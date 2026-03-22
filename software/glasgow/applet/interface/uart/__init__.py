@@ -12,6 +12,7 @@ from glasgow.support.arepl import AsyncInteractiveConsole as AsyncInteractiveCon
 from glasgow.support.logging import dump_hex
 from glasgow.support.endpoint import ServerEndpoint
 from glasgow.gateware.uart import UART
+from glasgow.gateware.stream import Queue
 from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletV2, GlasgowAppletError
 
@@ -94,6 +95,10 @@ class UARTAutoBaud(wiring.Component):
 
 
 class UARTComponent(wiring.Component):
+    RX_FIFO_DEPTH = 16
+    RTS_DEASSERT_LEVEL = 12
+    RTS_ASSERT_LEVEL = 4
+
     i_stream:   In(stream.Signature(8))
     o_stream:   Out(stream.Signature(8))
     o_flush:    Out(1)
@@ -124,6 +129,9 @@ class UARTComponent(wiring.Component):
             parity=self.parity,
             stop_bits=self.stop_bits)
         m.submodules.auto_baud = auto_baud = UARTAutoBaud()
+        m.submodules.rx_fifo = rx_fifo = Queue(shape=8, depth=self.RX_FIFO_DEPTH)
+
+        rx_flow_ok = Signal(init=1)
 
         if self.ports.rx is not None:
             m.d.comb += auto_baud.rx.eq(uart.bus.rx_i)
@@ -142,15 +150,27 @@ class UARTComponent(wiring.Component):
         with m.If(uart.rx_ovf):
             m.d.sync += self.rx_overflow.eq(self.rx_overflow + 1)
 
+        with m.If(rx_fifo.level >= self.RTS_DEASSERT_LEVEL):
+            m.d.sync += rx_flow_ok.eq(0)
+        with m.Elif(rx_fifo.level <= self.RTS_ASSERT_LEVEL):
+            m.d.sync += rx_flow_ok.eq(1)
+
         m.d.comb += [
             uart.tx_data.eq(self.i_stream.payload),
             uart.tx_ack.eq(self.i_stream.valid),
             self.i_stream.ready.eq(uart.tx_rdy),
-            self.o_stream.payload.eq(uart.rx_data),
-            self.o_stream.valid.eq(uart.rx_rdy),
-            uart.rx_ack.eq(self.o_stream.ready),
-            self.o_flush.eq(uart.rx_ack & uart.rx_data.matches(0x0A, 0x0D)),
+            rx_fifo.i.payload.eq(uart.rx_data),
+            rx_fifo.i.valid.eq(uart.rx_rdy),
+            uart.rx_ack.eq(rx_fifo.i.ready),
+            self.o_stream.payload.eq(rx_fifo.o.payload),
+            self.o_stream.valid.eq(rx_fifo.o.valid),
+            rx_fifo.o.ready.eq(self.o_stream.ready),
+            self.o_flush.eq(rx_fifo.o.valid & rx_fifo.o.ready &
+                            rx_fifo.o.payload.matches(0x0A, 0x0D)),
         ]
+
+        if uart.bus.has_rts:
+            m.d.comb += uart.bus.rts_o.eq(~rx_flow_ok)
 
         return m
 
@@ -158,14 +178,25 @@ class UARTComponent(wiring.Component):
 class UARTInterface:
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
                  rx: GlasgowPin | None, tx: GlasgowPin | None,
+                 rts: GlasgowPin | None = None, cts: GlasgowPin | None = None,
                  parity: Literal["none", "zero", "one", "odd", "even"] = "none",
                  stop_bits: int = 1):
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
-        ports = assembly.add_port_group(rx=rx, tx=tx)
+        if rts is not None and rx is None:
+            raise GlasgowAppletError("RTS requires an RX pin")
+        if cts is not None and tx is None:
+            raise GlasgowAppletError("CTS requires a TX pin")
+
+        ports = assembly.add_port_group(rx=rx, tx=tx, rts=rts, cts=cts)
+        pulls = {}
         if rx is not None:
-            assembly.use_pulls({rx: "high"})
+            pulls[rx] = "high"
+        if cts is not None:
+            pulls[cts] = "high"
+        if pulls:
+            assembly.use_pulls(pulls)
         component = assembly.add_submodule(UARTComponent(ports, parity=parity, stop_bits=stop_bits))
         self._pipe = assembly.add_inout_pipe(component.o_stream, component.i_stream,
             in_flush=component.o_flush)
@@ -287,7 +318,8 @@ class UARTApplet(GlasgowAppletV2):
     Transmit and receive data via UART.
 
     Any baud rate is supported. Only 8 data bits and from 1 to 8 integer stop bits are supported,
-    with configurable parity.
+    with configurable parity. Optional active-low RTS and CTS pins can be used independently for
+    hardware flow control.
 
     The automatic baud rate determination algorithm works by locking onto the shortest bit time in
     the receive stream. It will determine the baud rate incorrectly in presence of glitches as well
@@ -302,6 +334,12 @@ class UARTApplet(GlasgowAppletV2):
         access.add_voltage_argument(parser)
         access.add_pins_argument(parser, "rx", default=True)
         access.add_pins_argument(parser, "tx", default=True)
+        access.add_pins_argument(
+            parser, "rts",
+            help="drive active-low request-to-send output (host ready to receive) on PIN")
+        access.add_pins_argument(
+            parser, "cts",
+            help="sample active-low clear-to-send input from PIN before transmitting")
         parser.add_argument(
             "--parity", metavar="PARITY",
             choices=("none", "zero", "one", "odd", "even"), default="none",
@@ -314,7 +352,8 @@ class UARTApplet(GlasgowAppletV2):
         with self.assembly.add_applet(self):
             self.assembly.use_voltage(args.voltage)
             self.uart_iface = UARTInterface(self.logger, self.assembly,
-                rx=args.rx, tx=args.tx, parity=args.parity, stop_bits=args.stop_bits)
+                rx=args.rx, tx=args.tx, rts=args.rts, cts=args.cts,
+                parity=args.parity, stop_bits=args.stop_bits)
 
     @classmethod
     def add_setup_arguments(cls, parser):

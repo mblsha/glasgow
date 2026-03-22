@@ -15,7 +15,7 @@ class UARTBus(Elaboratable):
     def __init__(self, ports):
         self.ports = ports
 
-        self.has_rx = self.has_tx = False
+        self.has_rx = self.has_tx = self.has_rts = self.has_cts = False
         if hasattr(ports, "rx"):
             if ports.rx is not None:
                 self.has_rx = True
@@ -26,6 +26,16 @@ class UARTBus(Elaboratable):
                 self.has_tx = True
                 self.tx_o = Signal(init=1)
 
+        if hasattr(ports, "rts"):
+            if ports.rts is not None:
+                self.has_rts = True
+                self.rts_o = Signal(init=1)
+
+        if hasattr(ports, "cts"):
+            if ports.cts is not None:
+                self.has_cts = True
+                self.cts_i = Signal(init=1)
+
     def elaborate(self, platform):
         m = Module()
 
@@ -33,9 +43,17 @@ class UARTBus(Elaboratable):
             m.submodules.tx_buffer = tx_buffer = io.Buffer("o", self.ports.tx)
             m.d.comb += tx_buffer.o.eq(self.tx_o)
 
+        if self.has_rts:
+            m.submodules.rts_buffer = rts_buffer = io.Buffer("o", self.ports.rts)
+            m.d.comb += rts_buffer.o.eq(self.rts_o)
+
         if self.has_rx:
             m.submodules.rx_buffer = rx_buffer = io.Buffer("i", self.ports.rx)
             m.submodules += FFSynchronizer(rx_buffer.i, self.rx_i, init=1)
+
+        if self.has_cts:
+            m.submodules.cts_buffer = cts_buffer = io.Buffer("i", self.ports.cts)
+            m.submodules += FFSynchronizer(cts_buffer.i, self.cts_i, init=1)
 
         return m
 
@@ -215,6 +233,7 @@ class UART(Elaboratable):
             tx_bitno        = Signal(range(len(tx_shreg)))
             tx_parity       = Signal()
             tx_stop_bit_cnt = Signal(range(self.stop_bits))
+            cts_ok          = ~self.bus.cts_i if self.bus.has_cts else C(1, 1)
 
             with m.If(tx_start | (tx_timer == 0)):
                 m.d.sync += tx_timer.eq(self.bit_cyc - 1)
@@ -224,8 +243,8 @@ class UART(Elaboratable):
 
             with m.FSM():
                 with m.State("IDLE"):
-                    m.d.comb += self.tx_rdy.eq(1)
-                    with m.If(self.tx_ack):
+                    m.d.comb += self.tx_rdy.eq(cts_ok)
+                    with m.If(self.tx_ack & cts_ok):
                         m.d.comb += tx_start.eq(1)
                         m.d.sync += [
                             tx_shreg.eq(self.tx_data),

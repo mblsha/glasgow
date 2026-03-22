@@ -8,9 +8,10 @@ from glasgow.gateware.uart import UART
 
 
 class UARTTestbench(Elaboratable):
-    def __init__(self):
+    def __init__(self, *, has_cts=False):
         self.rx = io.SimulationPort("i", 1)
         self.tx = io.SimulationPort("o", 1)
+        self.cts = io.SimulationPort("i", 1) if has_cts else None
 
         self.bit_cyc = 4
 
@@ -192,3 +193,49 @@ class UARTTXTestCase(unittest.TestCase):
     def test_tx_back_to_back(self, tb):
         yield from self.byte(tb, 0xAA, [0, 1, 0, 1, 0, 1, 0, 1])
         yield from self.byte(tb, 0x55, [1, 0, 1, 0, 1, 0, 1, 0])
+
+
+class UARTTXCTSTestCase(UARTTXTestCase):
+    def setUp(self):
+        self.tb = UARTTestbench(has_cts=True)
+
+    def sync_cts(self, tb):
+        yield Tick()
+        yield Tick()
+        yield Tick()
+
+    def simulationSetUp(self, tb):
+        yield tb.cts.i.eq(0)
+        yield from self.sync_cts(tb)
+
+    @simulation_test
+    def test_tx_waits_for_cts(self, tb):
+        yield tb.cts.i.eq(1)
+        yield from self.sync_cts(tb)
+
+        self.assertEqual((yield tb.dut.tx_rdy), 0)
+        self.assertEqual((yield tb.tx.o), 1)
+
+        yield tb.dut.tx_data.eq(0x55)
+        yield tb.dut.tx_ack.eq(1)
+        yield Tick()
+        yield tb.dut.tx_ack.eq(0)
+        yield from self.cyc(tb)
+
+        self.assertEqual((yield tb.dut.tx_rdy), 0)
+        self.assertEqual((yield tb.tx.o), 1)
+
+        yield tb.cts.i.eq(0)
+        yield from self.sync_cts(tb)
+
+        yield from self.byte(tb, 0x55, [1, 0, 1, 0, 1, 0, 1, 0])
+
+    @simulation_test
+    def test_tx_does_not_pause_mid_frame(self, tb):
+        yield from self.start(tb, 0xA5)
+
+        yield tb.cts.i.eq(1)
+
+        for bit in [1, 0, 1, 0, 0, 1, 0, 1]:
+            yield from self.data(tb, bit)
+        yield from self.stop(tb)
