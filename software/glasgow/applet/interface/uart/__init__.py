@@ -15,6 +15,7 @@ from glasgow.gateware.uart import UART
 from glasgow.gateware.stream import Queue
 from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletV2, GlasgowAppletError
+from glasgow.simulation.assembly import SimulationAssembly
 
 
 class UARTAutoBaud(wiring.Component):
@@ -110,6 +111,7 @@ class UARTComponent(wiring.Component):
 
     rx_errors:   Out(16)
     rx_overflow: Out(16)
+    tx_count:    Out(16)
 
     def __init__(self, ports, *, parity: str, stop_bits: int):
         self.ports  = ports
@@ -150,6 +152,9 @@ class UARTComponent(wiring.Component):
         with m.If(uart.rx_ovf):
             m.d.sync += self.rx_overflow.eq(self.rx_overflow + 1)
 
+        with m.If(uart.tx_done):
+            m.d.sync += self.tx_count.eq(self.tx_count + 1)
+
         with m.If(rx_fifo.level >= self.RTS_DEASSERT_LEVEL):
             m.d.sync += rx_flow_ok.eq(0)
         with m.Elif(rx_fifo.level <= self.RTS_ASSERT_LEVEL):
@@ -183,6 +188,11 @@ class UARTInterface:
                  stop_bits: int = 1):
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
+        self._assembly = assembly
+        self._has_cts = cts is not None
+        self._tx_outstanding = 0
+        self._tx_count_value = 0
+        self._sys_clk_period = assembly.sys_clk_period
 
         if rts is not None and rx is None:
             raise GlasgowAppletError("RTS requires an RX pin")
@@ -206,7 +216,7 @@ class UARTInterface:
         self._bit_cyc    = assembly.add_ro_register(component.bit_cyc)
         self._rx_errors   = assembly.add_ro_register(component.rx_errors)
         self._rx_overflow = assembly.add_ro_register(component.rx_overflow)
-        self._sys_clk_period = assembly.sys_clk_period
+        self._tx_count    = assembly.add_ro_register(component.tx_count)
 
     def _log(self, message, *args):
         self._logger.log(self._level, "UART: " + message, *args)
@@ -274,14 +284,38 @@ class UARTInterface:
         """
         data = memoryview(data)
         self._log("tx data=<%s>", dump_hex(data))
+        await self._update_tx_progress()
         await self._pipe.send(data)
+        self._tx_outstanding += len(data)
         if flush:
             await self.flush()
+
+    async def _update_tx_progress(self):
+        new_tx_count = await self._tx_count
+        tx_delta = new_tx_count - self._tx_count_value
+        if new_tx_count < self._tx_count_value:
+            tx_delta += 1 << 16
+        self._tx_count_value = new_tx_count
+        self._tx_outstanding = max(0, self._tx_outstanding - tx_delta)
+
+    async def _advance_runtime(self):
+        if isinstance(self._assembly, SimulationAssembly):
+            _clk_hit, rst_hit = await self._assembly._context.tick()
+            assert not rst_hit
+        else:
+            await asyncio.sleep(0.001 if self._has_cts else 0)
 
     async def flush(self):
         """Transmits all buffered bytes from the UART."""
         self._log("tx flush")
         await self._pipe.flush()
+        if self._tx_outstanding == 0:
+            return
+
+        while self._tx_outstanding > 0:
+            await self._update_tx_progress()
+            if self._tx_outstanding > 0:
+                await self._advance_runtime()
 
     async def monitor(self, *, interval=1.0):
         """Logs receive errors and automatic baud rate changes."""

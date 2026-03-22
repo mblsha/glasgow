@@ -113,3 +113,126 @@ class UARTAppletTestCase(GlasgowAppletV2TestCase, applet=UARTApplet):
         sim.add_testbench(testbench)
         with sim.write_vcd("test_uart_component_rts.vcd"):
             sim.run()
+
+    def test_tx_inverted_pin_emits_expected_bytes(self):
+        payload = b"10 PRINT 456\x1A"
+        parsed_args = self._parse_args("--rx - --tx B3# --baud 1200")
+        assembly = SimulationAssembly()
+        applet = self.applet_cls(assembly)
+        applet.build(parsed_args)
+
+        tx_pin = assembly.get_pin("B3")
+        bit_cyc = round(1 / (parsed_args.baud * assembly.sys_clk_period))
+        received = bytearray()
+
+        async def tx_monitor(ctx):
+            def tx_level():
+                # Decode the raw physical pin waveform back to a conventional idle-high UART.
+                return ctx.get(tx_pin.o) ^ 1
+
+            while len(received) < len(payload):
+                while tx_level() == 1:
+                    await ctx.tick()
+
+                await ctx.tick().repeat(bit_cyc + bit_cyc // 2)
+
+                value = 0
+                for bitno in range(8):
+                    value |= tx_level() << bitno
+                    if bitno != 7:
+                        await ctx.tick().repeat(bit_cyc)
+
+                await ctx.tick().repeat(bit_cyc)
+                self.assertEqual(tx_level(), 1)
+                received.append(value)
+                await ctx.tick()
+
+        assembly.add_testbench(tx_monitor, background=True)
+
+        async def main(ctx):
+            await applet.setup(parsed_args)
+            await applet.uart_iface.write(payload, flush=True)
+            self.assertEqual(received, payload)
+
+        assembly.run(main, vcd_file="test_uart_tx_inverted_pin.vcd")
+
+    def test_flush_waits_for_cts_before_transmitting(self):
+        payload = b"A"
+        parsed_args = self._parse_args("--rx - --tx B3 --cts B0 --baud 1200")
+        assembly = SimulationAssembly()
+        applet = self.applet_cls(assembly)
+        applet.build(parsed_args)
+
+        cts_pin = assembly.get_pin("B0")
+        tx_pin = assembly.get_pin("B3")
+        bit_cyc = round(1 / (parsed_args.baud * assembly.sys_clk_period))
+        received = bytearray()
+        state = {"write_done": False}
+
+        async def tx_monitor(ctx):
+            while len(received) < len(payload):
+                while ctx.get(tx_pin.o) == 1:
+                    await ctx.tick()
+
+                await ctx.tick().repeat(bit_cyc + bit_cyc // 2)
+
+                value = 0
+                for bitno in range(8):
+                    value |= ctx.get(tx_pin.o) << bitno
+                    if bitno != 7:
+                        await ctx.tick().repeat(bit_cyc)
+
+                await ctx.tick().repeat(bit_cyc)
+                self.assertEqual(ctx.get(tx_pin.o), 1)
+                received.append(value)
+                await ctx.tick()
+
+        async def cts_driver(ctx):
+            ctx.set(cts_pin.i, 1)
+            await ctx.tick().repeat(bit_cyc * 4)
+            self.assertFalse(state["write_done"])
+            self.assertEqual(ctx.get(tx_pin.o), 1)
+            ctx.set(cts_pin.i, 0)
+
+        assembly.add_testbench(tx_monitor, background=True)
+        assembly.add_testbench(cts_driver, background=True)
+
+        async def main(ctx):
+            await applet.setup(parsed_args)
+            await applet.uart_iface.write(payload, flush=True)
+            state["write_done"] = True
+            self.assertEqual(received, payload)
+
+        assembly.run(main, vcd_file="test_uart_cts_flush_wait.vcd")
+
+    def test_flush_starts_transmitting_without_cts(self):
+        payload = b"A"
+        parsed_args = self._parse_args("--rx - --tx B3 --baud 1200")
+        assembly = SimulationAssembly()
+        applet = self.applet_cls(assembly)
+        applet.build(parsed_args)
+
+        tx_pin = assembly.get_pin("B3")
+        state = {"write_started": False, "start_seen": False}
+
+        async def tx_watchdog(ctx):
+            while not state["write_started"]:
+                await ctx.tick()
+
+            for _ in range(8):
+                if ctx.get(tx_pin.o) == 0:
+                    state["start_seen"] = True
+                    return
+                await ctx.tick()
+
+            self.fail("TX did not leave idle promptly without CTS")
+
+        assembly.add_testbench(tx_watchdog, background=True)
+
+        async def main(ctx):
+            await applet.setup(parsed_args)
+            state["write_started"] = True
+            await applet.uart_iface.write(payload, flush=True)
+            self.assertTrue(state["start_seen"])
+
+        assembly.run(main, vcd_file="test_uart_no_cts_start.vcd")

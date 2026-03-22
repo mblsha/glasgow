@@ -109,6 +109,8 @@ class UART(Elaboratable):
     :attr tx_ack:
         Transmit acknowledgement. If active when ``tx_rdy`` is active, ``tx_rdy`` is reset,
         ``tx_data`` is sampled, and the transmit state machine starts transmitting a frame.
+    :attr tx_done:
+        Transmit complete flag. Active for one cycle when a frame has fully finished transmitting.
     """
 
     def __init__(self, ports, bit_cyc, data_bits=8, parity="none", stop_bits=1, max_bit_cyc=None):
@@ -134,6 +136,7 @@ class UART(Elaboratable):
         self.tx_data = Signal(data_bits)
         self.tx_rdy  = Signal()
         self.tx_ack  = Signal()
+        self.tx_done = Signal()
 
         self.bus = UARTBus(ports)
 
@@ -285,6 +288,7 @@ class UART(Elaboratable):
                     with m.If(tx_stb):
                         m.d.sync += tx_stop_bit_cnt.eq(tx_stop_bit_cnt + 1)
                         with m.If(tx_stop_bit_cnt == self.stop_bits - 1):
+                            m.d.comb += self.tx_done.eq(1)
                             m.next = "IDLE"
 
         return m

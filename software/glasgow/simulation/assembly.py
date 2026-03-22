@@ -114,7 +114,7 @@ class SimulationAssembly(AbstractAssembly):
         pin_name = f"{pin.port}{pin.number}"
         port = io.SimulationPort("io", 1, name=pin_name)
         self._pins[pin_name] = port
-        return port
+        return ~port if pin.invert else port
 
     def get_pin(self, pin_name: str) -> io.SimulationPort:
         return self._pins[pin_name]
