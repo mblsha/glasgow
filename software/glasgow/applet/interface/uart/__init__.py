@@ -15,7 +15,6 @@ from glasgow.gateware.uart import UART
 from glasgow.gateware.stream import Queue
 from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletV2, GlasgowAppletError
-from glasgow.simulation.assembly import SimulationAssembly
 
 
 class UARTAutoBaud(wiring.Component):
@@ -97,8 +96,10 @@ class UARTAutoBaud(wiring.Component):
 
 class UARTComponent(wiring.Component):
     RX_FIFO_DEPTH = 16
-    RTS_DEASSERT_LEVEL = 12
-    RTS_ASSERT_LEVEL = 4
+    # Leave four character times of slack for in-flight peer data after RTS changes.
+    RTS_MARGIN = 4
+    RTS_DEASSERT_LEVEL = RX_FIFO_DEPTH - RTS_MARGIN
+    RTS_ASSERT_LEVEL = RTS_MARGIN
 
     i_stream:   In(stream.Signature(8))
     o_stream:   Out(stream.Signature(8))
@@ -111,7 +112,7 @@ class UARTComponent(wiring.Component):
 
     rx_errors:   Out(16)
     rx_overflow: Out(16)
-    tx_count:    Out(16)
+    tx_count:    Out(32)
 
     def __init__(self, ports, *, parity: str, stop_bits: int):
         self.ports  = ports
@@ -284,7 +285,6 @@ class UARTInterface:
         """
         data = memoryview(data)
         self._log("tx data=<%s>", dump_hex(data))
-        await self._update_tx_progress()
         await self._pipe.send(data)
         self._tx_outstanding += len(data)
         if flush:
@@ -292,30 +292,19 @@ class UARTInterface:
 
     async def _update_tx_progress(self):
         new_tx_count = await self._tx_count
-        tx_delta = new_tx_count - self._tx_count_value
-        if new_tx_count < self._tx_count_value:
-            tx_delta += 1 << 16
+        tx_delta = (new_tx_count - self._tx_count_value) & 0xffff_ffff
         self._tx_count_value = new_tx_count
         self._tx_outstanding = max(0, self._tx_outstanding - tx_delta)
-
-    async def _advance_runtime(self):
-        if isinstance(self._assembly, SimulationAssembly):
-            _clk_hit, rst_hit = await self._assembly._context.tick()
-            assert not rst_hit
-        else:
-            await asyncio.sleep(0.001 if self._has_cts else 0)
 
     async def flush(self):
         """Transmits all buffered bytes from the UART."""
         self._log("tx flush")
         await self._pipe.flush()
-        if self._tx_outstanding == 0:
-            return
+        await self._update_tx_progress()
 
         while self._tx_outstanding > 0:
+            await self._assembly.advance_runtime(0.001 if self._has_cts else 0)
             await self._update_tx_progress()
-            if self._tx_outstanding > 0:
-                await self._advance_runtime()
 
     async def monitor(self, *, interval=1.0):
         """Logs receive errors and automatic baud rate changes."""

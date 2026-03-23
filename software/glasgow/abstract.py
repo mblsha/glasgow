@@ -8,6 +8,7 @@ import re
 import enum
 import math
 import logging
+import asyncio
 
 from amaranth import *
 from amaranth.lib import io
@@ -394,3 +395,6 @@ class AbstractAssembly(metaclass=ABCMeta):
     @abstractmethod
     async def configure_ports(self):
         pass
+
+    async def advance_runtime(self, delay: float = 0.0):
+        await asyncio.sleep(delay)

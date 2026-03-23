@@ -201,6 +201,12 @@ class SimulationAssembly(AbstractAssembly):
     async def configure_ports(self):
         pass # TODO: log and use pull state for default pin state?
 
+    async def advance_runtime(self, delay: float = 0.0):
+        cycles = max(1, round(delay / self.sys_clk_period))
+        for _ in range(cycles):
+            _clk_hit, rst_hit = await self._context.tick()
+            assert not rst_hit
+
     @property
     def _context(self):
         if self.__context is None:
