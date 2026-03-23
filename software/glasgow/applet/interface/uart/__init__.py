@@ -191,9 +191,10 @@ class UARTInterface:
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
         self._assembly = assembly
         self._has_cts = cts is not None
-        self._tx_outstanding = 0
-        self._tx_count_value = 0
+        self._tx_target = 0
         self._sys_clk_period = assembly.sys_clk_period
+        self._parity = parity
+        self._stop_bits = stop_bits
 
         if rts is not None and rx is None:
             raise GlasgowAppletError("RTS requires an RX pin")
@@ -286,25 +287,33 @@ class UARTInterface:
         data = memoryview(data)
         self._log("tx data=<%s>", dump_hex(data))
         await self._pipe.send(data)
-        self._tx_outstanding += len(data)
+        self._tx_target = (self._tx_target + len(data)) & 0xffff_ffff
         if flush:
             await self.flush()
 
-    async def _update_tx_progress(self):
-        new_tx_count = await self._tx_count
-        tx_delta = (new_tx_count - self._tx_count_value) & 0xffff_ffff
-        self._tx_count_value = new_tx_count
-        self._tx_outstanding = max(0, self._tx_outstanding - tx_delta)
+    async def _flush_delay(self, remaining):
+        baud = await self.get_baud()
+        if baud <= 0:
+            return 0.001 if self._has_cts else 0
+
+        frame_bits = 1 + 8 + (0 if self._parity == "none" else 1) + self._stop_bits
+        frame_time = frame_bits / baud
+        if self._has_cts:
+            return min(frame_time, 0.001)
+        return remaining * frame_time
 
     async def flush(self):
         """Transmits all buffered bytes from the UART."""
         self._log("tx flush")
+        target = self._tx_target
         await self._pipe.flush()
-        await self._update_tx_progress()
 
-        while self._tx_outstanding > 0:
-            await self._assembly.advance_runtime(0.001 if self._has_cts else 0)
-            await self._update_tx_progress()
+        while True:
+            done = await self._tx_count
+            remaining = (target - done) & 0xffff_ffff
+            if remaining == 0:
+                return
+            await self._assembly.advance_runtime(await self._flush_delay(remaining))
 
     async def monitor(self, *, interval=1.0):
         """Logs receive errors and automatic baud rate changes."""

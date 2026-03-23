@@ -2,6 +2,7 @@ from typing import Any
 from collections.abc import Buffer, Generator
 from contextlib import contextmanager
 import logging
+import math
 
 from amaranth import *
 from amaranth.lib import io
@@ -202,7 +203,7 @@ class SimulationAssembly(AbstractAssembly):
         pass # TODO: log and use pull state for default pin state?
 
     async def advance_runtime(self, delay: float = 0.0):
-        cycles = max(1, round(delay / self.sys_clk_period))
+        cycles = max(1, math.ceil(delay / self.sys_clk_period))
         for _ in range(cycles):
             _clk_hit, rst_hit = await self._context.tick()
             assert not rst_hit

@@ -1,3 +1,6 @@
+import asyncio
+import logging
+
 from amaranth import *
 from amaranth.lib import io
 from amaranth.sim import Simulator
@@ -6,10 +9,71 @@ from glasgow.gateware.ports import PortGroup
 from glasgow.gateware.stream import stream_get
 from glasgow.simulation.assembly import SimulationAssembly
 from ... import *
-from . import UARTApplet, UARTComponent
+from . import UARTApplet, UARTComponent, UARTInterface
 
 
 class UARTAppletTestCase(GlasgowAppletV2TestCase, applet=UARTApplet):
+    def test_interface_flush_waits_for_completion_target(self):
+        class FakePipe:
+            def __init__(self):
+                self.sent = []
+                self.flush_calls = 0
+
+            async def send(self, data):
+                self.sent.append(bytes(data))
+
+            async def flush(self):
+                self.flush_calls += 1
+
+        class FakeRegister:
+            def __init__(self, parent):
+                self.parent = parent
+
+            async def get(self):
+                return self.parent.tx_count
+
+            def __await__(self):
+                return self.get().__await__()
+
+        class FakeAssembly:
+            def __init__(self, tx_count_updates):
+                self.tx_count = 0
+                self.tx_count_updates = iter(tx_count_updates)
+                self.delays = []
+
+            async def advance_runtime(self, delay=0.0):
+                self.delays.append(delay)
+                self.tx_count = next(self.tx_count_updates, self.tx_count)
+
+        iface = object.__new__(UARTInterface)
+        iface._logger = logging.getLogger(__name__)
+        iface._level = logging.DEBUG
+        iface._assembly = assembly = FakeAssembly([1, 2])
+        iface._has_cts = False
+        iface._tx_target = 0
+        iface._sys_clk_period = 1e-6
+        iface._parity = "none"
+        iface._stop_bits = 1
+        iface._pipe = pipe = FakePipe()
+        iface._tx_count = FakeRegister(assembly)
+
+        async def get_baud():
+            return 1200
+
+        iface.get_baud = get_baud
+
+        async def testbench():
+            await iface.write(b"AB", flush=True)
+
+        asyncio.run(testbench())
+
+        self.assertEqual(pipe.sent, [b"AB"])
+        self.assertEqual(pipe.flush_calls, 1)
+        self.assertEqual(iface._tx_target, 2)
+        self.assertEqual(len(assembly.delays), 2)
+        self.assertAlmostEqual(assembly.delays[0], 2 * 10 / 1200)
+        self.assertAlmostEqual(assembly.delays[1], 1 * 10 / 1200)
+
     @synthesis_test
     def test_build(self):
         self.assertBuilds()
@@ -204,6 +268,63 @@ class UARTAppletTestCase(GlasgowAppletV2TestCase, applet=UARTApplet):
             self.assertEqual(received, payload)
 
         assembly.run(main, vcd_file="test_uart_cts_flush_wait.vcd")
+
+    def test_flush_waits_for_second_byte_when_cts_blocks_between_frames(self):
+        payload = b"AB"
+        parsed_args = self._parse_args("--rx - --tx B3 --cts B0 --baud 1200")
+        assembly = SimulationAssembly()
+        applet = self.applet_cls(assembly)
+        applet.build(parsed_args)
+
+        cts_pin = assembly.get_pin("B0")
+        tx_pin = assembly.get_pin("B3")
+        bit_cyc = round(1 / (parsed_args.baud * assembly.sys_clk_period))
+        received = bytearray()
+        state = {"write_done": False}
+
+        async def tx_monitor(ctx):
+            while len(received) < len(payload):
+                while ctx.get(tx_pin.o) == 1:
+                    await ctx.tick()
+
+                await ctx.tick().repeat(bit_cyc + bit_cyc // 2)
+
+                value = 0
+                for bitno in range(8):
+                    value |= ctx.get(tx_pin.o) << bitno
+                    if bitno != 7:
+                        await ctx.tick().repeat(bit_cyc)
+
+                await ctx.tick().repeat(bit_cyc)
+                self.assertEqual(ctx.get(tx_pin.o), 1)
+                received.append(value)
+                await ctx.tick()
+
+        async def cts_driver(ctx):
+            ctx.set(cts_pin.i, 0)
+            while ctx.get(tx_pin.o) == 1:
+                await ctx.tick()
+
+            await ctx.tick().repeat(bit_cyc * 9 + bit_cyc // 2)
+            ctx.set(cts_pin.i, 1)
+            await ctx.tick().repeat(bit_cyc * 3)
+
+            self.assertEqual(received, bytearray(b"A"))
+            self.assertFalse(state["write_done"])
+            self.assertEqual(ctx.get(tx_pin.o), 1)
+
+            ctx.set(cts_pin.i, 0)
+
+        assembly.add_testbench(tx_monitor, background=True)
+        assembly.add_testbench(cts_driver, background=True)
+
+        async def main(ctx):
+            await applet.setup(parsed_args)
+            await applet.uart_iface.write(payload, flush=True)
+            state["write_done"] = True
+            self.assertEqual(received, payload)
+
+        assembly.run(main, vcd_file="test_uart_cts_two_byte_flush_wait.vcd")
 
     def test_flush_starts_transmitting_without_cts(self):
         payload = b"A"
