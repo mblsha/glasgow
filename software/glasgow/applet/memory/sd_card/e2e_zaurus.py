@@ -20,9 +20,9 @@ import sys
 import tempfile
 import time
 
-from . import DEFAULT_TRANSFER_SPEED, parse_transfer_speed
 from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 from ._console import SerialTransport, TelnetTransport
+from ._registers import DEFAULT_TRANSFER_SPEED, parse_transfer_speed
 
 
 MODULE = "/lib/modules.rom/2.4.18-rmk7-pxa3-embedix/kernel/drivers/block/sharp_mmcsd_m.o"
@@ -259,8 +259,13 @@ class ZaurusSDController:
                 await asyncio.sleep(self.settle_delay)
             await self.load_driver()
             self._prepared = True
-        except BaseException:
-            await self.restore()
+        except BaseException as primary_error:
+            try:
+                await self.restore()
+            except BaseException as restore_error:
+                raise BaseExceptionGroup(
+                    "Zaurus SD setup and rollback both failed",
+                    [primary_error, restore_error]) from None
             raise
 
     async def restore(self):
@@ -277,12 +282,15 @@ class ZaurusSDController:
             await self.unload_driver()
         if state.daemon_running:
             await self.start_daemon()
-        if state.mount is None:
-            # sdmgr can mount opportunistically while starting; preserve an originally unmounted
-            # slot as well as an originally mounted one.
-            await self.unmount()
-        else:
-            await self.restore_mount(state.mount)
+        # sdmgr can mount opportunistically while starting. Normalize that side effect before
+        # restoring either an explicitly mounted slot or an explicitly unmounted one.
+        await self.unmount()
+        await self.restore_mount(state.mount)
+        observed = await self.capture_state()
+        if observed != state:
+            raise E2EError(
+                "Zaurus SD lifecycle restoration did not converge: "
+                f"expected {state!r}, observed {observed!r}")
         self._prepared = False
         self._restore_needed = False
         self._initial_state = None
@@ -292,7 +300,14 @@ class ZaurusSDController:
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        await self.restore()
+        try:
+            await self.restore()
+        except BaseException as restore_error:
+            if exc_value is not None:
+                raise BaseExceptionGroup(
+                    "Zaurus SD test and lifecycle restoration both failed",
+                    [exc_value, restore_error]) from None
+            raise
         return False
 
 

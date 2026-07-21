@@ -40,7 +40,7 @@ class BlockBuffer(wiring.Component):
         super().__init__({
             "host": In(BlockBufferPortSignature()),
             "data": In(BlockBufferPortSignature()),
-            "bank_states": In(4),
+            "bank_states": In(6),
             "collision": Out(1),
             "collision_count": Out(16),
             "ownership_violation": Out(1),
@@ -57,9 +57,9 @@ class BlockBuffer(wiring.Component):
 
         fault_active = Signal()
         host_write_state = self.bank_states.word_select(
-            self.host.write_address[BUFFER_BANK_BIT], 2)
+            self.host.write_address[BUFFER_BANK_BIT], 3)
         data_read_state = self.bank_states.word_select(
-            self.data.read_address[BUFFER_BANK_BIT], 2)
+            self.data.read_address[BUFFER_BANK_BIT], 3)
         m.d.comb += self.collision.eq(
             (self.host.write_en & self.data.write_en) |
             (self.host.read_active & self.data.read_active) |
@@ -70,7 +70,9 @@ class BlockBuffer(wiring.Component):
                 (self.data.write_address[BUFFER_BANK_BIT] ==
                  self.host.read_address[BUFFER_BANK_BIT])))
         m.d.comb += self.ownership_violation.eq(
-            (self.host.write_en & (host_write_state != ReadBufferState.Filling)) |
+            (self.host.write_en &
+             (host_write_state != ReadBufferState.Filling) &
+             (host_write_state != ReadBufferState.Draining)) |
             (self.data.read_active & (data_read_state != ReadBufferState.Active)))
         fault_event = self.collision | self.ownership_violation
         m.d.sd += fault_active.eq(fault_event)
