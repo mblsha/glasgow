@@ -4,7 +4,7 @@ from amaranth.lib.wiring import In, Out
 
 from ._buffer import BlockBufferPortSignature
 from ._gateware_support import BLOCK_SIZE, CardState, DataMode
-from ._interfaces import CommandDataSignature, DataHostSignature
+from ._interfaces import CommandDataSignature, DataHostSignature, ReadBufferState
 from ._lanes import SDDataLaneCodec
 
 
@@ -24,6 +24,7 @@ class DataEngine(wiring.Component):
 
     read_count: Out(32)
     write_count: Out(32)
+    prefetch_waits: Out(32)
     protocol_errors: Out(16)
 
     def elaborate(self, platform):
@@ -47,17 +48,54 @@ def _elaborate_data_transfer_engine(
     read_request_bank = storage.read_request_bank
     write_request = storage.write_request
     erase_request = storage.erase_request
-    request_sent = Signal()
     read_buffer_ready = storage.read_buffer_ready
     read_buffer_address = storage.read_buffer_address
-    read_buffer_bank = storage.read_buffer_bank
+    read_reply_bank = storage.read_reply_bank
     read_buffer_consume = storage.read_buffer_consume
     read_reply_error = storage.read_reply_error
     host_ack_valid = storage.host_ack_valid
     host_ack_status = storage.host_ack_status
     host_ack_consume = storage.host_ack_consume
-    active_read_bank = Signal()
     read_error_pending = Signal()
+    bank_state = Array(
+        Signal(ReadBufferState, name=f"read_bank_{index}_state") for index in range(2))
+    bank_address = Array(Signal(32, name=f"read_bank_{index}_address") for index in range(2))
+
+    empty_bank = Signal()
+    empty_bank_available = Signal()
+    ready_bank = Signal()
+    ready_for_current = Signal()
+    filling_for_current = Signal()
+    active_bank = Signal()
+    active_bank_available = Signal()
+    read_reply_failed = Signal()
+    m.d.comb += [
+        empty_bank.eq(bank_state[0] != ReadBufferState.Empty),
+        empty_bank_available.eq(
+            (bank_state[0] == ReadBufferState.Empty) |
+            (bank_state[1] == ReadBufferState.Empty)),
+        ready_bank.eq(bank_state[0] != ReadBufferState.Ready),
+        ready_for_current.eq(
+            ((bank_state[0] == ReadBufferState.Ready) &
+             (bank_address[0] == current_address)) |
+            ((bank_state[1] == ReadBufferState.Ready) &
+             (bank_address[1] == current_address))),
+        filling_for_current.eq(
+            ((bank_state[0] == ReadBufferState.Filling) &
+             (bank_address[0] == current_address)) |
+            ((bank_state[1] == ReadBufferState.Filling) &
+             (bank_address[1] == current_address))),
+        active_bank.eq(bank_state[1] == ReadBufferState.Active),
+        active_bank_available.eq(
+            (bank_state[0] == ReadBufferState.Active) |
+            (bank_state[1] == ReadBufferState.Active)),
+        read_reply_failed.eq(
+            read_reply_error &
+            (bank_state[read_reply_bank] == ReadBufferState.Filling)),
+    ]
+    m.d.sd += Assert(~(
+        (bank_state[0] == ReadBufferState.Active) &
+        (bank_state[1] == ReadBufferState.Active)))
 
     m.d.comb += [
         control.state_update_valid.eq(0),
@@ -80,18 +118,46 @@ def _elaborate_data_transfer_engine(
             control.address_update.eq(value),
         ]
 
+    def request_read(address):
+        """Reserve an empty bank and begin its Empty -> Filling transition."""
+        m.d.sd += [
+            read_request.eq(1),
+            read_request_address.eq(address),
+            read_request_bank.eq(empty_bank),
+            bank_state[empty_bank].eq(ReadBufferState.Filling),
+            bank_address[empty_bank].eq(address),
+        ]
+
     with m.If(storage.read_request_accepted | stop_requested |
               (data_mode == DataMode.Idle)):
         m.d.sd += read_request.eq(0)
-    with m.If(stop_requested | (data_mode == DataMode.Idle)):
-        m.d.sd += request_sent.eq(0)
     with m.If(storage.write_request_accepted | stop_requested |
               (data_mode == DataMode.Idle)):
         m.d.sd += write_request.eq(0)
     with m.If(storage.erase_request_accepted):
         m.d.sd += erase_request.eq(0)
-    with m.If(read_reply_error):
-        m.d.sd += read_error_pending.eq(1)
+    # The data engine owns all bank-state transitions. The host engine only reports a completed
+    # fill tagged with its bank and address. A reply for a bank emptied by CMD12 is consumed and
+    # discarded; a mismatched reply for a bank still marked Filling is a protocol fault.
+    m.d.comb += read_buffer_consume.eq(0)
+    with m.If(read_buffer_ready):
+        m.d.comb += read_buffer_consume.eq(1)
+        with m.If((bank_state[read_reply_bank] == ReadBufferState.Filling) &
+                  (bank_address[read_reply_bank] == read_buffer_address)):
+            m.d.sd += bank_state[read_reply_bank].eq(ReadBufferState.Ready)
+        with m.Elif(bank_state[read_reply_bank] == ReadBufferState.Filling):
+            m.d.sd += [
+                bank_state[read_reply_bank].eq(ReadBufferState.Empty),
+                read_error_pending.eq(1),
+            ]
+    with m.If(read_reply_failed):
+        m.d.sd += [
+            bank_state[read_reply_bank].eq(ReadBufferState.Empty),
+            read_error_pending.eq(1),
+        ]
+    with m.If(stop_requested | (data_mode == DataMode.Idle)):
+        for state in bank_state:
+            m.d.sd += state.eq(ReadBufferState.Empty)
     # Data transfer engine. It never depends on a full image being resident on the FPGA: reads
     # ping-pong between two blocks, and writes drain one block at a time.
     data_byte = Signal(range(BLOCK_SIZE))
@@ -111,24 +177,21 @@ def _elaborate_data_transfer_engine(
     m.d.comb += [
         dat_o.eq(0xf),
         dat_oe.eq(0),
-        read_buffer_consume.eq(0),
         host_ack_consume.eq(0),
         read_advance.eq(0),
         block_buffer.write_en.eq(0),
         block_buffer.write_address.eq(0),
         block_buffer.write_data.eq(0),
-        block_buffer.read_active.eq(
-            (data_mode == DataMode.ReadSingle) | (data_mode == DataMode.ReadMulti)),
+        block_buffer.read_active.eq(active_bank_available),
         block_buffer.read_address.eq(Cat(
-            Mux(read_advance, data_byte + 1, data_byte)[:9], active_read_bank)),
+            Mux(read_advance, data_byte + 1, data_byte)[:9], active_bank)),
     ]
     m.d.sd += Assert(~(block_buffer.write_en & block_buffer.read_active))
 
     with m.FSM(domain="sd", name="data_transfer"):
         with m.State("Idle"):
-            with m.If(read_error_pending | read_reply_error):
+            with m.If(read_error_pending | read_reply_failed):
                 m.d.sd += [
-                    request_sent.eq(0),
                     read_error_pending.eq(0),
                     self.protocol_errors.eq(self.protocol_errors + 1),
                 ]
@@ -137,19 +200,12 @@ def _elaborate_data_transfer_engine(
             with m.Else():
                 with m.Switch(data_mode):
                     with m.Case(DataMode.ReadSingle, DataMode.ReadMulti):
-                        with m.If(~request_sent):
+                        with m.If(~read_request & ~filling_for_current &
+                                  ~ready_for_current & empty_bank_available):
+                            request_read(current_address)
+                        with m.If(~response_active & ready_for_current):
                             m.d.sd += [
-                                read_request.eq(1),
-                                read_request_address.eq(current_address),
-                                read_request_bank.eq(~read_buffer_bank),
-                                request_sent.eq(1),
-                            ]
-                        with m.If(~response_active & read_buffer_ready &
-                                  (read_buffer_address == current_address)):
-                            m.d.comb += read_buffer_consume.eq(1)
-                            m.d.sd += [
-                                active_read_bank.eq(read_buffer_bank),
-                                request_sent.eq(0),
+                                bank_state[ready_bank].eq(ReadBufferState.Active),
                                 data_byte.eq(0),
                                 data_bit.eq(0),
                             ]
@@ -172,8 +228,6 @@ def _elaborate_data_transfer_engine(
                         with m.If(~response_active):
                             m.d.sd += erase_request.eq(1)
                             m.next = "Busy"
-                    with m.Default():
-                        m.d.sd += request_sent.eq(0)
 
         with m.State("Read-Start"):
             m.d.comb += [
@@ -183,14 +237,10 @@ def _elaborate_data_transfer_engine(
             # In multi-block mode the inactive bank is filled from the host while this bank is
             # shifted onto DAT. This hides USB/backend latency from controllers with short FIFO
             # service timeouts without retaining more than two blocks in FPGA memory.
-            with m.If((data_mode == DataMode.ReadMulti) & ~request_sent &
+            with m.If((data_mode == DataMode.ReadMulti) & ~read_request &
+                      empty_bank_available &
                       (current_address <= self.image_size - (2 * BLOCK_SIZE))):
-                m.d.sd += [
-                    read_request.eq(1),
-                    read_request_address.eq(current_address + BLOCK_SIZE),
-                    read_request_bank.eq(~active_read_bank),
-                    request_sent.eq(1),
-                ]
+                request_read(current_address + BLOCK_SIZE)
             m.next = "Read-Data"
 
         with m.State("Read-Data"):
@@ -230,8 +280,21 @@ def _elaborate_data_transfer_engine(
                 dat_oe.eq(lanes.output_enable),
             ]
             m.d.sd += self.read_count.eq(self.read_count + 1)
+            with m.If((data_mode == DataMode.ReadSingle) |
+                      (data_mode == DataMode.ReadMulti)):
+                m.d.sd += bank_state[active_bank].eq(ReadBufferState.Empty)
             with m.If(data_mode == DataMode.ReadMulti):
                 with m.If(current_address <= self.image_size - (2 * BLOCK_SIZE)):
+                    next_address = current_address + BLOCK_SIZE
+                    next_ready = \
+                        (((bank_state[0] == ReadBufferState.Ready) &
+                          (bank_address[0] == next_address)) |
+                         ((bank_state[1] == ReadBufferState.Ready) &
+                          (bank_address[1] == next_address)) |
+                         (read_buffer_ready &
+                          (read_buffer_address == next_address)))
+                    with m.If(~next_ready):
+                        m.d.sd += self.prefetch_waits.eq(self.prefetch_waits + 1)
                     update_address(current_address + BLOCK_SIZE)
                 with m.Else():
                     m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)

@@ -1,10 +1,19 @@
-from amaranth.lib import wiring
+from amaranth.lib import enum, wiring
 from amaranth.lib.wiring import In, Out
 
 from ._gateware_support import CardState, DataMode
 
 
-__all__ = ["CommandDataSignature", "DataHostSignature"]
+__all__ = ["CommandDataSignature", "DataHostSignature", "ReadBufferState"]
+
+
+class ReadBufferState(enum.Enum, shape=2):
+    """Ownership state for each bank of the read ping-pong buffer."""
+
+    Empty = 0
+    Filling = 1
+    Ready = 2
+    Active = 3
 
 
 class CommandDataSignature(wiring.Signature):
@@ -48,7 +57,7 @@ class DataHostSignature(wiring.Signature):
 
             "read_buffer_ready": In(1),
             "read_buffer_address": In(32),
-            "read_buffer_bank": In(1),
+            "read_reply_bank": In(1),
             "read_buffer_consume": Out(1),
             "read_reply_error": In(1),
             "host_ack_valid": In(1),

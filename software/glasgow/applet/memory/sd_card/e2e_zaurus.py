@@ -146,6 +146,74 @@ def root(command):
     return f"su -c {shlex.quote(command)}"
 
 
+class ZaurusSDController:
+    """Idempotently hand the Sharp SD driver between the E2E test and ``sdmgr``."""
+
+    def __init__(self, shell, mount_point, *, module=MODULE, settle_delay=2):
+        self.shell = shell
+        self.mount_point = mount_point
+        self.module = module
+        self.settle_delay = settle_delay
+        self._prepared = False
+        self._restore_needed = False
+
+    async def _run_root(self, command, *, check=True):
+        return await self.shell.run(root(command), check=check, timeout=30)
+
+    async def unmount(self):
+        mount_pattern = shlex.quote(f" {self.mount_point} ")
+        mount_point = shlex.quote(self.mount_point)
+        await self._run_root(
+            f"if grep -F {mount_pattern} /proc/mounts >/dev/null 2>&1; "
+            f"then umount {mount_point}; fi")
+
+    async def stop_daemon(self):
+        # killall is required because an interrupted run can leave a daemon not named by the
+        # current PID file. Keeping it here avoids scattering a destructive process-wide action
+        # through setup and cleanup strings.
+        await self._run_root("/usr/bin/killall sdmgr >/dev/null 2>&1 || true")
+        await self._run_root("rm -f /var/run/sdmgr.pid")
+
+    async def unload_driver(self):
+        await self._run_root(
+            "if grep -q '^sharp_mmcsd_m ' /proc/modules; "
+            "then /sbin/rmmod sharp_mmcsd_m; fi")
+
+    async def load_driver(self):
+        await self._run_root(
+            "if ! grep -q '^sharp_mmcsd_m ' /proc/modules; "
+            f"then /sbin/insmod {shlex.quote(self.module)}; fi")
+
+    async def start_daemon(self):
+        await self._run_root(
+            "if ! ps | grep '[s]dmgr' >/dev/null 2>&1; then "
+            "rm -f /var/run/sdmgr.pid; /sbin/sdmgr; fi")
+
+    async def prepare(self):
+        if self._prepared:
+            return
+        self._restore_needed = True
+        await self.unmount()
+        await self.stop_daemon()
+        if self.settle_delay:
+            await asyncio.sleep(self.settle_delay)
+        await self.unload_driver()
+        if self.settle_delay:
+            await asyncio.sleep(self.settle_delay)
+        await self.load_driver()
+        self._prepared = True
+
+    async def restore(self):
+        if not self._restore_needed:
+            return
+        await self.unmount()
+        await self.stop_daemon()
+        await self.load_driver()
+        await self.start_daemon()
+        self._prepared = False
+        self._restore_needed = False
+
+
 def md5(block):
     return hashlib.md5(block).hexdigest()
 
@@ -175,6 +243,8 @@ async def start_glasgow(args):
     ]
     if args.volatile_writes:
         command.append("--volatile-writes")
+    if args.conservative_speed:
+        command.append("--conservative-speed")
     command.append(os.fspath(args.image))
     process = await asyncio.create_subprocess_exec(
         *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -224,26 +294,8 @@ async def stop_glasgow(process, log_task, glasgow):
     await safe.communicate()
 
 
-async def reload_driver(shell):
-    command = (
-        "/usr/bin/killall sdmgr 2>/dev/null || true; "
-        "rm -f /var/run/sdmgr.pid; "
-        "sleep 2; /sbin/rmmod sharp_mmcsd_m 2>/dev/null || true; sleep 2; "
-        f"/sbin/insmod {shlex.quote(MODULE)}")
-    await shell.run(root(command), timeout=30)
-
-
-async def restore_driver(shell, mount_point):
-    command = (
-        f"umount {shlex.quote(mount_point)} 2>/dev/null || true; "
-        "/usr/bin/killall sdmgr 2>/dev/null || true; "
-        "rm -f /var/run/sdmgr.pid; /sbin/sdmgr")
-    await shell.run(root(command), check=False, timeout=30)
-
-
 async def verify(args, shell):
     partition_lba, host_mbr, host_bpb = image_sectors(args.image)
-    await reload_driver(shell)
 
     raw_command = (
         "rm -f /tmp/glasgow-mbr /tmp/glasgow-bpb; "
@@ -287,8 +339,7 @@ async def verify(args, shell):
 
 
 async def async_main(args):
-    process = log_task = shell = None
-    driver_restored = False
+    process = log_task = shell = controller = None
     try:
         process, log_task = await start_glasgow(args)
         shell = await connect_after_boot(
@@ -303,15 +354,16 @@ async def async_main(args):
                 args.host, args.port, username=args.username, timeout=args.reboot_timeout,
                 serial_device=args.serial_device, serial_baud=args.serial_baud)
 
+        controller = ZaurusSDController(shell, args.mount_point)
+        await controller.prepare()
         mbr, bpb, marker = await verify(args, shell)
-        await restore_driver(shell, args.mount_point)
-        driver_restored = True
+        await controller.restore()
         print(f"PASS: MBR {mbr}, BPB {bpb}, write marker {marker}")
     finally:
         if shell is not None:
-            if not driver_restored:
+            if controller is not None:
                 with suppress(Exception):
-                    await restore_driver(shell, args.mount_point)
+                    await controller.restore()
             await shell.close()
         await stop_glasgow(process, log_task, args.glasgow)
 
@@ -348,6 +400,8 @@ def make_parser():
     parser.add_argument("--cmd", default="B5")
     parser.add_argument("--dat", default="B1,B0,B7,B6")
     parser.add_argument("--volatile-writes", action="store_true")
+    parser.add_argument("--conservative-speed", action="store_true",
+        help="make Glasgow advertise the conservative 5 Mbit/s CSD profile")
     return parser
 
 

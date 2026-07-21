@@ -1,5 +1,6 @@
 from collections.abc import Buffer
 import asyncio
+import enum
 import logging
 import secrets
 
@@ -33,13 +34,27 @@ __all__ = [
     "FAT16Error", "FAT16Image", "FrameError", "HostEvent", "HostReply",
     "RequestFrame", "RequestHeader",
     "ReplyFrame", "ReplyHeader",
-    "SDCardError", "SDCardComponent", "SDCardInterface", "SDCardApplet",
+    "CSDTransferSpeedProfile", "SDCardError", "SDCardComponent", "SDCardInterface",
+    "SDCardApplet",
     "crc7", "crc16", "build_cid", "build_csd", "build_scr", "create_fat16_image",
 ]
 
 
 class SDCardError(GlasgowAppletError):
     pass
+
+
+class CSDTransferSpeedProfile(enum.IntEnum):
+    """CSD ``TRAN_SPEED`` values offered by the emulator."""
+
+    Default = 0x32       # 2.5 * 10 Mbit/s = 25 Mbit/s
+    Conservative = 0x59  # 5.0 * 1 Mbit/s = 5 Mbit/s
+
+    @property
+    def description(self):
+        if self is self.Conservative:
+            return "conservative 5 Mbit/s"
+        return "default 25 Mbit/s"
 
 
 def _crc7_step(crc: int, bit: int) -> int:
@@ -118,15 +133,20 @@ def _capacity_fields(size: int) -> tuple[int, int]:
     raise SDCardError(f"image size {size} cannot be represented by a CSD v1 register")
 
 
-def build_csd(size: int, *, read_only: bool = False) -> int:
+def build_csd(size: int, *, read_only: bool = False,
+        transfer_speed: CSDTransferSpeedProfile = CSDTransferSpeedProfile.Default) -> int:
     """Build a CSD v1 register describing a byte-addressed SDSC image."""
     c_size, c_size_mult = _capacity_fields(size)
+    try:
+        transfer_speed = CSDTransferSpeedProfile(transfer_speed)
+    except ValueError as error:
+        raise SDCardError(f"unsupported CSD transfer-speed profile {transfer_speed!r}") from error
 
     csd = 0
     csd = _set_field(csd, 127, 126, 0)       # CSD_STRUCTURE v1
     csd = _set_field(csd, 119, 112, 0x7f)    # TAAC: 80 ms
     csd = _set_field(csd, 111, 104, 0xff)    # NSAC: 25,500 clocks
-    csd = _set_field(csd, 103, 96, 0x32)     # TRAN_SPEED: 25 MHz
+    csd = _set_field(csd, 103, 96, transfer_speed)  # TRAN_SPEED
     csd = _set_field(csd, 95, 84, 0x135)     # classes 0, 2, 4, 5, 8
     csd = _set_field(csd, 83, 80, 9)         # READ_BL_LEN: 512 bytes
     csd = _set_field(csd, 79, 79, 0)         # fixed-size reads only
@@ -180,6 +200,9 @@ class SDCardComponent(wiring.Component):
     protocol_errors: Out(16)
     backend_errors: Out(16)
     stale_replies:  Out(16)
+    buffer_faults:  Out(16)
+    prefetch_waits: Out(32)
+    max_host_service_latency: Out(32)
 
     def __init__(self, ports):
         self._ports = ports
@@ -301,6 +324,9 @@ class SDCardComponent(wiring.Component):
                 host_engine.protocol_errors + block_buffer.collision_count),
             self.backend_errors.eq(host_engine.backend_errors),
             self.stale_replies.eq(host_engine.stale_replies),
+            self.buffer_faults.eq(block_buffer.collision_count),
+            self.prefetch_waits.eq(data_engine.prefetch_waits),
+            self.max_host_service_latency.eq(host_engine.max_host_service_latency),
         ]
 
         dat_o_latched = Signal(4, init=0xf)
@@ -350,6 +376,10 @@ class SDCardInterface:
         self.protocol_errors = assembly.add_ro_register(component.protocol_errors)
         self.backend_errors = assembly.add_ro_register(component.backend_errors)
         self.stale_replies = assembly.add_ro_register(component.stale_replies)
+        self.buffer_faults = assembly.add_ro_register(component.buffer_faults)
+        self.prefetch_waits = assembly.add_ro_register(component.prefetch_waits)
+        self.max_host_service_latency = assembly.add_ro_register(
+            component.max_host_service_latency)
 
         self._backend = None
         self._worker = None
@@ -375,7 +405,8 @@ class SDCardInterface:
 
     async def configure(self, image_path: str | None = None, *,
             backend: BlockBackend | None = None, read_only: bool = False,
-            sync_writes: bool = True):
+            sync_writes: bool = True,
+            transfer_speed: CSDTransferSpeedProfile = CSDTransferSpeedProfile.Default):
         if (image_path is None) == (backend is None):
             raise ValueError("exactly one of image_path or backend must be provided")
         if backend is None:
@@ -383,7 +414,9 @@ class SDCardInterface:
         worker = self._worker_factory(backend)
         try:
             size = backend.size
-            csd = build_csd(size, read_only=backend.read_only)
+            transfer_speed = CSDTransferSpeedProfile(transfer_speed)
+            csd = build_csd(
+                size, read_only=backend.read_only, transfer_speed=transfer_speed)
             cid = build_cid(serial=backend.identity)
             scr = build_scr()
 
@@ -409,9 +442,9 @@ class SDCardInterface:
         access = "read-only" if backend.read_only else "writable"
         durability = "synchronous" if sync_writes else "write-back"
         self._logger.info(
-            "serving %s as a %.2f MiB SDSC image (%s, %s)",
+            "serving %s as a %.2f MiB SDSC image (%s, %s, %s CSD)",
             getattr(backend, "path", backend.__class__.__name__), size / 2**20,
-            access, durability)
+            access, durability, transfer_speed.description)
 
     async def suspend(self, *, reason: str = "requested"):
         if not self._active:
@@ -467,6 +500,8 @@ class SDCardInterface:
                 await self.command_count, await self.read_count,
                 await self.write_count, await self.protocol_errors,
                 await self.backend_errors, await self.stale_replies,
+                await self.buffer_faults, await self.prefetch_waits,
+                await self.max_host_service_latency,
             )
         await self._enabled.set(0)
         self._active = False
@@ -474,8 +509,10 @@ class SDCardInterface:
             self._logger.info(
                 "stopped after %d SD clocks (%d CMD-low), %d commands, %d reads, %d writes, "
                 "%d protocol errors, %d FPGA-reported backend errors, %d stale replies; "
-                "%d host backend errors, %d durable flushes",
-                *statistics, self._host_backend_errors, self._flush_count)
+                "%d buffer faults, %d prefetch waits, %d max host-service SD clocks; "
+                "%d host backend errors, %d durable flushes, %.3f ms max backend call",
+                *statistics, self._host_backend_errors, self._flush_count,
+                getattr(self._worker, "max_service_latency", 0.0) * 1e3)
         if self._backend is not None:
             try:
                 await self._worker.flush()
@@ -595,9 +632,9 @@ class SDCardApplet(GlasgowAppletV2):
     description = """
     Emulate a byte-addressed SDSC memory card using a disk image on the host.
 
-    The FPGA stores only one 512-byte data block and bounded transport FIFOs. Read blocks are
-    fetched from the host during the card access delay, and write blocks keep DAT0 busy until the
-    host has written and synchronized them to the image. Images must be 2 KiB aligned and no
+    The FPGA stores two 512-byte ping-pong data blocks and bounded transport FIFOs. Read blocks
+    are fetched from the host during the card access delay, and write blocks keep DAT0 busy until
+    the host has written and synchronized them to the image. Images must be 2 KiB aligned and no
     larger than 16 MiB. Target-power monitoring automatically resets protocol and transport state
     when a device such as a Zaurus removes and restores its SD rail.
 
@@ -631,6 +668,8 @@ class SDCardApplet(GlasgowAppletV2):
             help="advertise write protection and open IMAGE read-only")
         parser.add_argument("--volatile-writes", action="store_true",
             help="acknowledge writes before fsync (the image is still flushed on exit)")
+        parser.add_argument("--conservative-speed", action="store_true",
+            help="advertise a conservative 5 Mbit/s CSD transfer speed for compatibility tests")
         parser.add_argument("--no-power-monitor", action="store_true",
             help="do not reset the applet when the CLK port target rail changes")
         parser.add_argument("--power-off-threshold", type=float, default=1.0, metavar="V",
@@ -645,7 +684,9 @@ class SDCardApplet(GlasgowAppletV2):
     async def setup(self, args):
         try:
             await self.sd_card_iface.configure(
-                args.image, read_only=args.read_only, sync_writes=not args.volatile_writes)
+                args.image, read_only=args.read_only, sync_writes=not args.volatile_writes,
+                transfer_speed=(CSDTransferSpeedProfile.Conservative
+                    if args.conservative_speed else CSDTransferSpeedProfile.Default))
         except OSError as error:
             raise SDCardError(f"cannot open image {args.image!r}: {error.strerror}") from error
 

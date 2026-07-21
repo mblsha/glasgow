@@ -1,5 +1,7 @@
 import asyncio
+from collections import deque
 import os
+import random
 import struct
 import tempfile
 import time
@@ -14,12 +16,13 @@ from glasgow.simulation.assembly import SimulationAssembly
 
 from . import (
     BLOCK_SIZE, BackendError, BackendStatus, BackendWorker, BlockBackend, FileBlockBackend,
-    HostEvent, HostReply,
+    CSDTransferSpeedProfile, HostEvent, HostReply,
     ReplyFrame, RequestFrame, SDCardApplet, SDCardInterface,
     build_cid, build_csd, build_scr, crc7, crc16,
 )
 from .bfm import SDHostBFM
 from ._console import SerialTransport, TelnetTransport
+from .e2e_zaurus import ZaurusSDController
 from ._buffer import BlockBuffer
 from ._fat16 import FAT16Image, create_fat16_image
 from ._protocol import (
@@ -51,6 +54,16 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
         self.assertEqual((build_csd(16 * 1024 * 1024) >> 12) & 1, 0)
         self.assertEqual((build_csd(16 * 1024 * 1024, read_only=True) >> 12) & 1, 1)
 
+    def test_csd_transfer_speed_profiles(self):
+        default = build_csd(16 * 1024 * 1024)
+        conservative = build_csd(
+            16 * 1024 * 1024,
+            transfer_speed=CSDTransferSpeedProfile.Conservative)
+        self.assertEqual((default >> 96) & 0xff, CSDTransferSpeedProfile.Default)
+        self.assertEqual((conservative >> 96) & 0xff,
+            CSDTransferSpeedProfile.Conservative)
+        self.assertEqual((conservative >> 1) & 0x7f, crc7(conservative >> 8, 120))
+
     def test_csd_capacity_through_16_mib(self):
         for size in (2048, 1 << 20, 8 << 20, 16 << 20):
             csd = build_csd(size)
@@ -65,15 +78,88 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
         self.assertEqual((scr >> 56) & 0xf, 0)  # SD 1.0/1.01
         self.assertEqual((scr >> 48) & 0xf, 0b0101)
 
-    def test_sim_initialization_and_single_block_read_write(self):
-        payload = bytes(
-            ((index // BLOCK_SIZE) * 0x31 + index) & 0xff
-            for index in range(BLOCK_SIZE * 4))
+    async def _initialize_sim_card(self, applet, bfm, image, payload, *, transfer_speed):
+        # Let the enable synchronizer cross into the externally clocked SD domain.
+        await bfm.idle(4)
+
+        # Configuration is snapshotted atomically before command sampling. Mutating the source
+        # register while enabled must not tear or alter the active 128-bit CID.
+        await applet.sd_card_iface._cid.set(0)
+        await bfm.send_command(0)
+        for _ in range(4):
+            command_oe, _, _ = await bfm.cycle()
+            self.assertEqual(command_oe, 0)
+
+        await bfm.send_command(55)
+        self.assertEqual(await applet.sd_card_iface.last_command, 55)
+        bfm.assert_r1(await bfm.receive_response(48), 55)
+
+        await bfm.send_command(41, 0x00ff_8000)
+        r3 = await bfm.receive_response(48)
+        self.assertEqual(r3 >> 46, 0)
+        self.assertEqual((r3 >> 40) & 0x3f, 0x3f)
+        self.assertEqual((r3 >> 8) & 0xffff_ffff, 0x80ff_8000)
+        self.assertEqual(r3 & 0xff, 0xff)
+
+        stat = os.fstat(image.fileno())
+        cid = build_cid(serial=(stat.st_ino ^ stat.st_size) & 0xffff_ffff)
+        csd = build_csd(len(payload), transfer_speed=transfer_speed)
+
+        await bfm.send_command(2)
+        r2 = await bfm.receive_response(136)
+        self.assertEqual((r2 >> 1) & ((1 << 127) - 1), cid >> 1)
+
+        await bfm.send_command(3)
+        r6 = await bfm.receive_response(48)
+        self.assertEqual((r6 >> 24) & 0xffff, 0x1234)
+        self.assertEqual((r6 >> 40) & 0x3f, 3)
+
+        await bfm.send_command(9, 0x1234_0000)
+        r2 = await bfm.receive_response(136)
+        self.assertEqual((r2 >> 1) & ((1 << 127) - 1), csd >> 1)
+
+        await bfm.send_command(7, 0x1234_0000)
+        bfm.assert_r1(await bfm.receive_response(48), 7)
+        await bfm.send_command(16, BLOCK_SIZE)
+        bfm.assert_r1(await bfm.receive_response(48), 16)
+
+    async def _serve_next_sim_request(self, applet, bfm):
+        while not applet.sd_card_iface._pipe.flush_readable:
+            await bfm.cycle()
+        await applet.sd_card_iface.serve_once()
+
+    async def _receive_sim_block(self, applet, bfm, expected, *, timeout_cycles=2048):
+        async def diagnostic():
+            pipe = applet.sd_card_iface._pipe
+            return (
+                f"host readable={pipe.readable}, "
+                f"errors={await applet.sd_card_iface.protocol_errors}, "
+                f"prefetch waits={await applet.sd_card_iface.prefetch_waits}")
+
+        await bfm.receive_data_block(
+            expected, timeout_cycles=timeout_cycles, timeout_diagnostic=diagnostic)
+
+    async def _complete_sim_busy_request(self, applet, bfm, description):
+        saw_busy = False
+        for _ in range(4096):
+            _, _, data_sample = await bfm.cycle()
+            if data_sample[0] == (1, 0):
+                saw_busy = True
+            if applet.sd_card_iface._pipe.flush_readable:
+                await applet.sd_card_iface.serve_once()
+            if saw_busy and data_sample[0][0] == 0:
+                return
+        pipe = applet.sd_card_iface._pipe
+        self.fail(
+            f"timed out waiting for {description} (host readable={pipe.readable}, "
+            f"errors={await applet.sd_card_iface.protocol_errors})")
+
+    def _run_simulation(self, payload, scenario, *, setup_arguments=()):
         with tempfile.NamedTemporaryFile() as image:
             image.write(payload)
             image.flush()
 
-            args = self._parse_args([image.name])
+            args = self._parse_args([*setup_arguments, image.name])
             assembly = SimulationAssembly()
             applet = self.applet_cls(assembly)
             applet.build(args)
@@ -85,182 +171,152 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
 
             async def card_host(ctx):
                 bfm = SDHostBFM(ctx, self, clk=clk, cmd=cmd, dat=dat)
-                cycle = bfm.cycle
-                send_command = bfm.send_command
-                receive_response = bfm.receive_response
-                assert_r1 = bfm.assert_r1
-
-                async def receive_data_block(expected):
-                    async def diagnostic():
-                        pipe = applet.sd_card_iface._pipe
-                        return (
-                            f"host readable={pipe.readable}, "
-                            f"errors={await applet.sd_card_iface.protocol_errors}")
-                    await bfm.receive_data_block(expected, timeout_diagnostic=diagnostic)
-
-                async def complete_busy_request(description):
-                    saw_busy = False
-                    for _ in range(4096):
-                        _, _, data_sample = await cycle()
-                        if data_sample[0] == (1, 0):
-                            saw_busy = True
-                        if applet.sd_card_iface._pipe.flush_readable:
-                            await applet.sd_card_iface.serve_once()
-                        if saw_busy and data_sample[0][0] == 0:
-                            return
-                    pipe = applet.sd_card_iface._pipe
-                    self.fail(
-                        f"timed out waiting for {description} "
-                        f"(host readable={pipe.readable}, "
-                        f"errors={await applet.sd_card_iface.protocol_errors})")
-
-                # Let the enable synchronizer cross into the externally clocked SD domain.
-                for _ in range(4):
-                    await cycle()
-
-                # Configuration is snapshotted atomically before command sampling. Mutating the
-                # source register while enabled must not tear or alter the active 128-bit CID.
-                await applet.sd_card_iface._cid.set(0)
-
-                await send_command(0)
-                for _ in range(4):
-                    command_oe, _, _ = await cycle()
-                    self.assertEqual(command_oe, 0)
-
-                await send_command(55)
-                self.assertEqual(await applet.sd_card_iface.last_command, 55)
-                assert_r1(await receive_response(48), 55)
-
-                await send_command(41, 0x00ff_8000)
-                r3 = await receive_response(48)
-                self.assertEqual(r3 >> 46, 0)
-                self.assertEqual((r3 >> 40) & 0x3f, 0x3f)
-                self.assertEqual((r3 >> 8) & 0xffff_ffff, 0x80ff_8000)
-                self.assertEqual(r3 & 0xff, 0xff)
-
-                stat = os.fstat(image.fileno())
-                cid = build_cid(serial=(stat.st_ino ^ stat.st_size) & 0xffff_ffff)
-                csd = build_csd(len(payload))
-
-                await send_command(2)
-                r2 = await receive_response(136)
-                self.assertEqual((r2 >> 1) & ((1 << 127) - 1), cid >> 1)
-
-                await send_command(3)
-                r6 = await receive_response(48)
-                self.assertEqual((r6 >> 24) & 0xffff, 0x1234)
-                self.assertEqual((r6 >> 40) & 0x3f, 3)
-
-                await send_command(9, 0x1234_0000)
-                r2 = await receive_response(136)
-                self.assertEqual((r2 >> 1) & ((1 << 127) - 1), csd >> 1)
-
-                await send_command(7, 0x1234_0000)
-                assert_r1(await receive_response(48), 7)
-
-                await send_command(16, BLOCK_SIZE)
-                assert_r1(await receive_response(48), 16)
-
-                await send_command(17, BLOCK_SIZE)
-                assert_r1(await receive_response(48), 17)
-
-                while not applet.sd_card_iface._pipe.flush_readable:
-                    await cycle()
-                await applet.sd_card_iface.serve_once()
-                await receive_data_block(payload[BLOCK_SIZE:BLOCK_SIZE * 2])
-
-                # A multi-block read prefetches its next block. If CMD12 stops it before that
-                # block is transferred, the following command must wait for data tagged with its
-                # own address rather than consuming the stale prefetch.
-                await send_command(18, 0)
-                assert_r1(await receive_response(48), 18)
-                while not applet.sd_card_iface._pipe.flush_readable:
-                    await cycle()
-                await applet.sd_card_iface.serve_once()
-                await receive_data_block(payload[:BLOCK_SIZE])
-
-                await send_command(12)
-                assert_r1(await receive_response(48), 12)
-                while not applet.sd_card_iface._pipe.flush_readable:
-                    await cycle()
-                await applet.sd_card_iface.serve_once()  # stale block-one prefetch
-                read_address = BLOCK_SIZE * 3
-                await send_command(17, read_address)
-                assert_r1(await receive_response(48), 17)
-                while not applet.sd_card_iface._pipe.flush_readable:
-                    await cycle()
-                await applet.sd_card_iface.serve_once()
-                await receive_data_block(payload[read_address:read_address + BLOCK_SIZE])
-
-                # Exercise the same reconstructed-byte and CRC codec on a 1-bit card write before
-                # changing widths with ACMD6.
-                one_bit_address = BLOCK_SIZE * 2
-                one_bit_block = bytes((0x5a ^ index) & 0xff for index in range(BLOCK_SIZE))
-                await send_command(24, one_bit_address)
-                assert_r1(await receive_response(48), 24)
-                await bfm.send_data_block_1bit(one_bit_block)
-                self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
-                await complete_busy_request("host-backed 1-bit write completion")
-                self.assertEqual(
-                    os.pread(image.fileno(), BLOCK_SIZE, one_bit_address), one_bit_block)
-
-                await send_command(55)
-                assert_r1(await receive_response(48), 55)
-                await send_command(6, 2)
-                assert_r1(await receive_response(48), 6)
-
-                write_address = BLOCK_SIZE * 2
-                write_block = bytes((0xa5 ^ index) & 0xff for index in range(BLOCK_SIZE))
-                await send_command(24, write_address)
-                assert_r1(await receive_response(48), 24)
-
-                await bfm.send_data_block_4bit(write_block)
-                self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
-
-                # DAT0 remains low while the block crosses to the host and is written.
-                await complete_busy_request("host-backed 4-bit write completion")
-                self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, write_address), write_block)
-
-                # A bad per-lane CRC must be rejected locally without emitting a host write, and
-                # the command/data engines must return to TRAN for the following command.
-                rejected_address = 0
-                rejected_block = bytes([0x3c]) * BLOCK_SIZE
-                original_block = os.pread(image.fileno(), BLOCK_SIZE, rejected_address)
-                writes_before = await applet.sd_card_iface.write_count
-                await send_command(24, rejected_address)
-                assert_r1(await receive_response(48), 24)
-                await bfm.send_data_block_4bit(rejected_block, valid_crc=False)
-                self.assertEqual(await bfm.receive_data_response(), [0, 1, 0, 1, 1])
-                for _ in range(32):
-                    await cycle()
-                self.assertFalse(applet.sd_card_iface._pipe.flush_readable)
-                self.assertEqual(await applet.sd_card_iface.write_count, writes_before)
-                self.assertEqual(
-                    os.pread(image.fileno(), BLOCK_SIZE, rejected_address), original_block)
-                await send_command(13, 0x1234_0000)
-                assert_r1(await receive_response(48), 13)
-
-                # Erase requests now originate in the data engine and cross the directional
-                # data/host handshake just like writes.
-                erase_address = BLOCK_SIZE
-                await send_command(32, erase_address)
-                assert_r1(await receive_response(48), 32)
-                await send_command(33, erase_address)
-                assert_r1(await receive_response(48), 33)
-                await send_command(38)
-                assert_r1(await receive_response(48), 38)
-                await complete_busy_request("host-backed erase completion")
-                self.assertEqual(
-                    os.pread(image.fileno(), BLOCK_SIZE, erase_address),
-                    bytes([0xff]) * BLOCK_SIZE)
-
-                await applet.sd_card_iface.close()
+                transfer_speed = (CSDTransferSpeedProfile.Conservative
+                    if args.conservative_speed else CSDTransferSpeedProfile.Default)
+                await self._initialize_sim_card(
+                    applet, bfm, image, payload, transfer_speed=transfer_speed)
+                try:
+                    await scenario(applet, bfm, image)
+                finally:
+                    await applet.sd_card_iface.close()
 
             async def main(ctx):
                 await applet.setup(args)
                 await card_host(ctx)
 
             assembly.run(main)
+
+    def test_sim_initialization_and_single_block_read(self):
+        payload = bytes(
+            ((index // BLOCK_SIZE) * 0x31 + index) & 0xff
+            for index in range(BLOCK_SIZE * 8))
+
+        async def scenario(applet, bfm, image):
+            await bfm.send_command(17, BLOCK_SIZE)
+            bfm.assert_r1(await bfm.receive_response(48), 17)
+            await self._serve_next_sim_request(applet, bfm)
+            await self._receive_sim_block(
+                applet, bfm, payload[BLOCK_SIZE:BLOCK_SIZE * 2])
+
+        self._run_simulation(payload, scenario)
+
+    def test_sim_single_and_multi_bit_writes_and_erase(self):
+        payload = bytes(
+            ((index // BLOCK_SIZE) * 0x31 + index) & 0xff
+            for index in range(BLOCK_SIZE * 8))
+
+        async def scenario(applet, bfm, image):
+            one_bit_address = BLOCK_SIZE * 2
+            one_bit_block = bytes((0x5a ^ index) & 0xff for index in range(BLOCK_SIZE))
+            await bfm.send_command(24, one_bit_address)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            await bfm.send_data_block_1bit(one_bit_block)
+            self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
+            await self._complete_sim_busy_request(
+                applet, bfm, "host-backed 1-bit write completion")
+            self.assertEqual(
+                os.pread(image.fileno(), BLOCK_SIZE, one_bit_address), one_bit_block)
+
+            await bfm.send_command(55)
+            bfm.assert_r1(await bfm.receive_response(48), 55)
+            await bfm.send_command(6, 2)
+            bfm.assert_r1(await bfm.receive_response(48), 6)
+
+            write_address = BLOCK_SIZE * 3
+            write_block = bytes((0xa5 ^ index) & 0xff for index in range(BLOCK_SIZE))
+            await bfm.send_command(24, write_address)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            await bfm.send_data_block_4bit(write_block)
+            self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
+            await self._complete_sim_busy_request(
+                applet, bfm, "host-backed 4-bit write completion")
+            self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, write_address), write_block)
+
+            rejected_address = 0
+            rejected_block = bytes([0x3c]) * BLOCK_SIZE
+            original_block = os.pread(image.fileno(), BLOCK_SIZE, rejected_address)
+            writes_before = await applet.sd_card_iface.write_count
+            await bfm.send_command(24, rejected_address)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            await bfm.send_data_block_4bit(rejected_block, valid_crc=False)
+            self.assertEqual(await bfm.receive_data_response(), [0, 1, 0, 1, 1])
+            await bfm.idle(32)
+            self.assertFalse(applet.sd_card_iface._pipe.flush_readable)
+            self.assertEqual(await applet.sd_card_iface.write_count, writes_before)
+            self.assertEqual(
+                os.pread(image.fileno(), BLOCK_SIZE, rejected_address), original_block)
+
+            erase_address = BLOCK_SIZE
+            await bfm.send_command(32, erase_address)
+            bfm.assert_r1(await bfm.receive_response(48), 32)
+            await bfm.send_command(33, erase_address)
+            bfm.assert_r1(await bfm.receive_response(48), 33)
+            await bfm.send_command(38)
+            bfm.assert_r1(await bfm.receive_response(48), 38)
+            await self._complete_sim_busy_request(
+                applet, bfm, "host-backed erase completion")
+            self.assertEqual(
+                os.pread(image.fileno(), BLOCK_SIZE, erase_address),
+                bytes([0xff]) * BLOCK_SIZE)
+
+        self._run_simulation(payload, scenario)
+
+    def test_sim_sustained_cmd18_with_host_stalls_and_random_cmd12(self):
+        payload = b"".join(
+            bytes(((block * 0x31) + index) & 0xff for index in range(BLOCK_SIZE))
+            for block in range(48))
+
+        async def scenario(applet, bfm, image):
+            rng = random.Random(0x18_12_860)
+            stalls = deque([0, 5000] + [rng.randrange(0, 5200) for _ in range(32)])
+            stall_remaining = None
+
+            async def service_host():
+                nonlocal stall_remaining
+                if not applet.sd_card_iface._pipe.flush_readable:
+                    stall_remaining = None
+                    return
+                if stall_remaining is None:
+                    stall_remaining = stalls.popleft() if stalls else 0
+                if stall_remaining:
+                    stall_remaining -= 1
+                    return
+                await applet.sd_card_iface.serve_once()
+                stall_remaining = None
+
+            bfm.cycle_hook = service_host
+            for round_index in range(3):
+                first_block = round_index * 12
+                transferred_blocks = 4 + rng.randrange(3)
+                await bfm.send_command(18, first_block * BLOCK_SIZE)
+                bfm.assert_r1(await bfm.receive_response(48), 18)
+                for block in range(first_block, first_block + transferred_blocks):
+                    await self._receive_sim_block(
+                        applet, bfm,
+                        payload[block * BLOCK_SIZE:(block + 1) * BLOCK_SIZE],
+                        timeout_cycles=8192)
+
+                # Vary CMD12 from immediately after a complete block to well into the following
+                # block. The pending prefetch may still be Filling, already Ready, or Active.
+                await bfm.idle(rng.randrange(512))
+                await bfm.send_command(12)
+                bfm.assert_r1(await bfm.receive_response(48), 12)
+                await bfm.idle(BLOCK_SIZE * 8 + 64)
+
+                guard_block = 40 + round_index
+                await bfm.send_command(17, guard_block * BLOCK_SIZE)
+                bfm.assert_r1(await bfm.receive_response(48), 17)
+                await self._receive_sim_block(
+                    applet, bfm,
+                    payload[guard_block * BLOCK_SIZE:(guard_block + 1) * BLOCK_SIZE],
+                    timeout_cycles=8192)
+
+            bfm.cycle_hook = None
+            self.assertGreater(await applet.sd_card_iface.prefetch_waits, 0)
+            self.assertGreater(await applet.sd_card_iface.max_host_service_latency, 0)
+            self.assertEqual(await applet.sd_card_iface.buffer_faults, 0)
+
+        self._run_simulation(payload, scenario)
 
 
 class _FakePipe:
@@ -654,6 +710,48 @@ class FAT16ImageTestCase(unittest.TestCase):
 
 
 class BackendWorkerTestCase(unittest.TestCase):
+    def test_read_ahead_is_selected_by_backend_capability(self):
+        class CountingBackend(_MemoryBackend):
+            def __init__(self, image, *, preferred=1):
+                super().__init__(image)
+                self.preferred = preferred
+                self.runs = []
+
+            @property
+            def preferred_read_ahead_blocks(self):
+                return self.preferred
+
+            def read_blocks(self, address, count):
+                self.runs.append((address, count))
+                return super().read_blocks(address, count)
+
+        async def scenario():
+            image = bytes(BLOCK_SIZE * 8)
+            generic = CountingBackend(image)
+            generic_worker = BackendWorker(generic)
+            self.assertEqual(generic_worker.read_ahead_blocks, 1)
+            await generic_worker.read_block(0)
+            await generic_worker.read_block(BLOCK_SIZE)
+            self.assertEqual(generic.runs, [(0, 1), (BLOCK_SIZE, 1)])
+            await generic_worker.close()
+
+            optimized = CountingBackend(image, preferred=4)
+            optimized_worker = BackendWorker(optimized)
+            self.assertEqual(optimized_worker.read_ahead_blocks, 4)
+            await optimized_worker.read_block(0)
+            await optimized_worker.read_block(BLOCK_SIZE)
+            self.assertEqual(optimized.runs, [(0, 4)])
+            await optimized_worker.close()
+
+            with tempfile.NamedTemporaryFile() as image_file:
+                image_file.truncate(BLOCK_SIZE * 8)
+                file_backend = FileBlockBackend(image_file.name)
+                file_worker = BackendWorker(file_backend)
+                self.assertEqual(file_worker.read_ahead_blocks, 256)
+                await file_worker.close()
+
+        asyncio.run(scenario())
+
     def test_sequential_reads_use_bounded_read_ahead_and_writes_invalidate_it(self):
         class CountingBackend(_MemoryBackend):
             def __init__(self, image):
@@ -693,6 +791,8 @@ class BackendWorkerTestCase(unittest.TestCase):
             await asyncio.sleep(0.005)
             self.assertFalse(read.done())
             self.assertEqual(await read, bytes(BLOCK_SIZE))
+            self.assertGreaterEqual(worker.max_service_latency, 0.05)
+            self.assertGreaterEqual(worker.service_count, 1)
             await worker.close()
             self.assertTrue(backend.closed)
 
@@ -728,6 +828,42 @@ class COBSRecoveryTestCase(unittest.TestCase):
         simulator.add_testbench(sender)
         simulator.add_testbench(receiver)
         simulator.run()
+
+
+class ZaurusSDControllerTestCase(unittest.TestCase):
+    def test_prepare_and_restore_are_idempotent(self):
+        class FakeShell:
+            def __init__(self):
+                self.commands = []
+
+            async def run(self, command, *, check=True, timeout=None):
+                self.commands.append((command, check, timeout))
+                return 0, ""
+
+        async def scenario():
+            shell = FakeShell()
+            controller = ZaurusSDController(
+                shell, "/usr/mnt.rom/card", settle_delay=0)
+            await controller.prepare()
+            prepare_commands = len(shell.commands)
+            await controller.prepare()
+            self.assertEqual(len(shell.commands), prepare_commands)
+            self.assertTrue(any("killall sdmgr" in command
+                for command, _, _ in shell.commands))
+            self.assertTrue(any("rmmod sharp_mmcsd_m" in command
+                for command, _, _ in shell.commands))
+            self.assertTrue(any("insmod" in command
+                for command, _, _ in shell.commands))
+
+            await controller.restore()
+            restore_commands = len(shell.commands)
+            await controller.restore()
+            self.assertEqual(len(shell.commands), restore_commands)
+            self.assertTrue(any("/sbin/sdmgr" in command
+                for command, _, _ in shell.commands[prepare_commands:]))
+            self.assertTrue(all(timeout == 30 for _, _, timeout in shell.commands))
+
+        asyncio.run(scenario())
 
 
 class ConsoleTransportTestCase(unittest.TestCase):
