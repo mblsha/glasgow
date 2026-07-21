@@ -36,18 +36,8 @@ class DataEngine(wiring.Component):
         m.submodules.read_buffers = read_buffers = ReadBufferManager()
         buffer_client = read_buffers.client
         buffer_host = read_buffers.host
-        m.d.comb += [
-            self.storage.read_request.eq(buffer_host.request),
-            self.storage.read_request_address.eq(buffer_host.request_address),
-            self.storage.read_request_bank.eq(buffer_host.request_bank),
-            buffer_host.request_accepted.eq(self.storage.read_request_accepted),
-            buffer_host.reply_ready.eq(self.storage.read_buffer_ready),
-            buffer_host.reply_address.eq(self.storage.read_buffer_address),
-            buffer_host.reply_bank.eq(self.storage.read_reply_bank),
-            buffer_host.reply_error.eq(self.storage.read_reply_error),
-            self.storage.read_buffer_consume.eq(buffer_host.reply_consume),
-            self.read_bank_states.eq(buffer_client.bank_states),
-        ]
+        wiring.connect(m, buffer_host, wiring.flipped(self.storage.read))
+        m.d.comb += self.read_bank_states.eq(buffer_client.bank_states)
         _elaborate_data_transfer_engine(
             m, self, self.buffer, self.dat_i, self.dat_o, self.dat_oe,
             self.control, self.storage, buffer_client)
@@ -62,11 +52,12 @@ def _elaborate_data_transfer_engine(
     current_address = control.current_address
     response_active = control.response_active
     stop_requested = control.stop_requested
-    write_request = storage.write_request
-    erase_request = storage.erase_request
-    host_ack_valid = storage.host_ack_valid
-    host_ack_status = storage.host_ack_status
-    host_ack_consume = storage.host_ack_consume
+    mutation = storage.mutation
+    write_request = mutation.write_request
+    erase_request = mutation.erase_request
+    host_ack_valid = mutation.ack_valid
+    host_ack_status = mutation.ack_status
+    host_ack_consume = mutation.ack_consume
     read_error_pending = Signal()
     prefetch_wait_active = Signal()
     prefetch_wait_current = Signal(32)
@@ -100,10 +91,10 @@ def _elaborate_data_transfer_engine(
             control.address_update.eq(value),
         ]
 
-    with m.If(storage.write_request_accepted | stop_requested |
+    with m.If(mutation.write_request_accepted | stop_requested |
               (data_mode == DataMode.Idle)):
         m.d.sd += write_request.eq(0)
-    with m.If(storage.erase_request_accepted):
+    with m.If(mutation.erase_request_accepted):
         m.d.sd += erase_request.eq(0)
     with m.If(read_buffers.reply_fault):
         m.d.sd += read_error_pending.eq(1)
@@ -259,8 +250,8 @@ def _elaborate_data_transfer_engine(
                     next_address = current_address + BLOCK_SIZE
                     m.d.comb += read_buffers.lookup_address.eq(next_address)
                     next_ready = read_buffers.ready | (
-                        storage.read_buffer_ready &
-                        (storage.read_buffer_address == next_address))
+                        storage.read.reply_ready &
+                        (storage.read.reply_address == next_address))
                     with m.If(~next_ready & ~prefetch_wait_active):
                         m.d.sd += [
                             self.prefetch_waits.eq(self.prefetch_waits + 1),

@@ -4,7 +4,10 @@ from amaranth.lib.wiring import In, Out
 from ._gateware_support import CardState, DataMode
 
 
-__all__ = ["CommandDataSignature", "DataHostSignature", "ReadBufferState"]
+__all__ = [
+    "CommandDataSignature", "DataHostSignature", "MutationHostSignature",
+    "ReadBufferState", "ReadHostSignature",
+]
 
 
 class ReadBufferState(enum.Enum, shape=3):
@@ -42,26 +45,43 @@ class CommandDataSignature(wiring.Signature):
         })
 
 
-class DataHostSignature(wiring.Signature):
-    """Block request/result channel, oriented from the data engine toward the host engine."""
+class ReadHostSignature(wiring.Signature):
+    """Read-fill request/reply channel, oriented toward the host engine."""
 
     def __init__(self):
         super().__init__({
-            "read_request": Out(1),
-            "read_request_address": Out(32),
-            "read_request_bank": Out(1),
-            "read_request_accepted": In(1),
+            "request": Out(1),
+            "request_address": Out(32),
+            "request_bank": Out(1),
+            "request_accepted": In(1),
+            "reply_ready": In(1),
+            "reply_address": In(32),
+            "reply_bank": In(1),
+            "reply_consume": Out(1),
+            "reply_error": In(1),
+        })
+
+
+class MutationHostSignature(wiring.Signature):
+    """Write/erase request and acknowledgement channel, oriented toward the host engine."""
+
+    def __init__(self):
+        super().__init__({
             "write_request": Out(1),
             "write_request_accepted": In(1),
             "erase_request": Out(1),
             "erase_request_accepted": In(1),
+            "ack_valid": In(1),
+            "ack_status": In(8),
+            "ack_consume": Out(1),
+        })
 
-            "read_buffer_ready": In(1),
-            "read_buffer_address": In(32),
-            "read_reply_bank": In(1),
-            "read_buffer_consume": Out(1),
-            "read_reply_error": In(1),
-            "host_ack_valid": In(1),
-            "host_ack_status": In(8),
-            "host_ack_consume": Out(1),
+
+class DataHostSignature(wiring.Signature):
+    """Block request/result channels, oriented from the data engine toward the host engine."""
+
+    def __init__(self):
+        super().__init__({
+            "read": Out(ReadHostSignature()),
+            "mutation": Out(MutationHostSignature()),
         })
