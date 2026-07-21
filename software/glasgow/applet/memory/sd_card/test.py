@@ -1,7 +1,5 @@
 import asyncio
-from collections import deque
 import os
-import random
 import struct
 import tempfile
 import time
@@ -12,30 +10,33 @@ from amaranth.sim import Simulator
 
 from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
 from glasgow.gateware import cobs as gateware_cobs
-from glasgow.simulation.assembly import SimulationAssembly
 
 from . import (
     BLOCK_SIZE, BackendError, BackendStatus, BackendWorker, BlockBackend, FileBlockBackend,
-    CSDTransferSpeedProfile, HostEvent, HostReply,
-    ReplyFrame, RequestFrame, SDCardApplet, SDCardInterface,
+    DEFAULT_TRANSFER_SPEED, HostEvent, HostReply,
+    ReplyFrame, RequestFrame, SDCardApplet, SDCardDiagnostics, SDCardInterface,
     build_cid, build_csd, build_scr, crc7, crc16,
+    decode_csd_transfer_speed, encode_csd_transfer_speed, parse_transfer_speed,
 )
-from .bfm import SDHostBFM
 from ._console import SerialTransport, TelnetTransport
-from .e2e_zaurus import ZaurusSDController
+from .e2e_zaurus import ZaurusMountState, ZaurusSDController
 from ._buffer import BlockBuffer
 from ._fat16 import FAT16Image, create_fat16_image
+from ._interfaces import ReadBufferState
 from ._protocol import (
     HOST_OPERATIONS, HOST_OPERATION_FOR_EVENT, HOST_OPERATION_FOR_REPLY,
     FrameError, frame_crc16,
 )
+from ._read_buffer import ReadBufferManager
+from .test_sim import SDCardSimulationTestMixin
 
 
 GENERATION = 0x4321
 REQUEST_ID = 0x1234
 
 
-class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
+class SDCardAppletTestCase(
+        SDCardSimulationTestMixin, GlasgowAppletV2TestCase, applet=SDCardApplet):
     @synthesis_test
     def test_build(self):
         self.assertBuilds(revision="C3")
@@ -54,15 +55,22 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
         self.assertEqual((build_csd(16 * 1024 * 1024) >> 12) & 1, 0)
         self.assertEqual((build_csd(16 * 1024 * 1024, read_only=True) >> 12) & 1, 1)
 
-    def test_csd_transfer_speed_profiles(self):
+    def test_csd_transfer_speed_encoding(self):
         default = build_csd(16 * 1024 * 1024)
-        conservative = build_csd(
-            16 * 1024 * 1024,
-            transfer_speed=CSDTransferSpeedProfile.Conservative)
-        self.assertEqual((default >> 96) & 0xff, CSDTransferSpeedProfile.Default)
-        self.assertEqual((conservative >> 96) & 0xff,
-            CSDTransferSpeedProfile.Conservative)
+        intermediate = build_csd(16 * 1024 * 1024, transfer_speed=12_500_000)
+        conservative = build_csd(16 * 1024 * 1024, transfer_speed=5_000_000)
+        self.assertEqual((default >> 96) & 0xff, 0x32)
+        self.assertEqual((intermediate >> 96) & 0xff, 0x12)
+        self.assertEqual(decode_csd_transfer_speed((intermediate >> 96) & 0xff), 12_000_000)
+        self.assertEqual((conservative >> 96) & 0xff, 0x59)
+        self.assertEqual(encode_csd_transfer_speed(5_000_000), 0x59)
         self.assertEqual((conservative >> 1) & 0x7f, crc7(conservative >> 8, 120))
+
+    def test_transfer_speed_argument(self):
+        self.assertEqual(parse_transfer_speed("25m"), DEFAULT_TRANSFER_SPEED)
+        self.assertEqual(parse_transfer_speed("12.5 Mbit/s"), 12_500_000)
+        self.assertEqual(self._parse_args(["--transfer-speed", "5m", "card.img"]).transfer_speed,
+            5_000_000)
 
     def test_csd_capacity_through_16_mib(self):
         for size in (2048, 1 << 20, 8 << 20, 16 << 20):
@@ -77,247 +85,6 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
         scr = build_scr()
         self.assertEqual((scr >> 56) & 0xf, 0)  # SD 1.0/1.01
         self.assertEqual((scr >> 48) & 0xf, 0b0101)
-
-    async def _initialize_sim_card(self, applet, bfm, image, payload, *, transfer_speed):
-        # Let the enable synchronizer cross into the externally clocked SD domain.
-        await bfm.idle(4)
-
-        # Configuration is snapshotted atomically before command sampling. Mutating the source
-        # register while enabled must not tear or alter the active 128-bit CID.
-        await applet.sd_card_iface._cid.set(0)
-        await bfm.send_command(0)
-        for _ in range(4):
-            command_oe, _, _ = await bfm.cycle()
-            self.assertEqual(command_oe, 0)
-
-        await bfm.send_command(55)
-        self.assertEqual(await applet.sd_card_iface.last_command, 55)
-        bfm.assert_r1(await bfm.receive_response(48), 55)
-
-        await bfm.send_command(41, 0x00ff_8000)
-        r3 = await bfm.receive_response(48)
-        self.assertEqual(r3 >> 46, 0)
-        self.assertEqual((r3 >> 40) & 0x3f, 0x3f)
-        self.assertEqual((r3 >> 8) & 0xffff_ffff, 0x80ff_8000)
-        self.assertEqual(r3 & 0xff, 0xff)
-
-        stat = os.fstat(image.fileno())
-        cid = build_cid(serial=(stat.st_ino ^ stat.st_size) & 0xffff_ffff)
-        csd = build_csd(len(payload), transfer_speed=transfer_speed)
-
-        await bfm.send_command(2)
-        r2 = await bfm.receive_response(136)
-        self.assertEqual((r2 >> 1) & ((1 << 127) - 1), cid >> 1)
-
-        await bfm.send_command(3)
-        r6 = await bfm.receive_response(48)
-        self.assertEqual((r6 >> 24) & 0xffff, 0x1234)
-        self.assertEqual((r6 >> 40) & 0x3f, 3)
-
-        await bfm.send_command(9, 0x1234_0000)
-        r2 = await bfm.receive_response(136)
-        self.assertEqual((r2 >> 1) & ((1 << 127) - 1), csd >> 1)
-
-        await bfm.send_command(7, 0x1234_0000)
-        bfm.assert_r1(await bfm.receive_response(48), 7)
-        await bfm.send_command(16, BLOCK_SIZE)
-        bfm.assert_r1(await bfm.receive_response(48), 16)
-
-    async def _serve_next_sim_request(self, applet, bfm):
-        while not applet.sd_card_iface._pipe.flush_readable:
-            await bfm.cycle()
-        await applet.sd_card_iface.serve_once()
-
-    async def _receive_sim_block(self, applet, bfm, expected, *, timeout_cycles=2048):
-        async def diagnostic():
-            pipe = applet.sd_card_iface._pipe
-            return (
-                f"host readable={pipe.readable}, "
-                f"errors={await applet.sd_card_iface.protocol_errors}, "
-                f"prefetch waits={await applet.sd_card_iface.prefetch_waits}")
-
-        await bfm.receive_data_block(
-            expected, timeout_cycles=timeout_cycles, timeout_diagnostic=diagnostic)
-
-    async def _complete_sim_busy_request(self, applet, bfm, description):
-        saw_busy = False
-        for _ in range(4096):
-            _, _, data_sample = await bfm.cycle()
-            if data_sample[0] == (1, 0):
-                saw_busy = True
-            if applet.sd_card_iface._pipe.flush_readable:
-                await applet.sd_card_iface.serve_once()
-            if saw_busy and data_sample[0][0] == 0:
-                return
-        pipe = applet.sd_card_iface._pipe
-        self.fail(
-            f"timed out waiting for {description} (host readable={pipe.readable}, "
-            f"errors={await applet.sd_card_iface.protocol_errors})")
-
-    def _run_simulation(self, payload, scenario, *, setup_arguments=()):
-        with tempfile.NamedTemporaryFile() as image:
-            image.write(payload)
-            image.flush()
-
-            args = self._parse_args([*setup_arguments, image.name])
-            assembly = SimulationAssembly()
-            applet = self.applet_cls(assembly)
-            applet.build(args)
-            applet.sd_card_iface._worker_factory = _InlineWorker
-
-            clk = assembly.get_pin("A2")
-            cmd = assembly.get_pin("A5")
-            dat = [assembly.get_pin(name) for name in ("A1", "A0", "A7", "A6")]
-
-            async def card_host(ctx):
-                bfm = SDHostBFM(ctx, self, clk=clk, cmd=cmd, dat=dat)
-                transfer_speed = (CSDTransferSpeedProfile.Conservative
-                    if args.conservative_speed else CSDTransferSpeedProfile.Default)
-                await self._initialize_sim_card(
-                    applet, bfm, image, payload, transfer_speed=transfer_speed)
-                try:
-                    await scenario(applet, bfm, image)
-                finally:
-                    await applet.sd_card_iface.close()
-
-            async def main(ctx):
-                await applet.setup(args)
-                await card_host(ctx)
-
-            assembly.run(main)
-
-    def test_sim_initialization_and_single_block_read(self):
-        payload = bytes(
-            ((index // BLOCK_SIZE) * 0x31 + index) & 0xff
-            for index in range(BLOCK_SIZE * 8))
-
-        async def scenario(applet, bfm, image):
-            await bfm.send_command(17, BLOCK_SIZE)
-            bfm.assert_r1(await bfm.receive_response(48), 17)
-            await self._serve_next_sim_request(applet, bfm)
-            await self._receive_sim_block(
-                applet, bfm, payload[BLOCK_SIZE:BLOCK_SIZE * 2])
-
-        self._run_simulation(payload, scenario)
-
-    def test_sim_single_and_multi_bit_writes_and_erase(self):
-        payload = bytes(
-            ((index // BLOCK_SIZE) * 0x31 + index) & 0xff
-            for index in range(BLOCK_SIZE * 8))
-
-        async def scenario(applet, bfm, image):
-            one_bit_address = BLOCK_SIZE * 2
-            one_bit_block = bytes((0x5a ^ index) & 0xff for index in range(BLOCK_SIZE))
-            await bfm.send_command(24, one_bit_address)
-            bfm.assert_r1(await bfm.receive_response(48), 24)
-            await bfm.send_data_block_1bit(one_bit_block)
-            self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
-            await self._complete_sim_busy_request(
-                applet, bfm, "host-backed 1-bit write completion")
-            self.assertEqual(
-                os.pread(image.fileno(), BLOCK_SIZE, one_bit_address), one_bit_block)
-
-            await bfm.send_command(55)
-            bfm.assert_r1(await bfm.receive_response(48), 55)
-            await bfm.send_command(6, 2)
-            bfm.assert_r1(await bfm.receive_response(48), 6)
-
-            write_address = BLOCK_SIZE * 3
-            write_block = bytes((0xa5 ^ index) & 0xff for index in range(BLOCK_SIZE))
-            await bfm.send_command(24, write_address)
-            bfm.assert_r1(await bfm.receive_response(48), 24)
-            await bfm.send_data_block_4bit(write_block)
-            self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
-            await self._complete_sim_busy_request(
-                applet, bfm, "host-backed 4-bit write completion")
-            self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, write_address), write_block)
-
-            rejected_address = 0
-            rejected_block = bytes([0x3c]) * BLOCK_SIZE
-            original_block = os.pread(image.fileno(), BLOCK_SIZE, rejected_address)
-            writes_before = await applet.sd_card_iface.write_count
-            await bfm.send_command(24, rejected_address)
-            bfm.assert_r1(await bfm.receive_response(48), 24)
-            await bfm.send_data_block_4bit(rejected_block, valid_crc=False)
-            self.assertEqual(await bfm.receive_data_response(), [0, 1, 0, 1, 1])
-            await bfm.idle(32)
-            self.assertFalse(applet.sd_card_iface._pipe.flush_readable)
-            self.assertEqual(await applet.sd_card_iface.write_count, writes_before)
-            self.assertEqual(
-                os.pread(image.fileno(), BLOCK_SIZE, rejected_address), original_block)
-
-            erase_address = BLOCK_SIZE
-            await bfm.send_command(32, erase_address)
-            bfm.assert_r1(await bfm.receive_response(48), 32)
-            await bfm.send_command(33, erase_address)
-            bfm.assert_r1(await bfm.receive_response(48), 33)
-            await bfm.send_command(38)
-            bfm.assert_r1(await bfm.receive_response(48), 38)
-            await self._complete_sim_busy_request(
-                applet, bfm, "host-backed erase completion")
-            self.assertEqual(
-                os.pread(image.fileno(), BLOCK_SIZE, erase_address),
-                bytes([0xff]) * BLOCK_SIZE)
-
-        self._run_simulation(payload, scenario)
-
-    def test_sim_sustained_cmd18_with_host_stalls_and_random_cmd12(self):
-        payload = b"".join(
-            bytes(((block * 0x31) + index) & 0xff for index in range(BLOCK_SIZE))
-            for block in range(48))
-
-        async def scenario(applet, bfm, image):
-            rng = random.Random(0x18_12_860)
-            stalls = deque([0, 5000] + [rng.randrange(0, 5200) for _ in range(32)])
-            stall_remaining = None
-
-            async def service_host():
-                nonlocal stall_remaining
-                if not applet.sd_card_iface._pipe.flush_readable:
-                    stall_remaining = None
-                    return
-                if stall_remaining is None:
-                    stall_remaining = stalls.popleft() if stalls else 0
-                if stall_remaining:
-                    stall_remaining -= 1
-                    return
-                await applet.sd_card_iface.serve_once()
-                stall_remaining = None
-
-            bfm.cycle_hook = service_host
-            for round_index in range(3):
-                first_block = round_index * 12
-                transferred_blocks = 4 + rng.randrange(3)
-                await bfm.send_command(18, first_block * BLOCK_SIZE)
-                bfm.assert_r1(await bfm.receive_response(48), 18)
-                for block in range(first_block, first_block + transferred_blocks):
-                    await self._receive_sim_block(
-                        applet, bfm,
-                        payload[block * BLOCK_SIZE:(block + 1) * BLOCK_SIZE],
-                        timeout_cycles=8192)
-
-                # Vary CMD12 from immediately after a complete block to well into the following
-                # block. The pending prefetch may still be Filling, already Ready, or Active.
-                await bfm.idle(rng.randrange(512))
-                await bfm.send_command(12)
-                bfm.assert_r1(await bfm.receive_response(48), 12)
-                await bfm.idle(BLOCK_SIZE * 8 + 64)
-
-                guard_block = 40 + round_index
-                await bfm.send_command(17, guard_block * BLOCK_SIZE)
-                bfm.assert_r1(await bfm.receive_response(48), 17)
-                await self._receive_sim_block(
-                    applet, bfm,
-                    payload[guard_block * BLOCK_SIZE:(guard_block + 1) * BLOCK_SIZE],
-                    timeout_cycles=8192)
-
-            bfm.cycle_hook = None
-            self.assertGreater(await applet.sd_card_iface.prefetch_waits, 0)
-            self.assertGreater(await applet.sd_card_iface.max_host_service_latency, 0)
-            self.assertEqual(await applet.sd_card_iface.buffer_faults, 0)
-
-        self._run_simulation(payload, scenario)
-
 
 class _FakePipe:
     def __init__(self, request):
@@ -549,6 +316,44 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         self.assertEqual(header.status, BackendStatus.Invalid)
         self.assertEqual(payload, b"")
 
+    def test_named_diagnostics_snapshot(self):
+        class ImmediateValue:
+            def __init__(self, value):
+                self.value = value
+
+            def __await__(self):
+                async def get():
+                    return self.value
+                return get().__await__()
+
+        class Worker:
+            service_count = 91
+            max_service_latency = 0.125
+
+        register_names = (
+            "clock_count", "command_low_count", "command_count", "read_count",
+            "write_count", "protocol_errors", "backend_errors", "stale_replies",
+            "buffer_faults", "prefetch_waits", "prefetch_wait_cycles",
+            "max_prefetch_wait", "max_host_service_latency",
+        )
+        iface = object.__new__(SDCardInterface)
+        for value, name in enumerate(register_names, 1):
+            setattr(iface, name, ImmediateValue(value))
+        iface._worker = Worker()
+        iface._host_backend_errors = 14
+        iface._flush_count = 15
+
+        diagnostics = asyncio.run(iface.read_diagnostics())
+        self.assertIsInstance(diagnostics, SDCardDiagnostics)
+        self.assertEqual(diagnostics.sd_clocks, 1)
+        self.assertEqual(diagnostics.prefetch_wait_cycles, 11)
+        self.assertEqual(diagnostics.max_prefetch_wait_cycles, 12)
+        self.assertEqual(diagnostics.max_host_service_latency_cycles, 13)
+        self.assertEqual(diagnostics.host_backend_errors, 14)
+        self.assertEqual(diagnostics.durable_flushes, 15)
+        self.assertEqual(diagnostics.backend_calls, 91)
+        self.assertEqual(diagnostics.max_backend_call_seconds, 0.125)
+
     def test_power_monitor_suspends_and_resumes(self):
         class Device:
             def __init__(self):
@@ -684,6 +489,109 @@ class BlockBufferTestCase(unittest.TestCase):
             ctx.set(dut.data.read_address, BLOCK_SIZE + 7)
             await ctx.tick("sd")
             self.assertEqual(ctx.get(dut.collision_count), 3)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6, domain="sd")
+        simulator.add_testbench(testbench)
+        simulator.run()
+
+    def test_ownership_violation_poisoning(self):
+        m = Module()
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = BlockBuffer()
+
+        async def testbench(ctx):
+            ctx.set(dut.host.write_en, 1)
+            ctx.set(dut.host.write_address, 0)
+            self.assertEqual(ctx.get(dut.ownership_violation), 1)
+            await ctx.tick("sd")
+            self.assertEqual(ctx.get(dut.fault), 1)
+            self.assertEqual(ctx.get(dut.fault_count), 1)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6, domain="sd")
+        simulator.add_testbench(testbench)
+        simulator.run()
+
+
+class ReadBufferManagerTestCase(unittest.TestCase):
+    def test_full_bank_ownership_lifecycle(self):
+        m = Module()
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = ReadBufferManager()
+
+        async def testbench(ctx):
+            address = BLOCK_SIZE * 3
+            ctx.set(dut.lookup_address, address)
+            ctx.set(dut.reserve_address, address)
+            self.assertEqual(ctx.get(dut.reserve_ready), 1)
+            ctx.set(dut.reserve, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.reserve, 0)
+            self.assertEqual(ctx.get(dut.filling), 1)
+            self.assertEqual(ctx.get(dut.host_request), 1)
+            bank = ctx.get(dut.host_request_bank)
+            ctx.set(dut.host_request_accepted, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.host_request_accepted, 0)
+
+            ctx.set(dut.host_reply_ready, 1)
+            ctx.set(dut.host_reply_address, address)
+            ctx.set(dut.host_reply_bank, bank)
+            await ctx.tick("sd")
+            ctx.set(dut.host_reply_ready, 0)
+            self.assertEqual(ctx.get(dut.ready), 1)
+
+            ctx.set(dut.activate, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.activate, 0)
+            self.assertEqual(ctx.get(dut.active), 1)
+            states = ctx.get(dut.bank_states)
+            self.assertEqual((states >> (bank * 2)) & 0x3, ReadBufferState.Active.value)
+
+            ctx.set(dut.release, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.release, 0)
+            self.assertEqual(ctx.get(dut.active), 0)
+            self.assertEqual(ctx.get(dut.reserve_ready), 1)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6, domain="sd")
+        simulator.add_testbench(testbench)
+        simulator.run()
+
+    def test_accepted_prefetch_is_drained_after_cancellation(self):
+        m = Module()
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = ReadBufferManager()
+
+        async def testbench(ctx):
+            address = BLOCK_SIZE * 5
+            ctx.set(dut.lookup_address, address)
+            ctx.set(dut.reserve_address, address)
+            ctx.set(dut.reserve, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.reserve, 0)
+            bank = ctx.get(dut.host_request_bank)
+            ctx.set(dut.host_request_accepted, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.host_request_accepted, 0)
+
+            ctx.set(dut.reset, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.reset, 0)
+            states = ctx.get(dut.bank_states)
+            self.assertEqual((states >> (bank * 2)) & 0x3, ReadBufferState.Filling.value)
+
+            ctx.set(dut.host_reply_ready, 1)
+            ctx.set(dut.host_reply_address, address)
+            ctx.set(dut.host_reply_bank, bank)
+            await ctx.tick("sd")
+            ctx.set(dut.host_reply_ready, 0)
+            self.assertEqual(ctx.get(dut.ready), 0)
+            self.assertEqual(ctx.get(dut.reply_fault), 0)
+            states = ctx.get(dut.bank_states)
+            self.assertEqual((states >> (bank * 2)) & 0x3, ReadBufferState.Empty.value)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6, domain="sd")
@@ -831,37 +739,72 @@ class COBSRecoveryTestCase(unittest.TestCase):
 
 
 class ZaurusSDControllerTestCase(unittest.TestCase):
-    def test_prepare_and_restore_are_idempotent(self):
+    def test_context_restores_exact_state_and_is_idempotent(self):
         class FakeShell:
             def __init__(self):
                 self.commands = []
 
             async def run(self, command, *, check=True, timeout=None):
                 self.commands.append((command, check, timeout))
+                if "__GLASGOW_SD_" in command:
+                    return 0, (
+                        "login noise\n"
+                        "__GLASGOW_SD_STATE__\t1\t1\t/dev/mmcda1\tvfat\trw,sync\n")
                 return 0, ""
 
         async def scenario():
             shell = FakeShell()
             controller = ZaurusSDController(
                 shell, "/usr/mnt.rom/card", settle_delay=0)
-            await controller.prepare()
-            prepare_commands = len(shell.commands)
-            await controller.prepare()
-            self.assertEqual(len(shell.commands), prepare_commands)
+            state = await controller.capture_state()
+            self.assertTrue(state.module_loaded)
+            self.assertTrue(state.daemon_running)
+            self.assertEqual(state.mount, ZaurusMountState(
+                "/dev/mmcda1", "vfat", "rw,sync"))
+
+            shell.commands.clear()
+            async with controller:
+                prepare_commands = len(shell.commands)
+                await controller.prepare()
+                self.assertEqual(len(shell.commands), prepare_commands)
             self.assertTrue(any("killall sdmgr" in command
                 for command, _, _ in shell.commands))
             self.assertTrue(any("rmmod sharp_mmcsd_m" in command
                 for command, _, _ in shell.commands))
             self.assertTrue(any("insmod" in command
                 for command, _, _ in shell.commands))
-
-            await controller.restore()
             restore_commands = len(shell.commands)
             await controller.restore()
             self.assertEqual(len(shell.commands), restore_commands)
             self.assertTrue(any("/sbin/sdmgr" in command
                 for command, _, _ in shell.commands[prepare_commands:]))
+            self.assertTrue(any("mount -t vfat -o rw,sync /dev/mmcda1" in command
+                for command, _, _ in shell.commands[prepare_commands:]))
             self.assertTrue(all(timeout == 30 for _, _, timeout in shell.commands))
+
+        asyncio.run(scenario())
+
+    def test_unmounted_inactive_state_is_preserved(self):
+        class FakeShell:
+            def __init__(self):
+                self.commands = []
+
+            async def run(self, command, *, check=True, timeout=None):
+                self.commands.append(command)
+                if "__GLASGOW_SD_" in command:
+                    return 0, "__GLASGOW_SD_STATE__\t0\t0\t\n"
+                return 0, ""
+
+        async def scenario():
+            shell = FakeShell()
+            controller = ZaurusSDController(shell, "/usr/mnt.rom/card", settle_delay=0)
+            await controller.prepare()
+            restore_start = len(shell.commands)
+            await controller.restore()
+            restored = shell.commands[restore_start:]
+            self.assertTrue(any("rmmod sharp_mmcsd_m" in command for command in restored))
+            self.assertFalse(any("/sbin/sdmgr;" in command for command in restored))
+            self.assertFalse(any("mount -t" in command for command in restored))
 
         asyncio.run(scenario())
 

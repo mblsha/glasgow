@@ -25,6 +25,17 @@ class SimulationPipe(AbstractInOutPipe):
         self._i_buffer        = i_buffer
         self._i_flush_offsets = i_flush_offsets
         self._o_buffer        = o_buffer
+        self._bound_context   = None
+
+    def bind_simulation_context(self, context):
+        """Use *context* for runtime waits issued by a background simulation agent."""
+        self._bound_context = context
+
+    @property
+    def _context(self):
+        if self._bound_context is not None:
+            return self._bound_context
+        return self._parent._context
 
     @property
     def readable(self) -> int | None:
@@ -46,7 +57,7 @@ class SimulationPipe(AbstractInOutPipe):
     async def recv(self, length) -> memoryview:
         assert self._i_buffer is not None, "recv() called on an out pipe"
         while len(self._i_buffer) < length:
-            _clk_hit, rst_hit = await self._parent._context.tick()
+            _clk_hit, rst_hit = await self._context.tick()
             assert not rst_hit
         return memoryview(self._consume(length))
 
@@ -54,7 +65,7 @@ class SimulationPipe(AbstractInOutPipe):
         assert self._i_buffer is not None, "recv_until() called on an out pipe"
         assert len(delimiter) >= 1
         while delimiter not in self._i_buffer:
-            _clk_hit, rst_hit = await self._parent._context.tick()
+            _clk_hit, rst_hit = await self._context.tick()
             assert not rst_hit
         length = self._i_buffer.index(delimiter) + len(delimiter)
         return bytes(self._consume(length))
@@ -63,7 +74,7 @@ class SimulationPipe(AbstractInOutPipe):
         """Receive through the next boundary explicitly marked by gateware ``in_flush``."""
         assert self._i_flush_offsets is not None, "recv_flush() called on an out pipe"
         while not self._i_flush_offsets:
-            _clk_hit, rst_hit = await self._parent._context.tick()
+            _clk_hit, rst_hit = await self._context.tick()
             assert not rst_hit
         return bytes(self._consume(self._i_flush_offsets[0]))
 
@@ -78,7 +89,7 @@ class SimulationPipe(AbstractInOutPipe):
     async def flush(self, *, _wait=True):
         assert self._o_buffer is not None, "flush() called on an in pipe"
         while len(self._o_buffer) > 0:
-            _clk_hit, rst_hit = await self._parent._context.tick()
+            _clk_hit, rst_hit = await self._context.tick()
             assert not rst_hit
 
     async def reset(self):
