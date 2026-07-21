@@ -22,7 +22,10 @@ from .bfm import SDHostBFM
 from ._console import SerialTransport, TelnetTransport
 from ._buffer import BlockBuffer
 from ._fat16 import FAT16Image, create_fat16_image
-from ._protocol import FrameError, frame_crc16
+from ._protocol import (
+    HOST_OPERATIONS, HOST_OPERATION_FOR_EVENT, HOST_OPERATION_FOR_REPLY,
+    FrameError, frame_crc16,
+)
 
 
 GENERATION = 0x4321
@@ -94,6 +97,22 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                             f"host readable={pipe.readable}, "
                             f"errors={await applet.sd_card_iface.protocol_errors}")
                     await bfm.receive_data_block(expected, timeout_diagnostic=diagnostic)
+
+                async def complete_busy_request(description):
+                    saw_busy = False
+                    for _ in range(4096):
+                        _, _, data_sample = await cycle()
+                        if data_sample[0] == (1, 0):
+                            saw_busy = True
+                        if applet.sd_card_iface._pipe.flush_readable:
+                            await applet.sd_card_iface.serve_once()
+                        if saw_busy and data_sample[0][0] == 0:
+                            return
+                    pipe = applet.sd_card_iface._pipe
+                    self.fail(
+                        f"timed out waiting for {description} "
+                        f"(host readable={pipe.readable}, "
+                        f"errors={await applet.sd_card_iface.protocol_errors})")
 
                 # Let the enable synchronizer cross into the externally clocked SD domain.
                 for _ in range(4):
@@ -173,6 +192,18 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 await applet.sd_card_iface.serve_once()
                 await receive_data_block(payload[read_address:read_address + BLOCK_SIZE])
 
+                # Exercise the same reconstructed-byte and CRC codec on a 1-bit card write before
+                # changing widths with ACMD6.
+                one_bit_address = BLOCK_SIZE * 2
+                one_bit_block = bytes((0x5a ^ index) & 0xff for index in range(BLOCK_SIZE))
+                await send_command(24, one_bit_address)
+                assert_r1(await receive_response(48), 24)
+                await bfm.send_data_block_1bit(one_bit_block)
+                self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
+                await complete_busy_request("host-backed 1-bit write completion")
+                self.assertEqual(
+                    os.pread(image.fileno(), BLOCK_SIZE, one_bit_address), one_bit_block)
+
                 await send_command(55)
                 assert_r1(await receive_response(48), 55)
                 await send_command(6, 2)
@@ -187,22 +218,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
 
                 # DAT0 remains low while the block crosses to the host and is written.
-                saw_busy = False
-                for _ in range(4096):
-                    _, _, data_sample = await cycle()
-                    if data_sample[0] == (1, 0):
-                        saw_busy = True
-                    if applet.sd_card_iface._pipe.flush_readable:
-                        await applet.sd_card_iface.serve_once()
-                    if saw_busy and data_sample[0][0] == 0:
-                        break
-                else:
-                    pipe = applet.sd_card_iface._pipe
-                    self.fail(
-                        "timed out waiting for host-backed write completion "
-                        f"(host readable={pipe.readable}, "
-                        f"errors={await applet.sd_card_iface.protocol_errors})")
-                self.assertTrue(saw_busy)
+                await complete_busy_request("host-backed 4-bit write completion")
                 self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, write_address), write_block)
 
                 # A bad per-lane CRC must be rejected locally without emitting a host write, and
@@ -233,17 +249,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 assert_r1(await receive_response(48), 33)
                 await send_command(38)
                 assert_r1(await receive_response(48), 38)
-                saw_busy = False
-                for _ in range(4096):
-                    _, _, data_sample = await cycle()
-                    if data_sample[0] == (1, 0):
-                        saw_busy = True
-                    if applet.sd_card_iface._pipe.flush_readable:
-                        await applet.sd_card_iface.serve_once()
-                    if saw_busy and data_sample[0][0] == 0:
-                        break
-                else:
-                    self.fail("timed out waiting for host-backed erase completion")
+                await complete_busy_request("host-backed erase completion")
                 self.assertEqual(
                     os.pread(image.fileno(), BLOCK_SIZE, erase_address),
                     bytes([0xff]) * BLOCK_SIZE)
@@ -531,6 +537,33 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
 
 class SDCardProtocolTestCase(unittest.TestCase):
+    def test_operation_schema_is_the_payload_source_of_truth(self):
+        self.assertEqual(
+            set(HOST_OPERATION_FOR_EVENT.values()), set(HOST_OPERATIONS))
+        self.assertEqual(
+            set(HOST_OPERATION_FOR_REPLY.values()), set(HOST_OPERATIONS))
+
+        read = HOST_OPERATION_FOR_EVENT[HostEvent.Read]
+        self.assertEqual(read.reply, HostReply.ReadData)
+        encoded = read.request_payload.encode(address=0x1234_5600)
+        self.assertEqual(read.request_payload.decode(encoded), {"address": 0x1234_5600})
+
+        write = HOST_OPERATION_FOR_EVENT[HostEvent.Write]
+        block = bytes(range(256)) * 2
+        encoded = write.request_payload.encode(address=BLOCK_SIZE, data=block)
+        self.assertEqual(write.request_payload.decode(encoded), {
+            "address": BLOCK_SIZE,
+            "data": block,
+        })
+        self.assertEqual(write.reply_payload.size, 0)
+
+        erase = HOST_OPERATION_FOR_EVENT[HostEvent.Erase]
+        encoded = erase.request_payload.encode(start=BLOCK_SIZE, end=BLOCK_SIZE * 3)
+        self.assertEqual(erase.request_payload.decode(encoded), {
+            "start": BLOCK_SIZE,
+            "end": BLOCK_SIZE * 3,
+        })
+
     def test_request_and_reply_frames_round_trip(self):
         request = RequestFrame.create(
             HostEvent.Write, GENERATION, REQUEST_ID,
@@ -572,6 +605,7 @@ class BlockBufferTestCase(unittest.TestCase):
             self.assertEqual(ctx.get(dut.collision), 1)
             await ctx.tick("sd")
             self.assertEqual(ctx.get(dut.collision_count), 1)
+            self.assertEqual(ctx.get(dut.fault), 1)
             await ctx.tick("sd").repeat(3)
             self.assertEqual(ctx.get(dut.collision_count), 1)
 
@@ -582,6 +616,18 @@ class BlockBufferTestCase(unittest.TestCase):
             ctx.set(dut.data.read_active, 1)
             await ctx.tick("sd")
             self.assertEqual(ctx.get(dut.collision_count), 2)
+            self.assertEqual(ctx.get(dut.fault), 1)
+
+            ctx.set(dut.host.read_active, 0)
+            ctx.set(dut.data.read_active, 0)
+            await ctx.tick("sd")
+
+            ctx.set(dut.data.read_active, 1)
+            ctx.set(dut.host.write_en, 1)
+            ctx.set(dut.host.write_address, BLOCK_SIZE)
+            ctx.set(dut.data.read_address, BLOCK_SIZE + 7)
+            await ctx.tick("sd")
+            self.assertEqual(ctx.get(dut.collision_count), 3)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6, domain="sd")
@@ -608,6 +654,32 @@ class FAT16ImageTestCase(unittest.TestCase):
 
 
 class BackendWorkerTestCase(unittest.TestCase):
+    def test_sequential_reads_use_bounded_read_ahead_and_writes_invalidate_it(self):
+        class CountingBackend(_MemoryBackend):
+            def __init__(self, image):
+                super().__init__(image)
+                self.runs = []
+
+            def read_blocks(self, address, count):
+                self.runs.append((address, count))
+                return super().read_blocks(address, count)
+
+        async def scenario():
+            image = b"".join(bytes([index]) * BLOCK_SIZE for index in range(8))
+            backend = CountingBackend(image)
+            worker = BackendWorker(backend, read_ahead_blocks=4)
+            self.assertEqual(await worker.read_block(0), bytes([0]) * BLOCK_SIZE)
+            self.assertEqual(await worker.read_block(BLOCK_SIZE), bytes([1]) * BLOCK_SIZE)
+            self.assertEqual(backend.runs, [(0, 4)])
+
+            replacement = bytes([0xa5]) * BLOCK_SIZE
+            await worker.write_block(BLOCK_SIZE, replacement)
+            self.assertEqual(await worker.read_block(BLOCK_SIZE), replacement)
+            self.assertEqual(backend.runs, [(0, 4), (BLOCK_SIZE, 4)])
+            await worker.close()
+
+        asyncio.run(scenario())
+
     def test_blocking_backend_does_not_stall_event_loop(self):
         class SlowBackend(_MemoryBackend):
             def read_block(self, address):
@@ -616,7 +688,7 @@ class BackendWorkerTestCase(unittest.TestCase):
 
         async def scenario():
             backend = SlowBackend(bytes(BLOCK_SIZE * 4))
-            worker = BackendWorker(backend)
+            worker = BackendWorker(backend, read_ahead_blocks=1)
             read = asyncio.create_task(worker.read_block(0))
             await asyncio.sleep(0.005)
             self.assertFalse(read.done())
@@ -659,6 +731,54 @@ class COBSRecoveryTestCase(unittest.TestCase):
 
 
 class ConsoleTransportTestCase(unittest.TestCase):
+    def test_telnet_username_negotiation(self):
+        async def scenario():
+            received = asyncio.get_running_loop().create_future()
+
+            async def handler(reader, writer):
+                writer.write(bytes((
+                    TelnetTransport.IAC, TelnetTransport.DO,
+                    TelnetTransport.NEW_ENVIRON,
+                )))
+                await writer.drain()
+                negotiation = await reader.readexactly(3)
+                writer.write(bytes((
+                    TelnetTransport.IAC, TelnetTransport.SB,
+                    TelnetTransport.NEW_ENVIRON, TelnetTransport.ENVIRON_SEND,
+                    TelnetTransport.IAC, TelnetTransport.SE,
+                )) + b"ready")
+                await writer.drain()
+                environment = await reader.readuntil(bytes((
+                    TelnetTransport.IAC, TelnetTransport.SE,
+                )))
+                received.set_result((negotiation, environment))
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            try:
+                port = server.sockets[0].getsockname()[1]
+                transport = await TelnetTransport.connect(
+                    "127.0.0.1", port, username="zaurus")
+                self.assertEqual(await transport.read_some(), b"ready")
+                negotiation, environment = await received
+                self.assertEqual(negotiation, bytes((
+                    TelnetTransport.IAC, TelnetTransport.WILL,
+                    TelnetTransport.NEW_ENVIRON,
+                )))
+                self.assertEqual(environment, bytes((
+                    TelnetTransport.IAC, TelnetTransport.SB,
+                    TelnetTransport.NEW_ENVIRON, TelnetTransport.ENVIRON_IS,
+                    TelnetTransport.ENVIRON_VAR,
+                )) + b"USER" + bytes((TelnetTransport.ENVIRON_VALUE,)) + \
+                    b"zaurus" + bytes((TelnetTransport.IAC, TelnetTransport.SE)))
+                await transport.close()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(scenario())
+
     def test_telnet_negotiation_and_iac_escaping(self):
         async def scenario():
             received = asyncio.get_running_loop().create_future()

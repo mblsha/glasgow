@@ -38,6 +38,8 @@ class DataHostSignature(wiring.Signature):
     def __init__(self):
         super().__init__({
             "read_request": Out(1),
+            "read_request_address": Out(32),
+            "read_request_bank": Out(1),
             "read_request_accepted": In(1),
             "write_request": Out(1),
             "write_request_accepted": In(1),
@@ -46,6 +48,7 @@ class DataHostSignature(wiring.Signature):
 
             "read_buffer_ready": In(1),
             "read_buffer_address": In(32),
+            "read_buffer_bank": In(1),
             "read_buffer_consume": Out(1),
             "read_reply_error": In(1),
             "host_ack_valid": In(1),

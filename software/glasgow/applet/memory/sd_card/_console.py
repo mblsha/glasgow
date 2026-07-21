@@ -22,31 +22,67 @@ class TelnetTransport:
     BINARY = 0
     ECHO = 1
     SUPPRESS_GO_AHEAD = 3
+    NEW_ENVIRON = 39
 
-    def __init__(self, reader, writer):
+    ENVIRON_IS = 0
+    ENVIRON_SEND = 1
+    ENVIRON_VAR = 0
+    ENVIRON_VALUE = 1
+    ENVIRON_ESC = 2
+    ENVIRON_USERVAR = 3
+
+    def __init__(self, reader, writer, *, username=None):
         self._reader = reader
         self._writer = writer
+        self._username = username
         self._state = "Data"
         self._command = None
+        self._subnegotiation_option = None
+        self._subnegotiation = bytearray()
 
     @classmethod
-    async def connect(cls, host, port=23):
+    async def connect(cls, host, port=23, *, username=None):
         reader, writer = await asyncio.open_connection(host, port)
-        return cls(reader, writer)
+        return cls(reader, writer, username=username)
+
+    async def _write_protocol(self, data):
+        self._writer.write(bytes(data))
+        await self._writer.drain()
 
     async def _negotiate(self, command, option):
         if command == self.WILL:
             response = self.DO if option in (
                 self.BINARY, self.ECHO, self.SUPPRESS_GO_AHEAD) else self.DONT
         elif command == self.DO:
-            response = self.WILL if option in (
-                self.BINARY, self.SUPPRESS_GO_AHEAD) else self.WONT
+            supported = option in (self.BINARY, self.SUPPRESS_GO_AHEAD) or \
+                option == self.NEW_ENVIRON and self._username is not None
+            response = self.WILL if supported else self.WONT
         elif command == self.WONT:
             response = self.DONT
         else:
             response = self.WONT
-        self._writer.write(bytes((self.IAC, response, option)))
-        await self._writer.drain()
+        await self._write_protocol((self.IAC, response, option))
+
+    @classmethod
+    def _escape_environ(cls, value):
+        encoded = bytearray()
+        for octet in value.encode():
+            if octet in (cls.ENVIRON_VAR, cls.ENVIRON_VALUE,
+                    cls.ENVIRON_ESC, cls.ENVIRON_USERVAR):
+                encoded.append(cls.ENVIRON_ESC)
+            encoded.append(octet)
+        return bytes(encoded)
+
+    async def _handle_subnegotiation(self):
+        if self._subnegotiation_option != self.NEW_ENVIRON or self._username is None:
+            return
+        if not self._subnegotiation or self._subnegotiation[0] != self.ENVIRON_SEND:
+            return
+        payload = bytes((
+            self.IAC, self.SB, self.NEW_ENVIRON, self.ENVIRON_IS, self.ENVIRON_VAR,
+        )) + self._escape_environ("USER") + bytes((self.ENVIRON_VALUE,)) + \
+            self._escape_environ(self._username) + bytes((self.IAC, self.SE))
+        await self._write_protocol(payload)
 
     async def read_some(self):
         while True:
@@ -68,19 +104,29 @@ class TelnetTransport:
                         self._command = octet
                         self._state = "Negotiate"
                     elif octet == self.SB:
-                        self._state = "Subnegotiation"
+                        self._state = "Subnegotiation-Option"
                     else:
                         self._state = "Data"
                 elif self._state == "Negotiate":
                     await self._negotiate(self._command, octet)
                     self._state = "Data"
+                elif self._state == "Subnegotiation-Option":
+                    self._subnegotiation_option = octet
+                    self._subnegotiation.clear()
+                    self._state = "Subnegotiation"
                 elif self._state == "Subnegotiation":
                     if octet == self.IAC:
                         self._state = "Subnegotiation-IAC"
+                    else:
+                        self._subnegotiation.append(octet)
                 elif self._state == "Subnegotiation-IAC":
                     if octet == self.SE:
+                        await self._handle_subnegotiation()
                         self._state = "Data"
-                    elif octet != self.IAC:
+                    elif octet == self.IAC:
+                        self._subnegotiation.append(octet)
+                        self._state = "Subnegotiation"
+                    else:
                         self._state = "Subnegotiation"
             if cooked:
                 return bytes(cooked)

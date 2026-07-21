@@ -7,9 +7,11 @@ from glasgow.gateware import cobs
 
 __all__ = [
     "BLOCK_SIZE", "FRAME_VERSION", "REQUEST_SCHEMA", "REPLY_SCHEMA",
-    "BackendStatus", "FrameError", "FrameField", "FrameSchema", "HostEvent", "HostReply",
+    "BackendStatus", "FrameError", "FrameField", "FrameSchema", "HostEvent", "HostOperation",
+    "HostReply", "HOST_OPERATIONS", "HOST_OPERATION_FOR_EVENT", "HOST_OPERATION_FOR_REPLY",
     "HOST_EVENT_PAYLOAD_LENGTH", "HOST_REPLY_FOR_EVENT", "HOST_REPLY_PAYLOAD_LENGTH",
-    "RequestFrame", "RequestHeader", "ReplyFrame", "ReplyHeader", "frame_crc16",
+    "PayloadField", "PayloadSchema", "RequestFrame", "RequestHeader", "ReplyFrame",
+    "ReplyHeader", "frame_crc16",
 ]
 
 
@@ -37,25 +39,107 @@ class BackendStatus(IntEnum):
     ShortIO     = 0x04
 
 
-HOST_EVENT_PAYLOAD_LENGTH = {
-    HostEvent.Read: 4,
-    HostEvent.Write: 4 + BLOCK_SIZE,
-    HostEvent.Erase: 8,
-}
-HOST_REPLY_FOR_EVENT = {
-    HostEvent.Read: HostReply.ReadData,
-    HostEvent.Write: HostReply.WriteAck,
-    HostEvent.Erase: HostReply.EraseAck,
-}
-HOST_REPLY_PAYLOAD_LENGTH = {
-    HostReply.ReadData: BLOCK_SIZE,
-    HostReply.WriteAck: 0,
-    HostReply.EraseAck: 0,
-}
-
-
 class FrameError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class PayloadField:
+    name: str
+    byte_width: int
+    raw: bool = False
+
+    def __post_init__(self):
+        if self.byte_width < 1:
+            raise ValueError("payload fields must contain at least one byte")
+
+
+class PayloadSchema:
+    """Declarative fixed-size operation payload shared by host and gateware metadata."""
+
+    def __init__(self, name, fields=()):
+        self.name = name
+        self.fields = tuple(fields)
+        self.size = sum(field.byte_width for field in self.fields)
+        if len({field.name for field in self.fields}) != len(self.fields):
+            raise ValueError(f"duplicate field in {name} payload schema")
+
+    def encode(self, **values):
+        result = bytearray()
+        for field in self.fields:
+            value = values[field.name]
+            if field.raw:
+                value = bytes(value)
+                if len(value) != field.byte_width:
+                    raise FrameError(
+                        f"{self.name} payload field {field.name} is {len(value)} bytes, "
+                        f"expected {field.byte_width}")
+                result.extend(value)
+            else:
+                result.extend(int(value).to_bytes(field.byte_width, "little"))
+        return bytes(result)
+
+    def decode(self, value):
+        if len(value) != self.size:
+            raise FrameError(
+                f"{self.name} payload is {len(value)} bytes, expected {self.size}")
+        result = {}
+        offset = 0
+        for field in self.fields:
+            encoded = value[offset:offset + field.byte_width]
+            offset += field.byte_width
+            result[field.name] = encoded if field.raw else int.from_bytes(encoded, "little")
+        return result
+
+
+@dataclass(frozen=True)
+class HostOperation:
+    event: HostEvent
+    reply: HostReply
+    request_payload: PayloadSchema
+    reply_payload: PayloadSchema
+
+    def __post_init__(self):
+        if self.request_payload.name != self.event.name.lower():
+            raise ValueError("request payload schema name must match its event")
+
+    def invalid_reply_payload(self):
+        return bytes([0xff]) * self.reply_payload.size
+
+
+HOST_OPERATIONS = (
+    HostOperation(
+        HostEvent.Read, HostReply.ReadData,
+        PayloadSchema("read", (PayloadField("address", 4),)),
+        PayloadSchema("read_data", (PayloadField("data", BLOCK_SIZE, raw=True),))),
+    HostOperation(
+        HostEvent.Write, HostReply.WriteAck,
+        PayloadSchema("write", (
+            PayloadField("address", 4), PayloadField("data", BLOCK_SIZE, raw=True))),
+        PayloadSchema("write_ack")),
+    HostOperation(
+        HostEvent.Erase, HostReply.EraseAck,
+        PayloadSchema("erase", (PayloadField("start", 4), PayloadField("end", 4))),
+        PayloadSchema("erase_ack")),
+)
+
+HOST_OPERATION_FOR_EVENT = {operation.event: operation for operation in HOST_OPERATIONS}
+HOST_OPERATION_FOR_REPLY = {operation.reply: operation for operation in HOST_OPERATIONS}
+
+# Compatibility views for callers that only need one attribute. The operation table above is the
+# sole source of truth; these mappings must never be edited independently.
+HOST_EVENT_PAYLOAD_LENGTH = {
+    event: operation.request_payload.size
+    for event, operation in HOST_OPERATION_FOR_EVENT.items()
+}
+HOST_REPLY_FOR_EVENT = {
+    event: operation.reply
+    for event, operation in HOST_OPERATION_FOR_EVENT.items()
+}
+HOST_REPLY_PAYLOAD_LENGTH = {
+    reply: operation.reply_payload.size
+    for reply, operation in HOST_OPERATION_FOR_REPLY.items()
+}
 
 
 @dataclass(frozen=True)

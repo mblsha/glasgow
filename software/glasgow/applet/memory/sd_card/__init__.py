@@ -2,7 +2,6 @@ from collections.abc import Buffer
 import asyncio
 import logging
 import secrets
-import struct
 
 from amaranth import *
 from amaranth.lib import cdc, data, io, stream, wiring
@@ -24,8 +23,8 @@ from ._gateware_support import (
 )
 from ._host import HostBlockEngine
 from ._protocol import (
-    HOST_EVENT_PAYLOAD_LENGTH, HOST_REPLY_FOR_EVENT, BackendStatus, FrameError,
-    HostEvent, HostReply, ReplyFrame, ReplyHeader, RequestFrame, RequestHeader,
+    HOST_OPERATION_FOR_EVENT, BackendStatus, FrameError, HostEvent, HostReply,
+    ReplyFrame, ReplyHeader, RequestFrame, RequestHeader,
 )
 
 
@@ -276,7 +275,7 @@ class SDCardComponent(wiring.Component):
             command_engine.cmd_i.eq(cmd_buffer.i),
             cmd_buffer.o.eq(command_engine.cmd_o),
             cmd_buffer.oe.eq(command_engine.cmd_oe),
-            command_engine.enabled.eq(engine_enabled),
+            command_engine.enabled.eq(engine_enabled & ~block_buffer.fault),
             command_engine.read_only.eq(configuration.read_only),
             command_engine.image_size.eq(configuration.image_size),
             command_engine.cid.eq(configuration.cid),
@@ -308,7 +307,8 @@ class SDCardComponent(wiring.Component):
         dat_oe_latched = Signal(4)
         m.d.sd_fall += [
             dat_o_latched.eq(data_engine.dat_o),
-            dat_oe_latched.eq(Mux(engine_enabled, data_engine.dat_oe, 0)),
+            dat_oe_latched.eq(Mux(
+                engine_enabled & ~block_buffer.fault, data_engine.dat_oe, 0)),
         ]
         for index, buffer in enumerate(dat_buffers):
             m.d.comb += [
@@ -523,21 +523,20 @@ class SDCardInterface:
                 "discarding stale %s request %#06x/%#06x",
                 header.opcode.name.lower(), header.generation, header.request_id)
             return
-        expected_length = HOST_EVENT_PAYLOAD_LENGTH[header.opcode]
-        if len(payload) != expected_length:
+        operation = HOST_OPERATION_FOR_EVENT[header.opcode]
+        try:
+            fields = operation.request_payload.decode(payload)
+        except FrameError:
             self._logger.warning(
                 "invalid %s request length %d (expected %d)",
-                header.opcode.name.lower(), len(payload), expected_length)
-            reply_opcode = HOST_REPLY_FOR_EVENT[header.opcode]
-            reply_payload = bytes([0xff]) * BLOCK_SIZE \
-                if header.opcode == HostEvent.Read else b""
+                header.opcode.name.lower(), len(payload), operation.request_payload.size)
             await self._reply(
-                reply_opcode, header.generation, header.request_id,
-                BackendStatus.Invalid, reply_payload)
+                operation.reply, header.generation, header.request_id,
+                BackendStatus.Invalid, operation.invalid_reply_payload())
             return
 
         if header.opcode == HostEvent.Read:
-            address, = struct.unpack("<I", payload)
+            address = fields["address"]
             self._logger.log(self._level, "read block at %#x", address)
             status = BackendStatus.OK
             try:
@@ -547,11 +546,12 @@ class SDCardInterface:
                 status = error.status
                 block = bytes([0xff]) * BLOCK_SIZE
             await self._reply(
-                HostReply.ReadData, header.generation, header.request_id, status, block)
+                operation.reply, header.generation, header.request_id, status,
+                operation.reply_payload.encode(data=block))
 
         elif header.opcode == HostEvent.Write:
-            address, = struct.unpack("<I", payload[:4])
-            block = payload[4:]
+            address = fields["address"]
+            block = fields["data"]
             self._logger.log(self._level, "write block at %#x", address)
             status = BackendStatus.OK
             try:
@@ -562,10 +562,10 @@ class SDCardInterface:
                 self._record_backend_error("write", error)
                 status = error.status
             await self._reply(
-                HostReply.WriteAck, header.generation, header.request_id, status)
+                operation.reply, header.generation, header.request_id, status)
 
         elif header.opcode == HostEvent.Erase:
-            start, end = struct.unpack("<II", payload)
+            start, end = fields["start"], fields["end"]
             self._logger.log(self._level, "erase blocks at %#x..%#x", start, end)
             status = BackendStatus.OK
             try:
@@ -576,7 +576,7 @@ class SDCardInterface:
                 self._record_backend_error("erase", error)
                 status = error.status
             await self._reply(
-                HostReply.EraseAck, header.generation, header.request_id, status)
+                operation.reply, header.generation, header.request_id, status)
 
         else:
             raise SDCardError(f"unknown FPGA event opcode {header.opcode:#04x}")

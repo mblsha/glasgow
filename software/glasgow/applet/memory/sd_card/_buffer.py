@@ -5,7 +5,12 @@ from amaranth.lib.wiring import In, Out
 from ._gateware_support import BLOCK_SIZE
 
 
-__all__ = ["BlockBuffer", "BlockBufferPortSignature"]
+__all__ = ["BUFFER_BLOCKS", "BUFFER_SIZE", "BlockBuffer", "BlockBufferPortSignature"]
+
+
+BUFFER_BLOCKS = 2
+BUFFER_SIZE = BLOCK_SIZE * BUFFER_BLOCKS
+BUFFER_BANK_BIT = BLOCK_SIZE.bit_length() - 1
 
 
 class BlockBufferPortSignature(wiring.Signature):
@@ -14,20 +19,20 @@ class BlockBufferPortSignature(wiring.Signature):
     def __init__(self):
         super().__init__({
             "write_en": wiring.Out(1),
-            "write_address": wiring.Out(range(BLOCK_SIZE)),
+            "write_address": wiring.Out(range(BUFFER_SIZE)),
             "write_data": wiring.Out(8),
             "read_active": wiring.Out(1),
-            "read_address": wiring.Out(range(BLOCK_SIZE)),
+            "read_address": wiring.Out(range(BUFFER_SIZE)),
             "read_data": wiring.In(8),
         })
 
 
 class BlockBuffer(wiring.Component):
-    """One-block staging RAM with explicit host and SD-data-engine clients.
+    """Two-bank staging RAM with explicit host and SD-data-engine clients.
 
     The host client owns the read port while ``read_active`` is asserted; otherwise the data
-    engine owns it. Host and data writes are mutually exclusive at the protocol level, with host
-    priority providing deterministic behavior if a malformed exchange violates that invariant.
+    engine owns it. Protocol-level ownership violations fail closed and poison the buffer until
+    the SD domain is reset rather than selecting a client and silently corrupting a block.
     """
 
     def __init__(self):
@@ -36,27 +41,44 @@ class BlockBuffer(wiring.Component):
             "data": In(BlockBufferPortSignature()),
             "collision": Out(1),
             "collision_count": Out(16),
+            "fault": Out(1),
         })
 
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.memory = block_memory = memory.Memory(shape=8, depth=BLOCK_SIZE, init=[])
+        m.submodules.memory = block_memory = memory.Memory(shape=8, depth=BUFFER_SIZE, init=[])
         write_port = block_memory.write_port(domain="sd")
         read_port = block_memory.read_port(domain="sd")
-
-        host_write_grant = self.host.write_en
-        data_write_grant = ~self.host.write_en & self.data.write_en
-        host_read_grant = self.host.read_active
-        data_read_grant = ~self.host.read_active & self.data.read_active
 
         collision_active = Signal()
         m.d.comb += self.collision.eq(
             (self.host.write_en & self.data.write_en) |
-            (self.host.read_active & self.data.read_active))
+            (self.host.read_active & self.data.read_active) |
+            (self.host.write_en & self.data.read_active &
+                (self.host.write_address[BUFFER_BANK_BIT] ==
+                 self.data.read_address[BUFFER_BANK_BIT])) |
+            (self.data.write_en & self.host.read_active &
+                (self.data.write_address[BUFFER_BANK_BIT] ==
+                 self.host.read_address[BUFFER_BANK_BIT])))
         m.d.sd += collision_active.eq(self.collision)
         with m.If(self.collision & ~collision_active):
             m.d.sd += self.collision_count.eq(self.collision_count + 1)
+        with m.If(self.collision):
+            m.d.sd += self.fault.eq(1)
+
+        # Any ownership violation poisons the buffer until the SD domain is reset. Both clients
+        # are denied on the collision cycle as well, so priority cannot silently corrupt a block.
+        healthy = ~self.collision & ~self.fault
+        host_write_grant = healthy & self.host.write_en
+        data_write_grant = healthy & self.data.write_en
+        host_read_grant = healthy & self.host.read_active
+        data_read_grant = healthy & ~self.host.read_active & self.data.read_active
+
+        m.d.sd += [
+            Assert(~(host_write_grant & data_write_grant)),
+            Assert(~(host_read_grant & data_read_grant)),
+        ]
 
         m.d.comb += [
             write_port.en.eq(host_write_grant | data_write_grant),
