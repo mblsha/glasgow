@@ -2,16 +2,24 @@ import asyncio
 import os
 import struct
 import tempfile
+import time
 import unittest
 
+from amaranth.sim import Simulator
+
 from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
+from glasgow.gateware import cobs as gateware_cobs
 from glasgow.simulation.assembly import SimulationAssembly
 
 from . import (
-    BLOCK_SIZE, BackendError, BackendStatus, BlockBackend, FileBlockBackend, HostEvent, HostReply,
-    ReplyHeader, RequestHeader, SDCardApplet, SDCardInterface,
+    BLOCK_SIZE, BackendError, BackendStatus, BackendWorker, BlockBackend, FileBlockBackend,
+    HostEvent, HostReply,
+    ReplyFrame, RequestFrame, SDCardApplet, SDCardInterface,
     build_cid, build_csd, build_scr, crc7, crc16,
 )
+from .bfm import SDHostBFM
+from ._fat16 import FAT16Image, create_fat16_image
+from ._protocol import FrameError, frame_crc16
 
 
 GENERATION = 0x4321
@@ -69,76 +77,19 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
             dat = [assembly.get_pin(name) for name in ("A1", "A0", "A7", "A6")]
 
             async def card_host(ctx):
-                ctx.set(clk.i, 0)
-                ctx.set(cmd.i, 1)
-                for pin in dat:
-                    ctx.set(pin.i, 1)
-
-                async def cycle(command_bit=1):
-                    ctx.set(cmd.i, command_bit)
-                    await ctx.delay(250e-9)
-                    ctx.set(clk.i, 1)
-                    await ctx.delay(250e-9)
-                    sample = (
-                        ctx.get(cmd.oe), ctx.get(cmd.o),
-                        tuple((ctx.get(pin.oe), ctx.get(pin.o)) for pin in dat),
-                    )
-                    ctx.set(clk.i, 0)
-                    await ctx.delay(250e-9)
-                    return sample
-
-                async def send_command(index, argument=0):
-                    protected = (1 << 38) | (index << 32) | argument
-                    frame = (protected << 8) | (crc7(protected, 40) << 1) | 1
-                    for bitno in reversed(range(48)):
-                        await cycle((frame >> bitno) & 1)
-
-                async def receive_response(length):
-                    bits = []
-                    for _ in range(length + 16):
-                        command_oe, command_o, _ = await cycle()
-                        if command_oe:
-                            bits.append(command_o)
-                            if len(bits) == length:
-                                break
-                    self.assertEqual(len(bits), length)
-                    return sum(bit << bitno for bitno, bit in enumerate(reversed(bits)))
-
-                def assert_r1(response, index):
-                    self.assertEqual(response >> 46, 0)
-                    self.assertEqual((response >> 40) & 0x3f, index, hex(response))
-                    self.assertEqual((response >> 1) & 0x7f, crc7(response >> 8, 40))
-                    self.assertEqual(response & 1, 1)
+                bfm = SDHostBFM(ctx, self, clk=clk, cmd=cmd, dat=dat)
+                cycle = bfm.cycle
+                send_command = bfm.send_command
+                receive_response = bfm.receive_response
+                assert_r1 = bfm.assert_r1
 
                 async def receive_data_block(expected):
-                    # The host-backed block may take many SD clocks to cross the USB-side queues.
-                    for _ in range(2048):
-                        _, _, data_sample = await cycle()
-                        if data_sample[0] == (1, 0):
-                            break
-                    else:
+                    async def diagnostic():
                         pipe = applet.sd_card_iface._pipe
-                        self.fail(
-                            "timed out waiting for SD data start bit "
-                            f"(host in={len(pipe._i_buffer)}, host out={len(pipe._o_buffer)}, "
-                            f"errors={await applet.sd_card_iface.protocol_errors})")
-
-                    block = 0
-                    for _ in range(BLOCK_SIZE * 8):
-                        _, _, data_sample = await cycle()
-                        self.assertEqual(data_sample[0][0], 1)
-                        block = (block << 1) | data_sample[0][1]
-                    block = block.to_bytes(BLOCK_SIZE, "big")
-                    self.assertEqual(block, expected)
-
-                    received_crc = 0
-                    for _ in range(16):
-                        _, _, data_sample = await cycle()
-                        received_crc = (received_crc << 1) | data_sample[0][1]
-                    self.assertEqual(received_crc, crc16(block))
-
-                    _, _, data_sample = await cycle()
-                    self.assertEqual(data_sample[0], (1, 1))
+                        return (
+                            f"host in={len(pipe._i_buffer)}, host out={len(pipe._o_buffer)}, "
+                            f"errors={await applet.sd_card_iface.protocol_errors}")
+                    await bfm.receive_data_block(expected, timeout_diagnostic=diagnostic)
 
                 # Let the enable synchronizer cross into the externally clocked SD domain.
                 for _ in range(4):
@@ -225,46 +176,8 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 await send_command(24, write_address)
                 assert_r1(await receive_response(48), 24)
 
-                def drive_data(value):
-                    for lane, pin in enumerate(dat):
-                        ctx.set(pin.i, (value >> lane) & 1)
-
-                lane_bits = [[] for _ in range(4)]
-                # Leave the required write-response-to-data gap before the start bit.
-                drive_data(0xf)
-                await cycle()
-                await cycle()
-                drive_data(0)
-                await cycle()  # start bit on all four lanes
-                for octet in write_block:
-                    for nibble in (octet >> 4, octet & 0xf):
-                        drive_data(nibble)
-                        await cycle()
-                        for lane in range(4):
-                            lane_bits[lane].append((nibble >> lane) & 1)
-
-                lane_crcs = []
-                for bits in lane_bits:
-                    lane_data = bytes(
-                        sum(bit << (7 - index) for index, bit in enumerate(bits[offset:offset + 8]))
-                        for offset in range(0, len(bits), 8))
-                    lane_crcs.append(crc16(lane_data))
-                for bitno in reversed(range(16)):
-                    drive_data(sum(((lane_crcs[lane] >> bitno) & 1) << lane
-                                   for lane in range(4)))
-                    await cycle()
-
-                drive_data(0xf)
-                await cycle()  # end bit on all four lanes
-
-                response = []
-                for _ in range(32):
-                    _, _, data_sample = await cycle()
-                    if data_sample[0][0]:
-                        response.append(data_sample[0][1])
-                        if len(response) == 5:
-                            break
-                self.assertEqual(response, [0, 0, 1, 0, 1])
+                await bfm.send_data_block_4bit(write_block)
+                self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
 
                 # DAT0 remains low while the block crosses to the host and is written.
                 saw_busy = False
@@ -272,7 +185,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                     _, _, data_sample = await cycle()
                     if data_sample[0] == (1, 0):
                         saw_busy = True
-                    if applet.sd_card_iface._pipe.readable:
+                    if b"\0" in applet.sd_card_iface._pipe._i_buffer:
                         await applet.sd_card_iface.serve_once()
                     if saw_busy and data_sample[0][0] == 0:
                         break
@@ -284,6 +197,23 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                         f"errors={await applet.sd_card_iface.protocol_errors})")
                 self.assertTrue(saw_busy)
                 self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, write_address), write_block)
+
+                # A bad per-lane CRC must be rejected locally without emitting a host write, and
+                # the command/data engines must return to TRAN for the following command.
+                rejected_address = 0
+                rejected_block = bytes([0x3c]) * BLOCK_SIZE
+                original_block = os.pread(image.fileno(), BLOCK_SIZE, rejected_address)
+                await send_command(24, rejected_address)
+                assert_r1(await receive_response(48), 24)
+                await bfm.send_data_block_4bit(rejected_block, valid_crc=False)
+                self.assertEqual(await bfm.receive_data_response(), [0, 1, 0, 1, 1])
+                for _ in range(32):
+                    await cycle()
+                self.assertNotIn(b"\0", applet.sd_card_iface._pipe._i_buffer)
+                self.assertEqual(
+                    os.pread(image.fileno(), BLOCK_SIZE, rejected_address), original_block)
+                await send_command(13, 0x1234_0000)
+                assert_r1(await receive_response(48), 13)
 
                 await applet.sd_card_iface.close()
 
@@ -305,6 +235,12 @@ class _FakePipe:
         data = self.request[:length]
         del self.request[:length]
         return memoryview(data)
+
+    async def recv_until(self, delimiter):
+        length = self.request.index(delimiter) + len(delimiter)
+        data = self.request[:length]
+        del self.request[:length]
+        return bytes(data)
 
     async def send(self, data):
         self.replies.extend(data)
@@ -366,10 +302,31 @@ class _MemoryBackend(BlockBackend):
         self.closed = True
 
 
+class _InlineWorker:
+    def __init__(self, backend):
+        self.backend = backend
+
+    async def read_block(self, address):
+        return self.backend.read_block(address)
+
+    async def write_block(self, address, block):
+        return self.backend.write_block(address, block)
+
+    async def erase(self, start, end):
+        return self.backend.erase(start, end)
+
+    async def flush(self):
+        return self.backend.flush()
+
+    async def close(self):
+        return self.backend.close()
+
+
 class SDCardInterfaceTestCase(unittest.TestCase):
     def make_iface(self, backend, request, *, generation=GENERATION, sync_writes=True):
         iface = object.__new__(SDCardInterface)
         iface._backend = backend
+        iface._worker = _InlineWorker(backend)
         iface._generation = generation
         iface._sync_writes = sync_writes
         iface._flush_count = 0
@@ -380,12 +337,11 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         return iface
 
     def request(self, opcode, payload=b"", *, generation=GENERATION, request_id=REQUEST_ID):
-        return RequestHeader(opcode, generation, request_id).encode() + payload
+        return RequestFrame.create(opcode, generation, request_id, payload).encode_packet()
 
     def reply(self, pipe):
-        header = ReplyHeader.decode(bytes(pipe.replies[:ReplyHeader.size]))
-        payload = bytes(pipe.replies[ReplyHeader.size:])
-        return header, payload
+        reply = ReplyFrame.decode_packet(bytes(pipe.replies))
+        return reply.header, reply.payload
 
     def test_host_read_event(self):
         image = bytes(index & 0xff for index in range(BLOCK_SIZE * 4))
@@ -477,6 +433,27 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         self.assertEqual(reply_payload, b"")
         self.assertEqual(iface._host_backend_errors, 1)
 
+    def test_malformed_frame_is_discarded_before_next_request(self):
+        backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+        malformed = bytearray(self.request(HostEvent.Read, struct.pack("<I", 0)))
+        malformed[2] ^= 0x40
+        valid = self.request(HostEvent.Read, struct.pack("<I", BLOCK_SIZE))
+        iface = self.make_iface(backend, bytes(malformed) + valid)
+        asyncio.run(iface.serve_once())
+        header, payload = self.reply(iface._pipe)
+        self.assertEqual(header.status, BackendStatus.OK)
+        self.assertEqual(payload, bytes(BLOCK_SIZE))
+
+    def test_semantically_invalid_request_length_is_rejected(self):
+        backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+        request = self.request(HostEvent.Write, b"too short")
+        iface = self.make_iface(backend, request)
+        asyncio.run(iface.serve_once())
+        header, payload = self.reply(iface._pipe)
+        self.assertEqual(header.opcode, HostReply.WriteAck)
+        self.assertEqual(header.status, BackendStatus.Invalid)
+        self.assertEqual(payload, b"")
+
     def test_power_monitor_suspends_and_resumes(self):
         class Device:
             def __init__(self):
@@ -518,6 +495,105 @@ class SDCardInterfaceTestCase(unittest.TestCase):
             self.assertEqual(transitions, ["flush", "suspend", "resume"])
 
         asyncio.run(scenario())
+
+
+class SDCardProtocolTestCase(unittest.TestCase):
+    def test_request_and_reply_frames_round_trip(self):
+        request = RequestFrame.create(
+            HostEvent.Write, GENERATION, REQUEST_ID,
+            struct.pack("<I", BLOCK_SIZE) + bytes([0xa5]) * BLOCK_SIZE)
+        self.assertEqual(RequestFrame.decode_packet(request.encode_packet()).payload,
+            request.payload)
+
+        reply = ReplyFrame.create(
+            HostReply.ReadData, GENERATION, REQUEST_ID,
+            BackendStatus.OK, bytes(range(256)) * 2)
+        decoded = ReplyFrame.decode_packet(reply.encode_packet())
+        self.assertEqual(decoded.header.generation, GENERATION)
+        self.assertEqual(decoded.payload, reply.payload)
+
+    def test_frame_crc_rejects_corruption(self):
+        packet = bytearray(RequestFrame.create(
+            HostEvent.Read, GENERATION, REQUEST_ID, struct.pack("<I", 0)).encode_packet())
+        packet[3] ^= 1
+        with self.assertRaises(FrameError):
+            RequestFrame.decode_packet(packet)
+        self.assertEqual(frame_crc16(b"123456789"), 0x31c3)
+
+    def test_unknown_opcode_is_a_frame_error(self):
+        raw = struct.pack("<BBHHH", 1, 0x7f, GENERATION, REQUEST_ID, 0)
+        packet = gateware_cobs.encode(raw + struct.pack("<H", frame_crc16(raw))) + b"\0"
+        with self.assertRaises(FrameError):
+            RequestFrame.decode_packet(packet)
+
+
+class FAT16ImageTestCase(unittest.TestCase):
+    def test_generator_is_deterministic_and_structurally_readable(self):
+        files = {
+            "HOST.TXT": b"glasgow-host-marker\n",
+            "BLOCK.BIN": bytes(range(256)) * 7,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            first = os.path.join(directory, "first.img")
+            second = os.path.join(directory, "second.img")
+            create_fat16_image(first, files)
+            create_fat16_image(second, files)
+            with open(first, "rb") as first_file, open(second, "rb") as second_file:
+                self.assertEqual(first_file.read(), second_file.read())
+            image = FAT16Image.from_path(first)
+            self.assertEqual(image.read_file("host.txt"), files["HOST.TXT"])
+            self.assertEqual(image.read_file("BLOCK.BIN"), files["BLOCK.BIN"])
+
+
+class BackendWorkerTestCase(unittest.TestCase):
+    def test_blocking_backend_does_not_stall_event_loop(self):
+        class SlowBackend(_MemoryBackend):
+            def read_block(self, address):
+                time.sleep(0.05)
+                return super().read_block(address)
+
+        async def scenario():
+            backend = SlowBackend(bytes(BLOCK_SIZE * 4))
+            worker = BackendWorker(backend)
+            read = asyncio.create_task(worker.read_block(0))
+            await asyncio.sleep(0.005)
+            self.assertFalse(read.done())
+            self.assertEqual(await read, bytes(BLOCK_SIZE))
+            await worker.close()
+            self.assertTrue(backend.closed)
+
+        asyncio.run(scenario())
+
+
+class COBSRecoveryTestCase(unittest.TestCase):
+    def test_decoder_resynchronizes_at_delimiter(self):
+        decoder = gateware_cobs.Decoder(recover=True)
+        expected = b"A\0B"
+
+        async def sender(ctx):
+            # A delimiter where a group header is required is malformed, then a complete valid
+            # packet must still be accepted without resetting the decoder.
+            for octet in b"\0" + gateware_cobs.encode(expected) + b"\0":
+                ctx.set(decoder.i.payload, octet)
+                ctx.set(decoder.i.valid, 1)
+                await ctx.tick().until(decoder.i.ready)
+                ctx.set(decoder.i.valid, 0)
+
+        async def receiver(ctx):
+            result = bytearray()
+            ctx.set(decoder.o.ready, 1)
+            while True:
+                payload, = await ctx.tick().sample(decoder.o.payload).until(decoder.o.valid)
+                if payload.end:
+                    break
+                result.append(payload.data)
+            self.assertEqual(result, expected)
+
+        simulator = Simulator(decoder)
+        simulator.add_clock(1e-6)
+        simulator.add_testbench(sender)
+        simulator.add_testbench(receiver)
+        simulator.run()
 
 
 class FileBlockBackendTestCase(unittest.TestCase):

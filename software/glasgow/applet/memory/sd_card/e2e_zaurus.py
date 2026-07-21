@@ -17,7 +17,10 @@ import secrets
 import shlex
 import struct
 import sys
+import tempfile
 import time
+
+from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 
 
 MODULE = "/lib/modules.rom/2.4.18-rmk7-pxa3-embedix/kernel/drivers/block/sharp_mmcsd_m.o"
@@ -46,8 +49,15 @@ class TelnetShell:
         shell = cls(process, master_fd, timeout=timeout)
         try:
             await shell._read_until(b"Escape character is")
-            await shell.send("bash")
-            await shell._read_until(b"$")
+            # The Cacko telnet console does not consistently display a prompt, especially after
+            # another console disconnected. Probe command execution with a marker that does not
+            # appear contiguously in the echoed command line instead of waiting for ``$``.
+            await shell.send("bash --noprofile --norc")
+            token = secrets.token_hex(8)
+            marker = f"__GLASGOW_E2E_READY_{token}__"
+            await shell.send(
+                f"printf '%s%s\\n' '__GLASGOW_E2E_READY_' '{token}__'")
+            await shell._read_until(marker.encode())
         except BaseException:
             await shell.close()
             raise
@@ -151,7 +161,9 @@ async def connect_after_boot(host, port, *, timeout):
         except (OSError, asyncio.TimeoutError, E2EError) as error:
             last_error = error
             await asyncio.sleep(5)
-    raise E2EError(f"Zaurus did not accept telnet within {timeout:.0f} seconds: {last_error}")
+    raise E2EError(
+        f"Zaurus did not provide a usable telnet shell within {timeout:.0f} seconds; "
+        f"close any other console session and retry: {last_error}")
 
 
 def root(command):
@@ -280,9 +292,15 @@ async def verify(args, shell):
         f"umount {shlex.quote(args.mount_point)}")
     await shell.run(root(mount_command), timeout=60)
 
-    image = Path(args.image).read_bytes()
-    if write_marker.encode() not in image:
-        raise E2EError("Zaurus write marker was not found in the host image after unmount")
+    try:
+        image = FAT16Image.from_path(args.image)
+        written = image.read_file(args.write_file)
+    except FAT16Error as error:
+        raise E2EError(f"host image failed FAT16 validation after Zaurus write: {error}") \
+            from error
+    if written != (write_marker + "\n").encode():
+        raise E2EError(
+            f"Zaurus file contents do not match host image: {written!r}")
     return expected_mbr, expected_bpb, write_marker
 
 
@@ -315,7 +333,8 @@ async def async_main(args):
 
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", type=Path, help="prepared FAT16 image containing HOST-FILE")
+    parser.add_argument("image", nargs="?", type=Path,
+        help="prepared FAT16 image containing HOST-FILE (default: generate a deterministic image)")
     parser.add_argument("--host", default="192.168.10.2", help="Zaurus telnet address")
     parser.add_argument("--port", type=int, default=23, help="Zaurus telnet port")
     parser.add_argument("--host-file", default="HOST.TXT",
@@ -343,10 +362,17 @@ def main():
     args = make_parser().parse_args()
     if args.reboot_timeout < 120:
         raise SystemExit("--reboot-timeout must be at least 120 seconds for this Zaurus")
-    try:
-        asyncio.run(async_main(args))
-    except (E2EError, OSError, asyncio.TimeoutError) as error:
-        raise SystemExit(f"FAIL: {error}") from error
+    with tempfile.TemporaryDirectory(prefix="glasgow-sd-e2e-") as temporary_directory:
+        if args.image is None:
+            args.image = Path(temporary_directory) / "zaurus-fat16.img"
+            create_fat16_image(args.image, {
+                args.host_file: (args.host_marker + "\n").encode(),
+            })
+            print(f"generated deterministic FAT16 image {args.image}")
+        try:
+            asyncio.run(async_main(args))
+        except (E2EError, FAT16Error, OSError, asyncio.TimeoutError) as error:
+            raise SystemExit(f"FAIL: {error}") from error
 
 
 if __name__ == "__main__":

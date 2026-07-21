@@ -128,7 +128,8 @@ class Decoder(wiring.Component):
 
     If invalid COBS data is encountered (namely: if a group header byte or data byte is NUL),
     the decoder transitions to an error state, signaled by the ``error`` output. This state is
-    final, cleared only by a reset.
+    final, cleared only by a reset. If ``recover`` is true, an unexpected NUL is instead treated
+    as a frame boundary, ``error`` pulses for one cycle, and decoding resumes with the next byte.
 
     .. _cobs: https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing
     """
@@ -139,6 +140,10 @@ class Decoder(wiring.Component):
         "end":  1
     })))
     error: Out(1)
+
+    def __init__(self, *, recover=False):
+        self.recover = recover
+        super().__init__()
 
     def elaborate(self, platform):
         m = Module()
@@ -157,6 +162,8 @@ class Decoder(wiring.Component):
                     with m.If(self.i.payload != 0x00):
                         m.d.sync += offset.eq(self.i.payload)
                         m.next = "Data"
+                    with m.Elif(self.recover):
+                        m.d.comb += self.error.eq(1)
                     with m.Else():
                         m.next = "Error"
 
@@ -178,6 +185,9 @@ class Decoder(wiring.Component):
                         with m.If(self.i.payload != 0x00):
                             m.d.comb += buffer.i.payload.data.eq(self.i.payload)
                             m.d.comb += buffer.i.valid.eq(1)
+                        with m.Elif(self.recover):
+                            m.d.comb += self.error.eq(1)
+                            m.next = "Start"
                         with m.Else():
                             m.next = "Error"
 

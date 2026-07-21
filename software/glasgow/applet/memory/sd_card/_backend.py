@@ -1,10 +1,13 @@
 from abc import ABCMeta, abstractmethod
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import os
 
 from ._protocol import BackendStatus
 
 
-__all__ = ["BlockBackend", "BackendError", "FileBlockBackend"]
+__all__ = ["BlockBackend", "BackendError", "BackendWorker", "FileBlockBackend"]
 
 
 BLOCK_SIZE = 512
@@ -53,6 +56,66 @@ class BlockBackend(metaclass=ABCMeta):
     @abstractmethod
     def close(self) -> None:
         pass
+
+
+class BackendWorker:
+    """Serialize blocking backend calls on one dedicated worker thread.
+
+    Only one operation may be queued in addition to the operation currently executing. This
+    keeps a slow disk or network-backed implementation from accumulating unbounded work while
+    preserving the strict ordering required for write-and-flush acknowledgements.
+    """
+
+    def __init__(self, backend: BlockBackend):
+        self.backend = backend
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="glasgow-sd")
+        self._slots = asyncio.Semaphore(2)
+        self._closing = False
+        self._closed = False
+
+    async def _execute(self, function, *args, _allow_closing=False):
+        if self._closed or (self._closing and not _allow_closing):
+            raise RuntimeError("backend worker is closed")
+        async with self._slots:
+            if self._closed or (self._closing and not _allow_closing):
+                raise RuntimeError("backend worker is closed")
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # Amaranth's coroutine simulator implements async/await without an asyncio event
+                # loop. Keep its deterministic test backend inline; real applet execution always
+                # has a running loop and therefore uses the dedicated worker.
+                return function(*args)
+            future = loop.run_in_executor(self._executor, partial(function, *args))
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # A running thread cannot be cancelled. Keep the bounded slot occupied until it
+                # finishes so repeated task cancellation cannot grow the executor's work queue.
+                await asyncio.shield(future)
+                raise
+
+    async def read_block(self, address: int) -> bytes:
+        return await self._execute(self.backend.read_block, address)
+
+    async def write_block(self, address: int, block: bytes) -> None:
+        await self._execute(self.backend.write_block, address, block)
+
+    async def erase(self, start: int, end: int) -> None:
+        await self._execute(self.backend.erase, start, end)
+
+    async def flush(self) -> None:
+        await self._execute(self.backend.flush)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closing = True
+        try:
+            await self._execute(self.backend.close, _allow_closing=True)
+        finally:
+            self._closed = True
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 class FileBlockBackend(BlockBackend):
