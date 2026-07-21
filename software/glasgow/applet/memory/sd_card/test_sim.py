@@ -7,28 +7,7 @@ from glasgow.simulation.assembly import SimulationAssembly
 
 from . import BLOCK_SIZE, build_cid, build_csd
 from .bfm import SDHostBFM
-
-
-class _InlineWorker:
-    """Keep backend calls deterministic inside the HDL simulator."""
-
-    def __init__(self, backend):
-        self.backend = backend
-
-    async def read_block(self, address):
-        return self.backend.read_block(address)
-
-    async def write_block(self, address, block):
-        return self.backend.write_block(address, block)
-
-    async def erase(self, start, end):
-        return self.backend.erase(start, end)
-
-    async def flush(self):
-        return self.backend.flush()
-
-    async def close(self):
-        return self.backend.close()
+from ._test_support import InlineWorker
 
 
 class SimHostServiceAgent:
@@ -142,7 +121,7 @@ class SDCardSimulationTestMixin:
             assembly = SimulationAssembly()
             applet = self.applet_cls(assembly)
             applet.build(args)
-            applet.sd_card_iface._worker_factory = _InlineWorker
+            applet.sd_card_iface._worker_factory = InlineWorker
 
             clk = assembly.get_pin("A2")
             cmd = assembly.get_pin("A5")

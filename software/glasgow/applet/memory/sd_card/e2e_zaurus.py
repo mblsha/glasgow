@@ -165,11 +165,18 @@ def root(command):
 class ZaurusSDController:
     """Temporarily take over Sharp SD services and restore their exact prior state."""
 
-    def __init__(self, shell, mount_point, *, module=MODULE, settle_delay=2):
+    def __init__(self, shell, mount_point, *, module=MODULE, settle_delay=2,
+            reconcile_attempts=3, reconcile_delay=None):
+        if reconcile_attempts < 1:
+            raise ValueError("reconcile_attempts must be at least one")
+        if reconcile_delay is not None and reconcile_delay < 0:
+            raise ValueError("reconcile_delay cannot be negative")
         self.shell = shell
         self.mount_point = mount_point
         self.module = module
         self.settle_delay = settle_delay
+        self.reconcile_attempts = reconcile_attempts
+        self.reconcile_delay = settle_delay if reconcile_delay is None else reconcile_delay
         self._prepared = False
         self._restore_needed = False
         self._initial_state = None
@@ -268,12 +275,7 @@ class ZaurusSDController:
                     [primary_error, restore_error]) from None
             raise
 
-    async def restore(self):
-        if not self._restore_needed:
-            return
-        state = self._initial_state
-        if state is None:
-            raise E2EError("Zaurus SD lifecycle restoration has no captured state")
+    async def _reconcile(self, state):
         await self.unmount()
         await self.stop_daemon()
         if state.module_loaded:
@@ -286,14 +288,36 @@ class ZaurusSDController:
         # restoring either an explicitly mounted slot or an explicitly unmounted one.
         await self.unmount()
         await self.restore_mount(state.mount)
-        observed = await self.capture_state()
-        if observed != state:
-            raise E2EError(
-                "Zaurus SD lifecycle restoration did not converge: "
-                f"expected {state!r}, observed {observed!r}")
-        self._prepared = False
-        self._restore_needed = False
-        self._initial_state = None
+
+    async def restore(self):
+        if not self._restore_needed:
+            return
+        state = self._initial_state
+        if state is None:
+            raise E2EError("Zaurus SD lifecycle restoration has no captured state")
+        observed = None
+        last_error = None
+        for attempt in range(self.reconcile_attempts):
+            try:
+                await self._reconcile(state)
+                observed = await self.capture_state()
+                if observed == state:
+                    self._prepared = False
+                    self._restore_needed = False
+                    self._initial_state = None
+                    return
+            except E2EError as error:
+                last_error = error
+            if attempt + 1 < self.reconcile_attempts and self.reconcile_delay:
+                await asyncio.sleep(self.reconcile_delay * (2 ** attempt))
+        error = E2EError(
+            "Zaurus SD lifecycle restoration did not converge after "
+            f"{self.reconcile_attempts} attempts: expected {state!r}, "
+            f"observed {observed!r}" +
+            ("" if last_error is None else f"; last error: {last_error}"))
+        if last_error is not None:
+            raise error from last_error
+        raise error
 
     async def __aenter__(self):
         await self.prepare()

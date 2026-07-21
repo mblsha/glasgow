@@ -17,6 +17,7 @@ from ._backend import BackendError, BackendWorker, BlockBackend, FileBlockBacken
 from ._buffer import BlockBuffer
 from ._command import CommandEngine
 from ._data import DataEngine
+from ._diagnostics import FPGA_DIAGNOSTICS_LAYOUT, decode_fpga_diagnostics
 from ._errors import SDCardError
 from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 from ._gateware_support import (
@@ -66,6 +67,13 @@ class SDCardDiagnostics:
     max_backend_call_seconds: float
 
 
+@dataclass(frozen=True)
+class _BackendSession:
+    backend: BlockBackend
+    worker: BackendWorker
+    sync_writes: bool
+
+
 class SDCardComponent(wiring.Component):
     i_stream: In(stream.Signature(8))
     o_stream: Out(stream.Signature(8))
@@ -93,6 +101,7 @@ class SDCardComponent(wiring.Component):
     prefetch_wait_cycles: Out(32)
     max_prefetch_wait: Out(32)
     max_host_service_latency: Out(32)
+    diagnostics_snapshot: Out(FPGA_DIAGNOSTICS_LAYOUT.size)
 
     def __init__(self, ports):
         self._ports = ports
@@ -176,6 +185,8 @@ class SDCardComponent(wiring.Component):
         m.submodules.command_engine = command_engine = CommandEngine()
         m.submodules.data_engine = data_engine = DataEngine()
         m.submodules.host_engine = host_engine = HostBlockEngine()
+        diagnostics_snapshot = data.View(
+            FPGA_DIAGNOSTICS_LAYOUT, self.diagnostics_snapshot)
 
         wiring.connect(m, command_engine.control, data_engine.control)
         wiring.connect(m, data_engine.storage, host_engine.storage)
@@ -220,6 +231,26 @@ class SDCardComponent(wiring.Component):
             self.prefetch_wait_cycles.eq(data_engine.prefetch_wait_cycles),
             self.max_prefetch_wait.eq(data_engine.max_prefetch_wait),
             self.max_host_service_latency.eq(host_engine.max_host_service_latency),
+
+            diagnostics_snapshot.sd_clocks.eq(command_engine.clock_count),
+            diagnostics_snapshot.command_low_clocks.eq(
+                command_engine.command_low_count),
+            diagnostics_snapshot.commands.eq(command_engine.command_count),
+            diagnostics_snapshot.reads.eq(data_engine.read_count),
+            diagnostics_snapshot.writes.eq(data_engine.write_count),
+            diagnostics_snapshot.protocol_errors.eq(
+                command_engine.protocol_errors + data_engine.protocol_errors +
+                host_engine.protocol_errors + block_buffer.fault_count),
+            diagnostics_snapshot.backend_errors.eq(host_engine.backend_errors),
+            diagnostics_snapshot.stale_replies.eq(host_engine.stale_replies),
+            diagnostics_snapshot.buffer_faults.eq(block_buffer.fault_count),
+            diagnostics_snapshot.prefetch_waits.eq(data_engine.prefetch_waits),
+            diagnostics_snapshot.prefetch_wait_cycles.eq(
+                data_engine.prefetch_wait_cycles),
+            diagnostics_snapshot.max_prefetch_wait_cycles.eq(
+                data_engine.max_prefetch_wait),
+            diagnostics_snapshot.max_host_service_latency_cycles.eq(
+                host_engine.max_host_service_latency),
         ]
 
         dat_o_latched = Signal(4, init=0xf)
@@ -275,19 +306,22 @@ class SDCardInterface:
         self.max_prefetch_wait = assembly.add_ro_register(component.max_prefetch_wait)
         self.max_host_service_latency = assembly.add_ro_register(
             component.max_host_service_latency)
+        self._diagnostics_snapshot = assembly.add_ro_register(component.diagnostics_snapshot)
 
-        self._backend = None
-        self._worker = None
+        self._session = None
         self._worker_factory = worker_factory
+        self._lifecycle_lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
         self._generation = 0
-        self._sync_writes = True
         self._active = False
         self._flush_count = 0
         self._host_backend_errors = 0
 
     @property
     def backend(self) -> BlockBackend | None:
-        return self._backend
+        if self._session is None:
+            return None
+        return self._session.backend
 
     def _next_generation(self) -> int:
         # Randomizing the initial value also protects against replies retained when the same
@@ -307,6 +341,7 @@ class SDCardInterface:
         if backend is None:
             backend = FileBlockBackend(image_path, read_only=read_only)
         worker = self._worker_factory(backend)
+        new_session = _BackendSession(backend, worker, sync_writes)
         try:
             size = backend.size
             encoded_transfer_speed = encode_csd_transfer_speed(transfer_speed)
@@ -315,26 +350,58 @@ class SDCardInterface:
                 size, read_only=backend.read_only, transfer_speed=transfer_speed)
             cid = build_cid(serial=backend.identity)
             scr = build_scr()
-
-            await self._enabled.set(0)
-            await self._pipe.reset()
-            await self._generation_reg.set(self._next_generation())
-            await self._read_only_reg.set(backend.read_only)
-            await self._image_size.set(size)
-            await self._cid.set(cid)
-            await self._csd.set(csd)
-            await self._scr.set(scr)
-            await self._enabled.set(1)
-            self._active = True
-        except BaseException:
-            await worker.close()
+        except BaseException as primary_error:
+            try:
+                await worker.close()
+            except BaseException as close_error:
+                raise BaseExceptionGroup(
+                    "SD backend configuration and cleanup both failed",
+                    [primary_error, close_error]) from None
             raise
 
-        if self._worker is not None:
-            await self._worker.close()
-        self._backend = backend
-        self._worker = worker
-        self._sync_writes = sync_writes
+        async with self._lifecycle_lock:
+            async with self._operation_lock:
+                adopted = False
+                try:
+                    await self._enabled.set(0)
+                    self._active = False
+                    await self._pipe.reset()
+                    old_session = self._session
+                    self._session = None
+                    if old_session is not None:
+                        await self._retire_session(old_session, operation="reconfigure")
+
+                    await self._generation_reg.set(self._next_generation())
+                    await self._read_only_reg.set(backend.read_only)
+                    await self._image_size.set(size)
+                    await self._cid.set(cid)
+                    await self._csd.set(csd)
+                    await self._scr.set(scr)
+                    self._flush_count = 0
+                    self._host_backend_errors = 0
+                    self._session = new_session
+                    adopted = True
+                    await self._enabled.set(1)
+                    self._active = True
+                except BaseException as primary_error:
+                    cleanup_errors = []
+                    try:
+                        await self._enabled.set(0)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                    self._active = False
+                    if adopted:
+                        self._session = None
+                    try:
+                        await worker.close()
+                    except BaseException as close_error:
+                        cleanup_errors.append(close_error)
+                    if cleanup_errors:
+                        raise BaseExceptionGroup(
+                            "SD backend activation and cleanup both failed",
+                            [primary_error, *cleanup_errors]) from None
+                    raise
+
         access = "read-only" if backend.read_only else "writable"
         durability = "synchronous" if sync_writes else "write-back"
         self._logger.info(
@@ -344,23 +411,47 @@ class SDCardInterface:
             ("" if advertised_transfer_speed == transfer_speed else
              f", requested {transfer_speed / 1_000_000:.3g} Mbit/s"))
 
+    async def _retire_session(self, session, *, operation):
+        errors = []
+        try:
+            await session.worker.flush()
+            self._flush_count += 1
+        except BaseException as error:
+            if isinstance(error, BackendError):
+                self._record_backend_error(f"{operation} flush", error)
+            errors.append(error)
+        try:
+            await session.worker.close()
+        except BaseException as error:
+            errors.append(error)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup(
+                f"SD backend {operation} failed during flush and close", errors)
+
     async def suspend(self, *, reason: str = "requested"):
-        if not self._active:
-            return
-        self._logger.info("suspending SD card: %s", reason)
-        await self._enabled.set(0)
-        self._active = False
-        await self._generation_reg.set(self._next_generation())
-        await self._pipe.reset()
+        async with self._lifecycle_lock:
+            async with self._operation_lock:
+                if not self._active:
+                    return
+                self._logger.info("suspending SD card: %s", reason)
+                await self._enabled.set(0)
+                self._active = False
+                await self._generation_reg.set(self._next_generation())
+                await self._pipe.reset()
 
     async def resume(self, *, reason: str = "requested"):
-        if self._backend is None or self._active:
-            return
-        await self._pipe.reset()
-        await self._generation_reg.set(self._next_generation())
-        await self._enabled.set(1)
-        self._active = True
-        self._logger.info("resumed SD card: %s (generation %#06x)", reason, self._generation)
+        async with self._lifecycle_lock:
+            async with self._operation_lock:
+                if self._session is None or self._active:
+                    return
+                await self._pipe.reset()
+                await self._generation_reg.set(self._next_generation())
+                await self._enabled.set(1)
+                self._active = True
+                self._logger.info(
+                    "resumed SD card: %s (generation %#06x)", reason, self._generation)
 
     async def monitor_power(self, device, port, *, off_threshold: float = 1.0,
             on_threshold: float = 1.8, interval: float = 0.25, debounce_samples: int = 3):
@@ -391,36 +482,50 @@ class SDCardInterface:
             raise SDCardError(str(error)) from error
 
     async def close(self):
-        diagnostics = None
-        if self._backend is not None:
-            # Disabling the card asynchronously resets the SD domain and its counters, so capture
-            # FPGA fields immediately before doing so. Host fields are finalized after shutdown.
-            diagnostics = await self.read_diagnostics()
-        await self._enabled.set(0)
-        self._active = False
-        if self._backend is None:
-            return
+        async with self._lifecycle_lock:
+            async with self._operation_lock:
+                session = self._session
+                diagnostics = None
+                errors = []
+                if session is not None:
+                    # Disabling the card asynchronously resets the SD domain and its counters, so
+                    # capture FPGA fields first. Host fields are finalized after shutdown.
+                    try:
+                        diagnostics = await self._read_diagnostics_unlocked(session)
+                    except BaseException as error:
+                        errors.append(error)
+                try:
+                    await self._enabled.set(0)
+                except BaseException as error:
+                    errors.append(error)
+                self._active = False
+                if session is None:
+                    self._raise_lifecycle_errors("SD card shutdown failed", errors)
+                    return
 
-        worker = self._worker
-        try:
-            await self.flush()
-        except BackendError as error:
-            self._record_backend_error("close flush", error)
-        try:
-            await worker.close()
-        finally:
-            try:
-                diagnostics = replace(
-                    diagnostics,
-                    host_backend_errors=self._host_backend_errors,
-                    durable_flushes=self._flush_count,
-                    backend_calls=getattr(worker, "service_count", 0),
-                    max_backend_call_seconds=getattr(worker, "max_service_latency", 0.0),
-                )
-            finally:
-                self._worker = None
-                self._backend = None
-            self._log_diagnostics(diagnostics)
+                self._session = None
+                try:
+                    await self._retire_session(session, operation="close")
+                except BaseException as error:
+                    errors.append(error)
+                if diagnostics is not None:
+                    diagnostics = replace(
+                        diagnostics,
+                        host_backend_errors=self._host_backend_errors,
+                        durable_flushes=self._flush_count,
+                        backend_calls=getattr(session.worker, "service_count", 0),
+                        max_backend_call_seconds=getattr(
+                            session.worker, "max_service_latency", 0.0),
+                    )
+                    self._log_diagnostics(diagnostics)
+                self._raise_lifecycle_errors("SD card shutdown failed", errors)
+
+    @staticmethod
+    def _raise_lifecycle_errors(message, errors):
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup(message, errors)
 
     def _log_diagnostics(self, diagnostics):
         self._logger.info(
@@ -442,25 +547,32 @@ class SDCardInterface:
     async def read_diagnostics(self) -> SDCardDiagnostics:
         """Read named FPGA and host-side pipeline diagnostics.
 
-        During an active transfer, individual FPGA registers may advance between reads. The
-        close-time report samples FPGA counters immediately before disabling their clock domain,
-        then updates host fields after the final flush and worker close.
+        The FPGA fields are latched by one packed register transaction, so they represent one
+        instant even during an active transfer. The close-time report samples that register
+        immediately before disabling the SD clock domain, then updates host fields after the
+        final flush and worker close.
         """
-        worker = self._worker
+        async with self._lifecycle_lock:
+            async with self._operation_lock:
+                return await self._read_diagnostics_unlocked(self._session)
+
+    async def _read_diagnostics_unlocked(self, session) -> SDCardDiagnostics:
+        worker = None if session is None else session.worker
+        fpga = decode_fpga_diagnostics(await self._diagnostics_snapshot)
         return SDCardDiagnostics(
-            sd_clocks=await self.clock_count,
-            command_low_clocks=await self.command_low_count,
-            commands=await self.command_count,
-            reads=await self.read_count,
-            writes=await self.write_count,
-            protocol_errors=await self.protocol_errors,
-            fpga_backend_errors=await self.backend_errors,
-            stale_replies=await self.stale_replies,
-            buffer_faults=await self.buffer_faults,
-            prefetch_waits=await self.prefetch_waits,
-            prefetch_wait_cycles=await self.prefetch_wait_cycles,
-            max_prefetch_wait_cycles=await self.max_prefetch_wait,
-            max_host_service_latency_cycles=await self.max_host_service_latency,
+            sd_clocks=fpga["sd_clocks"],
+            command_low_clocks=fpga["command_low_clocks"],
+            commands=fpga["commands"],
+            reads=fpga["reads"],
+            writes=fpga["writes"],
+            protocol_errors=fpga["protocol_errors"],
+            fpga_backend_errors=fpga["backend_errors"],
+            stale_replies=fpga["stale_replies"],
+            buffer_faults=fpga["buffer_faults"],
+            prefetch_waits=fpga["prefetch_waits"],
+            prefetch_wait_cycles=fpga["prefetch_wait_cycles"],
+            max_prefetch_wait_cycles=fpga["max_prefetch_wait_cycles"],
+            max_host_service_latency_cycles=fpga["max_host_service_latency_cycles"],
             host_backend_errors=self._host_backend_errors,
             durable_flushes=self._flush_count,
             backend_calls=getattr(worker, "service_count", 0),
@@ -473,9 +585,14 @@ class SDCardInterface:
             operation, error.status.name, error)
 
     async def flush(self):
-        if self._worker is None:
-            raise SDCardError("no image is configured")
-        await self._worker.flush()
+        async with self._lifecycle_lock:
+            async with self._operation_lock:
+                if self._session is None:
+                    raise SDCardError("no image is configured")
+                await self._flush_session(self._session)
+
+    async def _flush_session(self, session):
+        await session.worker.flush()
         self._flush_count += 1
 
     async def _reply(self, opcode: HostReply, generation: int, request_id: int,
@@ -486,7 +603,7 @@ class SDCardInterface:
         await self._pipe.flush()
 
     async def serve_once(self):
-        if self._backend is None:
+        if self._session is None:
             raise SDCardError("no image is configured")
 
         while True:
@@ -498,6 +615,13 @@ class SDCardInterface:
                 continue
             break
 
+        async with self._operation_lock:
+            session = self._session
+            if session is None:
+                return
+            await self._serve_request(request, session)
+
+    async def _serve_request(self, request, session):
         header = request.header
         payload = request.payload
         if header.generation != self._generation:
@@ -522,7 +646,7 @@ class SDCardInterface:
             self._logger.log(self._level, "read block at %#x", address)
             status = BackendStatus.OK
             try:
-                block = await self._worker.read_block(address)
+                block = await session.worker.read_block(address)
             except BackendError as error:
                 self._record_backend_error("read", error)
                 status = error.status
@@ -537,9 +661,9 @@ class SDCardInterface:
             self._logger.log(self._level, "write block at %#x", address)
             status = BackendStatus.OK
             try:
-                await self._worker.write_block(address, block)
-                if self._sync_writes:
-                    await self.flush()
+                await session.worker.write_block(address, block)
+                if session.sync_writes:
+                    await self._flush_session(session)
             except BackendError as error:
                 self._record_backend_error("write", error)
                 status = error.status
@@ -551,9 +675,9 @@ class SDCardInterface:
             self._logger.log(self._level, "erase blocks at %#x..%#x", start, end)
             status = BackendStatus.OK
             try:
-                await self._worker.erase(start, end)
-                if self._sync_writes:
-                    await self.flush()
+                await session.worker.erase(start, end)
+                if session.sync_writes:
+                    await self._flush_session(session)
             except BackendError as error:
                 self._record_backend_error("erase", error)
                 status = error.status

@@ -60,20 +60,22 @@ def _elaborate_host_block_engine(
     """
 
     self = component
-    read_request = storage.read_request
-    write_request = storage.write_request
-    erase_request = storage.erase_request
+    read = storage.read
+    mutation = storage.mutation
+    read_request = read.request
+    write_request = mutation.write_request
+    erase_request = mutation.erase_request
 
     # Host replies carry both a session generation and a request ID. This permits the SD clock
     # domains and USB pipes to be reset independently without ever accepting a reply left over
     # from the previous target-power cycle.
-    read_buffer_ready = storage.read_buffer_ready
-    read_buffer_address = storage.read_buffer_address
-    read_buffer_consume = storage.read_buffer_consume
-    read_reply_error = storage.read_reply_error
-    host_ack_valid = storage.host_ack_valid
-    host_ack_status = storage.host_ack_status
-    host_ack_consume = storage.host_ack_consume
+    read_buffer_ready = read.reply_ready
+    read_buffer_address = read.reply_address
+    read_buffer_consume = read.reply_consume
+    read_reply_error = read.reply_error
+    host_ack_valid = mutation.ack_valid
+    host_ack_status = mutation.ack_status
+    host_ack_consume = mutation.ack_consume
     transaction = Signal(data.StructLayout({
         "phase": TransactionPhase,
         "event": HostEvent,
@@ -129,9 +131,9 @@ def _elaborate_host_block_engine(
 
     m.d.sd += [
         read_reply_error.eq(0),
-        storage.read_request_accepted.eq(0),
-        storage.write_request_accepted.eq(0),
-        storage.erase_request_accepted.eq(0),
+        read.request_accepted.eq(0),
+        mutation.write_request_accepted.eq(0),
+        mutation.erase_request_accepted.eq(0),
     ]
     with m.If(read_buffer_consume):
         m.d.sd += read_buffer_ready.eq(0)
@@ -147,9 +149,9 @@ def _elaborate_host_block_engine(
     m.d.sd += [
         Assert(~(block_buffer.write_en & block_buffer.read_active)),
         Assert(~(
-            (storage.read_request_accepted & storage.write_request_accepted) |
-            (storage.read_request_accepted & storage.erase_request_accepted) |
-            (storage.write_request_accepted & storage.erase_request_accepted))),
+            (read.request_accepted & mutation.write_request_accepted) |
+            (read.request_accepted & mutation.erase_request_accepted) |
+            (mutation.write_request_accepted & mutation.erase_request_accepted))),
     ]
 
     def discard_reply():
@@ -232,7 +234,7 @@ def _elaborate_host_block_engine(
                             m.d.sd += self.max_host_service_latency.eq(
                                 completed_service_latency)
                         with m.If(transaction.event == HostEvent.Read):
-                            m.d.sd += storage.read_reply_bank.eq(transaction.bank)
+                            m.d.sd += read.reply_bank.eq(transaction.bank)
                             with m.If(reply_header.status == BackendStatus.OK):
                                 m.d.sd += [
                                     read_buffer_ready.eq(1),
@@ -279,10 +281,10 @@ def _elaborate_host_block_engine(
             transaction.event.eq(HostEvent.Read),
             transaction.reply.eq(HOST_OPERATION_FOR_EVENT[HostEvent.Read].reply),
             transaction.request_id.eq(next_request),
-            transaction.address.eq(storage.read_request_address),
-            transaction.bank.eq(storage.read_request_bank),
+            transaction.address.eq(read.request_address),
+            transaction.bank.eq(read.request_bank),
             next_request.eq(next_request + 1),
-            storage.read_request_accepted.eq(1),
+            read.request_accepted.eq(1),
         ]
     with m.Elif(write_request & (transaction.phase == TransactionPhase.Idle)):
         m.d.sd += [
@@ -292,7 +294,7 @@ def _elaborate_host_block_engine(
             transaction.request_id.eq(next_request),
             transaction.address.eq(current_address),
             next_request.eq(next_request + 1),
-            storage.write_request_accepted.eq(1),
+            mutation.write_request_accepted.eq(1),
         ]
     with m.Elif(erase_request & (transaction.phase == TransactionPhase.Idle)):
         m.d.sd += [
@@ -303,7 +305,7 @@ def _elaborate_host_block_engine(
             transaction.address.eq(erase_start),
             transaction.end_address.eq(erase_end),
             next_request.eq(next_request + 1),
-            storage.erase_request_accepted.eq(1),
+            mutation.erase_request_accepted.eq(1),
         ]
 
     event_payload_length = Signal(16)
