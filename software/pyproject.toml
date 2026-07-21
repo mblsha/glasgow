@@ -118,6 +118,7 @@ memory-25x = "glasgow.applet.memory._25x:Memory25xApplet"
 memory-onfi = "glasgow.applet.memory.onfi:MemoryONFIApplet"
 memory-prom = "glasgow.applet.memory.prom:MemoryPROMApplet"
 memory-floppy = "glasgow.applet.memory.floppy:MemoryFloppyApplet"
+memory-sd-card = "glasgow.applet.memory.sd_card:SDCardApplet"
 
 debug-arc = "glasgow.applet.debug.arc:DebugARCApplet"
 debug-arm = "glasgow.applet.debug.arm.jtag:DebugARMJTAGApplet"
