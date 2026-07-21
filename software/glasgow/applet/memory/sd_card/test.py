@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 
+from amaranth import ClockDomain, Module
 from amaranth.sim import Simulator
 
 from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
@@ -19,6 +20,7 @@ from . import (
 )
 from .bfm import SDHostBFM
 from ._console import SerialTransport, TelnetTransport
+from ._buffer import BlockBuffer
 from ._fat16 import FAT16Image, create_fat16_image
 from ._protocol import FrameError, frame_crc16
 
@@ -96,6 +98,10 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 # Let the enable synchronizer cross into the externally clocked SD domain.
                 for _ in range(4):
                     await cycle()
+
+                # Configuration is snapshotted atomically before command sampling. Mutating the
+                # source register while enabled must not tear or alter the active 128-bit CID.
+                await applet.sd_card_iface._cid.set(0)
 
                 await send_command(0)
                 for _ in range(4):
@@ -552,6 +558,35 @@ class SDCardProtocolTestCase(unittest.TestCase):
         packet = gateware_cobs.encode(raw + struct.pack("<H", frame_crc16(raw))) + b"\0"
         with self.assertRaises(FrameError):
             RequestFrame.decode_packet(packet)
+
+
+class BlockBufferTestCase(unittest.TestCase):
+    def test_collisions_are_counted_once_per_incident(self):
+        m = Module()
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = BlockBuffer()
+
+        async def testbench(ctx):
+            ctx.set(dut.host.write_en, 1)
+            ctx.set(dut.data.write_en, 1)
+            self.assertEqual(ctx.get(dut.collision), 1)
+            await ctx.tick("sd")
+            self.assertEqual(ctx.get(dut.collision_count), 1)
+            await ctx.tick("sd").repeat(3)
+            self.assertEqual(ctx.get(dut.collision_count), 1)
+
+            ctx.set(dut.host.write_en, 0)
+            ctx.set(dut.data.write_en, 0)
+            await ctx.tick("sd")
+            ctx.set(dut.host.read_active, 1)
+            ctx.set(dut.data.read_active, 1)
+            await ctx.tick("sd")
+            self.assertEqual(ctx.get(dut.collision_count), 2)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6, domain="sd")
+        simulator.add_testbench(testbench)
+        simulator.run()
 
 
 class FAT16ImageTestCase(unittest.TestCase):

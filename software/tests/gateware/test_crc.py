@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+import random
 import unittest
 from amaranth import *
 from amaranth.lib import crc
@@ -70,6 +71,42 @@ def run_frame(dut, input, output, *, error=False):
     sim.run()
 
 
+def run_frame_backpressured(dut, input_tokens, output_tokens, *, seed):
+    input_random = random.Random(seed)
+    output_random = random.Random(seed ^ 0x5a5a)
+
+    async def testbench_i(ctx):
+        for token in input_tokens:
+            delay = input_random.randrange(4)
+            if delay:
+                await ctx.tick().repeat(delay)
+            ctx.set(dut.i.payload, token)
+            ctx.set(dut.i.valid, 1)
+            await ctx.tick().until(dut.i.ready)
+            ctx.set(dut.i.valid, 0)
+
+    async def testbench_o(ctx):
+        for expected in output_tokens:
+            for attempt in range(10000):
+                ready = output_random.randrange(4) != 0 or attempt % 8 == 7
+                ctx.set(dut.o.ready, ready)
+                _, _, valid, payload = await ctx.tick().sample(dut.o.valid, dut.o.payload)
+                if valid and ready:
+                    for name, value in expected.items():
+                        assert payload[name] == value, \
+                            f"payload.{name}: {payload[name]!r} != {value!r}"
+                    break
+            else:
+                raise AssertionError("output did not become valid within 10000 cycles")
+        ctx.set(dut.o.ready, 0)
+
+    sim = Simulator(dut)
+    sim.add_clock(1e-6)
+    sim.add_testbench(testbench_i)
+    sim.add_testbench(testbench_o)
+    sim.run()
+
+
 class PacketChecksumTestCase(unittest.TestCase):
     def test_append(self):
         algorithm = crc.catalog.CRC32_ETHERNET
@@ -113,14 +150,12 @@ class FrameChecksumTestCase(unittest.TestCase):
     def test_verify_too_short(self):
         run_frame(FrameChecksumVerifier(self.algorithm), b"\0", b"", error=True)
 
-    def test_abort_resynchronizes_next_frame(self):
+    def test_error_boundary_resynchronizes_next_frame(self):
         dut = FrameChecksumVerifier(self.algorithm)
 
         async def testbench_i(ctx):
             await stream_put(ctx, dut.i, {"data": 0x41})
-            ctx.set(dut.abort, 1)
-            await ctx.tick()
-            ctx.set(dut.abort, 0)
+            await stream_put(ctx, dut.i, {"end": 1, "error": 1})
             for byte in append(self.algorithm, b"B"):
                 await stream_put(ctx, dut.i, {"data": byte})
             await stream_put(ctx, dut.i, {"end": 1})
@@ -135,3 +170,18 @@ class FrameChecksumTestCase(unittest.TestCase):
         sim.add_testbench(testbench_i)
         sim.add_testbench(testbench_o)
         sim.run()
+
+    def test_randomized_backpressure(self):
+        payload = bytes(range(256)) * 2
+        encoded = append(self.algorithm, payload)
+
+        run_frame_backpressured(
+            FrameChecksumAppender(self.algorithm),
+            [{"data": byte} for byte in payload] + [{"end": 1}],
+            [{"data": byte} for byte in encoded] + [{"end": 1}],
+            seed=0x63726361)
+        run_frame_backpressured(
+            FrameChecksumVerifier(self.algorithm),
+            [{"data": byte} for byte in encoded] + [{"end": 1}],
+            [{"data": byte} for byte in payload] + [{"end": 1, "error": 0}],
+            seed=0x63726376)

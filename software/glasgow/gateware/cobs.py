@@ -130,20 +130,25 @@ class Decoder(wiring.Component):
     the decoder transitions to an error state, signaled by the ``error`` output. This state is
     final, cleared only by a reset. If ``recover`` is true, an unexpected NUL is instead treated
     as a frame boundary, ``error`` pulses for one cycle, and decoding resumes with the next byte.
+    If ``error_tokens`` is also true, recovery additionally emits a handshaked ``end`` token with
+    an ``error`` field, preserving the malformed boundary under output backpressure.
 
     .. _cobs: https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing
     """
 
-    i: In(stream.Signature(8))
-    o: Out(stream.Signature(data.StructLayout({
-        "data": 8,
-        "end":  1
-    })))
-    error: Out(1)
-
-    def __init__(self, *, recover=False):
+    def __init__(self, *, recover=False, error_tokens=False):
+        if error_tokens and not recover:
+            raise ValueError("COBS error tokens require recovery mode")
         self.recover = recover
-        super().__init__()
+        self.error_tokens = error_tokens
+        output_layout = {"data": 8, "end": 1}
+        if error_tokens:
+            output_layout["error"] = 1
+        super().__init__({
+            "i": In(stream.Signature(8)),
+            "o": Out(stream.Signature(data.StructLayout(output_layout))),
+            "error": Out(1),
+        })
 
     def elaborate(self, platform):
         m = Module()
@@ -154,16 +159,28 @@ class Decoder(wiring.Component):
         m.submodules.buffer = buffer = StreamBuffer(self.o.p.shape())
         wiring.connect(m, wiring.flipped(self.o), buffer.o)
 
+        def report_error():
+            m.d.comb += self.error.eq(1)
+            if self.error_tokens:
+                m.d.comb += [
+                    buffer.i.p.end.eq(1),
+                    buffer.i.p.error.eq(1),
+                    buffer.i.valid.eq(1),
+                ]
+
         with m.FSM():
             with m.State("Start"):
-                m.d.comb += self.i.ready.eq(1)
+                if self.error_tokens:
+                    m.d.comb += self.i.ready.eq(buffer.i.ready)
+                else:
+                    m.d.comb += self.i.ready.eq(1)
                 with m.If(self.i.valid & self.i.ready):
                     m.d.sync += count.eq(1)
                     with m.If(self.i.payload != 0x00):
                         m.d.sync += offset.eq(self.i.payload)
                         m.next = "Data"
                     with m.Elif(self.recover):
-                        m.d.comb += self.error.eq(1)
+                        report_error()
                     with m.Else():
                         m.next = "Error"
 
@@ -186,7 +203,7 @@ class Decoder(wiring.Component):
                             m.d.comb += buffer.i.payload.data.eq(self.i.payload)
                             m.d.comb += buffer.i.valid.eq(1)
                         with m.Elif(self.recover):
-                            m.d.comb += self.error.eq(1)
+                            report_error()
                             m.next = "Start"
                         with m.Else():
                             m.next = "Error"

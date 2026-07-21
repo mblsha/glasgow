@@ -10,8 +10,7 @@ from amaranth.lib.wiring import In, Out
 
 from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
-from glasgow.gateware import cobs as gateware_cobs
-from glasgow.gateware.crc import FrameChecksumAppender, FrameChecksumVerifier
+from glasgow.gateware.framing import COBSCRCFrameDecoder, COBSCRCFrameEncoder
 from glasgow.gateware.stream import AsyncQueue
 from glasgow.support.target_power import TargetPowerLifecycle
 
@@ -213,14 +212,33 @@ class SDCardComponent(wiring.Component):
         enabled_sd = Signal()
         m.submodules.enabled_sync = cdc.FFSynchronizer(self.enabled, enabled_sd, o_domain="sd")
 
-        m.submodules.host_decoder = host_decoder = gateware_cobs.Decoder(recover=True)
-        wiring.connect(m, host_decoder.i, wiring.flipped(self.i_stream))
+        # Configuration registers are written while the SD domain is held in reset. Once enable
+        # has crossed into the target-clock domain, take one coherent snapshot before allowing
+        # either command sampling or data output. The wide buses remain stable for the lifetime
+        # of this snapshot and are never consumed directly across the domain boundary.
+        configuration = Signal(data.StructLayout({
+            "generation": 16,
+            "read_only": 1,
+            "image_size": 25,
+            "cid": 128,
+            "csd": 128,
+            "scr": 64,
+        }))
+        configuration_valid = Signal()
+        with m.If(enabled_sd & ~configuration_valid):
+            m.d.sd += [
+                configuration.generation.eq(self.generation),
+                configuration.read_only.eq(self.read_only),
+                configuration.image_size.eq(self.image_size),
+                configuration.cid.eq(self.cid),
+                configuration.csd.eq(self.csd),
+                configuration.scr.eq(self.scr),
+                configuration_valid.eq(1),
+            ]
+        engine_enabled = enabled_sd & configuration_valid
 
-        m.submodules.host_checksum = host_checksum = FrameChecksumVerifier(FRAME_CRC16)
-        wiring.connect(m, host_checksum.i, host_decoder.o)
-        host_decode_error = Signal()
-        m.d.sync += host_decode_error.eq(host_decoder.error)
-        m.d.comb += host_checksum.abort.eq(host_decode_error)
+        m.submodules.host_decoder = host_decoder = COBSCRCFrameDecoder(FRAME_CRC16)
+        wiring.connect(m, host_decoder.i, wiring.flipped(self.i_stream))
 
         host_to_sd = AsyncQueue(
             shape=data.StructLayout({"data": 8, "end": 1, "error": 1}),
@@ -230,12 +248,11 @@ class SDCardComponent(wiring.Component):
             depth=64, i_domain="sd", o_domain="sync")
         m.submodules.host_to_sd = host_to_sd
         m.submodules.sd_to_host = sd_to_host
-        wiring.connect(m, host_to_sd.i, host_checksum.o)
+        wiring.connect(m, host_to_sd.i, host_decoder.o)
 
-        m.submodules.event_checksum = event_checksum = FrameChecksumAppender(FRAME_CRC16)
-        wiring.connect(m, event_checksum.i, sd_to_host.o)
-        m.submodules.host_encoder = host_encoder = gateware_cobs.Encoder(fifo_depth=1024)
-        wiring.connect(m, host_encoder.i, event_checksum.o)
+        m.submodules.host_encoder = host_encoder = COBSCRCFrameEncoder(
+            FRAME_CRC16, fifo_depth=1024)
+        wiring.connect(m, host_encoder.i, sd_to_host.o)
         wiring.connect(m, wiring.flipped(self.o_stream), host_encoder.o)
         m.d.sync += self.o_flush.eq(0)
         with m.If(self.o_stream.valid & self.o_stream.ready & (self.o_stream.payload == 0)):
@@ -259,17 +276,17 @@ class SDCardComponent(wiring.Component):
             command_engine.cmd_i.eq(cmd_buffer.i),
             cmd_buffer.o.eq(command_engine.cmd_o),
             cmd_buffer.oe.eq(command_engine.cmd_oe),
-            command_engine.enabled.eq(enabled_sd),
-            command_engine.read_only.eq(self.read_only),
-            command_engine.image_size.eq(self.image_size),
-            command_engine.cid.eq(self.cid),
-            command_engine.csd.eq(self.csd),
+            command_engine.enabled.eq(engine_enabled),
+            command_engine.read_only.eq(configuration.read_only),
+            command_engine.image_size.eq(configuration.image_size),
+            command_engine.cid.eq(configuration.cid),
+            command_engine.csd.eq(configuration.csd),
 
             data_engine.dat_i.eq(dat_i),
-            data_engine.scr.eq(self.scr),
-            data_engine.image_size.eq(self.image_size),
+            data_engine.scr.eq(configuration.scr),
+            data_engine.image_size.eq(configuration.image_size),
 
-            host_engine.generation.eq(self.generation),
+            host_engine.generation.eq(configuration.generation),
             host_engine.current_address.eq(command_engine.control.current_address),
             host_engine.erase_start.eq(command_engine.control.erase_start),
             host_engine.erase_end.eq(command_engine.control.erase_end),
@@ -282,7 +299,7 @@ class SDCardComponent(wiring.Component):
             self.write_count.eq(data_engine.write_count),
             self.protocol_errors.eq(
                 command_engine.protocol_errors + data_engine.protocol_errors +
-                host_engine.protocol_errors),
+                host_engine.protocol_errors + block_buffer.collision_count),
             self.backend_errors.eq(host_engine.backend_errors),
             self.stale_replies.eq(host_engine.stale_replies),
         ]
@@ -291,7 +308,7 @@ class SDCardComponent(wiring.Component):
         dat_oe_latched = Signal(4)
         m.d.sd_fall += [
             dat_o_latched.eq(data_engine.dat_o),
-            dat_oe_latched.eq(Mux(enabled_sd, data_engine.dat_oe, 0)),
+            dat_oe_latched.eq(Mux(engine_enabled, data_engine.dat_oe, 0)),
         ]
         for index, buffer in enumerate(dat_buffers):
             m.d.comb += [

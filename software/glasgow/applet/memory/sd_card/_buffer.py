@@ -1,6 +1,6 @@
 from amaranth import *
 from amaranth.lib import memory, wiring
-from amaranth.lib.wiring import In
+from amaranth.lib.wiring import In, Out
 
 from ._gateware_support import BLOCK_SIZE
 
@@ -34,6 +34,8 @@ class BlockBuffer(wiring.Component):
         super().__init__({
             "host": In(BlockBufferPortSignature()),
             "data": In(BlockBufferPortSignature()),
+            "collision": Out(1),
+            "collision_count": Out(16),
         })
 
     def elaborate(self, platform):
@@ -43,14 +45,28 @@ class BlockBuffer(wiring.Component):
         write_port = block_memory.write_port(domain="sd")
         read_port = block_memory.read_port(domain="sd")
 
+        host_write_grant = self.host.write_en
+        data_write_grant = ~self.host.write_en & self.data.write_en
+        host_read_grant = self.host.read_active
+        data_read_grant = ~self.host.read_active & self.data.read_active
+
+        collision_active = Signal()
+        m.d.comb += self.collision.eq(
+            (self.host.write_en & self.data.write_en) |
+            (self.host.read_active & self.data.read_active))
+        m.d.sd += collision_active.eq(self.collision)
+        with m.If(self.collision & ~collision_active):
+            m.d.sd += self.collision_count.eq(self.collision_count + 1)
+
         m.d.comb += [
-            write_port.en.eq(self.host.write_en | self.data.write_en),
+            write_port.en.eq(host_write_grant | data_write_grant),
             write_port.addr.eq(Mux(
-                self.host.write_en, self.host.write_address, self.data.write_address)),
+                host_write_grant, self.host.write_address, self.data.write_address)),
             write_port.data.eq(Mux(
-                self.host.write_en, self.host.write_data, self.data.write_data)),
+                host_write_grant, self.host.write_data, self.data.write_data)),
             read_port.addr.eq(Mux(
-                self.host.read_active, self.host.read_address, self.data.read_address)),
+                host_read_grant, self.host.read_address,
+                Mux(data_read_grant, self.data.read_address, 0))),
             self.host.read_data.eq(read_port.data),
             self.data.read_data.eq(read_port.data),
         ]

@@ -104,7 +104,8 @@ def _elaborate_data_transfer_engine(
         block_buffer.write_en.eq(0),
         block_buffer.write_address.eq(0),
         block_buffer.write_data.eq(0),
-        block_buffer.read_active.eq(1),
+        block_buffer.read_active.eq(
+            (data_mode == DataMode.ReadSingle) | (data_mode == DataMode.ReadMulti)),
         block_buffer.read_address.eq(Mux(read_advance, data_byte + 1, data_byte)),
     ]
 

@@ -212,9 +212,9 @@ class FrameChecksumVerifier(wiring.Component):
     """Verify and remove a CRC checksum from an explicitly delimited token stream.
 
     The output preserves each frame boundary and adds an ``error`` bit to its ``end`` token.
-    Frames shorter than the checksum and frames with an invalid checksum are discarded at the
-    boundary with ``error`` asserted. Payload bytes are otherwise streamed with only enough
-    lookbehind to retain the checksum.
+    Frames shorter than the checksum, frames with an invalid checksum, and input boundaries
+    already marked as errors are reported at the output boundary with ``error`` asserted. Payload
+    bytes are otherwise streamed with only enough lookbehind to retain the checksum.
     """
 
     def __init__(self, algorithm: crc.Algorithm, *, data_width=8):
@@ -223,12 +223,11 @@ class FrameChecksumVerifier(wiring.Component):
 
         self._parameters = algorithm(data_width)
         self._checksum_words = algorithm.crc_width // data_width
-        input_layout = data.StructLayout({"data": data_width, "end": 1})
+        input_layout = data.StructLayout({"data": data_width, "end": 1, "error": 1})
         output_layout = data.StructLayout({"data": data_width, "end": 1, "error": 1})
         super().__init__({
             "i": In(stream.Signature(input_layout)),
             "o": Out(stream.Signature(output_layout)),
-            "abort": In(1),
         })
 
     def elaborate(self, platform):
@@ -244,18 +243,12 @@ class FrameChecksumVerifier(wiring.Component):
         m.d.comb += engine.data.eq(window[0])
         with m.FSM():
             with m.State("Data"):
-                with m.If(self.abort):
-                    m.d.sync += [
-                        frame_error.eq(1),
-                        count.eq(0),
-                    ]
-                    m.next = "End"
-                with m.Elif(self.i.p.end):
+                with m.If(self.i.p.end):
                     m.d.comb += self.i.ready.eq(1)
                     with m.If(self.i.valid):
                         m.d.sync += [
                             frame_error.eq(
-                                (count != checksum_words) |
+                                self.i.p.error | (count != checksum_words) |
                                 (window.as_value() != engine.crc)),
                             count.eq(0),
                         ]

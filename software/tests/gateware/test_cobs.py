@@ -5,6 +5,7 @@ from amaranth.sim import Simulator
 from cobs import cobs
 
 from glasgow.gateware.cobs import *
+from glasgow.gateware.stream import stream_assert, stream_put
 
 
 def ref_encode(data_i: bytes) -> bytes:
@@ -121,6 +122,29 @@ class COBSDecoderTest(unittest.TestCase):
 
     def test_vmlinuz(self):
         assert rtl_decode(cobs.encode(vmlinuz) + b"\0") == [vmlinuz]
+
+    def test_recovery_emits_handshaked_error_boundary(self):
+        dut = Decoder(recover=True, error_tokens=True)
+
+        async def testbench_i(ctx):
+            for byte in b"\x03A\0" + cobs.encode(b"OK") + b"\0":
+                await stream_put(ctx, dut.i, byte)
+
+        async def testbench_o(ctx):
+            # Keep the decoded byte buffered long enough that accepting the malformed delimiter
+            # must wait for output space, then verify recovery is itself a stream transaction.
+            await ctx.tick().repeat(5)
+            await stream_assert(ctx, dut.o, {"data": ord("A")})
+            await stream_assert(ctx, dut.o, {"end": 1, "error": 1})
+            await stream_assert(ctx, dut.o, {"data": ord("O")})
+            await stream_assert(ctx, dut.o, {"data": ord("K")})
+            await stream_assert(ctx, dut.o, {"end": 1, "error": 0})
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(testbench_i)
+        sim.add_testbench(testbench_o)
+        sim.run()
 
 
 vmlinuz = bytes.fromhex("""
