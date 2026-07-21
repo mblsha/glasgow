@@ -18,6 +18,7 @@ from . import (
     build_cid, build_csd, build_scr, crc7, crc16,
 )
 from .bfm import SDHostBFM
+from ._console import SerialTransport, TelnetTransport
 from ._fat16 import FAT16Image, create_fat16_image
 from ._protocol import FrameError, frame_crc16
 
@@ -71,6 +72,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
             assembly = SimulationAssembly()
             applet = self.applet_cls(assembly)
             applet.build(args)
+            applet.sd_card_iface._worker_factory = _InlineWorker
 
             clk = assembly.get_pin("A2")
             cmd = assembly.get_pin("A5")
@@ -87,7 +89,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                     async def diagnostic():
                         pipe = applet.sd_card_iface._pipe
                         return (
-                            f"host in={len(pipe._i_buffer)}, host out={len(pipe._o_buffer)}, "
+                            f"host readable={pipe.readable}, "
                             f"errors={await applet.sd_card_iface.protocol_errors}")
                     await bfm.receive_data_block(expected, timeout_diagnostic=diagnostic)
 
@@ -137,7 +139,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 await send_command(17, BLOCK_SIZE)
                 assert_r1(await receive_response(48), 17)
 
-                while applet.sd_card_iface._pipe.readable == 0:
+                while not applet.sd_card_iface._pipe.contains(b"\0"):
                     await cycle()
                 await applet.sd_card_iface.serve_once()
                 await receive_data_block(payload[BLOCK_SIZE:BLOCK_SIZE * 2])
@@ -147,21 +149,20 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 # own address rather than consuming the stale prefetch.
                 await send_command(18, 0)
                 assert_r1(await receive_response(48), 18)
-                while applet.sd_card_iface._pipe.readable == 0:
+                while not applet.sd_card_iface._pipe.contains(b"\0"):
                     await cycle()
                 await applet.sd_card_iface.serve_once()
                 await receive_data_block(payload[:BLOCK_SIZE])
 
                 await send_command(12)
                 assert_r1(await receive_response(48), 12)
-                while applet.sd_card_iface._pipe.readable == 0:
+                while not applet.sd_card_iface._pipe.contains(b"\0"):
                     await cycle()
                 await applet.sd_card_iface.serve_once()  # stale block-one prefetch
-
                 read_address = BLOCK_SIZE * 3
                 await send_command(17, read_address)
                 assert_r1(await receive_response(48), 17)
-                while applet.sd_card_iface._pipe.readable == 0:
+                while not applet.sd_card_iface._pipe.contains(b"\0"):
                     await cycle()
                 await applet.sd_card_iface.serve_once()
                 await receive_data_block(payload[read_address:read_address + BLOCK_SIZE])
@@ -185,7 +186,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                     _, _, data_sample = await cycle()
                     if data_sample[0] == (1, 0):
                         saw_busy = True
-                    if b"\0" in applet.sd_card_iface._pipe._i_buffer:
+                    if applet.sd_card_iface._pipe.contains(b"\0"):
                         await applet.sd_card_iface.serve_once()
                     if saw_busy and data_sample[0][0] == 0:
                         break
@@ -193,7 +194,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                     pipe = applet.sd_card_iface._pipe
                     self.fail(
                         "timed out waiting for host-backed write completion "
-                        f"(host in={len(pipe._i_buffer)}, host out={len(pipe._o_buffer)}, "
+                        f"(host readable={pipe.readable}, "
                         f"errors={await applet.sd_card_iface.protocol_errors})")
                 self.assertTrue(saw_busy)
                 self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, write_address), write_block)
@@ -203,17 +204,43 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 rejected_address = 0
                 rejected_block = bytes([0x3c]) * BLOCK_SIZE
                 original_block = os.pread(image.fileno(), BLOCK_SIZE, rejected_address)
+                writes_before = await applet.sd_card_iface.write_count
                 await send_command(24, rejected_address)
                 assert_r1(await receive_response(48), 24)
                 await bfm.send_data_block_4bit(rejected_block, valid_crc=False)
                 self.assertEqual(await bfm.receive_data_response(), [0, 1, 0, 1, 1])
                 for _ in range(32):
                     await cycle()
-                self.assertNotIn(b"\0", applet.sd_card_iface._pipe._i_buffer)
+                self.assertFalse(applet.sd_card_iface._pipe.contains(b"\0"))
+                self.assertEqual(await applet.sd_card_iface.write_count, writes_before)
                 self.assertEqual(
                     os.pread(image.fileno(), BLOCK_SIZE, rejected_address), original_block)
                 await send_command(13, 0x1234_0000)
                 assert_r1(await receive_response(48), 13)
+
+                # Erase requests now originate in the data engine and cross the directional
+                # data/host handshake just like writes.
+                erase_address = BLOCK_SIZE
+                await send_command(32, erase_address)
+                assert_r1(await receive_response(48), 32)
+                await send_command(33, erase_address)
+                assert_r1(await receive_response(48), 33)
+                await send_command(38)
+                assert_r1(await receive_response(48), 38)
+                saw_busy = False
+                for _ in range(4096):
+                    _, _, data_sample = await cycle()
+                    if data_sample[0] == (1, 0):
+                        saw_busy = True
+                    if applet.sd_card_iface._pipe.contains(b"\0"):
+                        await applet.sd_card_iface.serve_once()
+                    if saw_busy and data_sample[0][0] == 0:
+                        break
+                else:
+                    self.fail("timed out waiting for host-backed erase completion")
+                self.assertEqual(
+                    os.pread(image.fileno(), BLOCK_SIZE, erase_address),
+                    bytes([0xff]) * BLOCK_SIZE)
 
                 await applet.sd_card_iface.close()
 
@@ -492,7 +519,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            self.assertEqual(transitions, ["flush", "suspend", "resume"])
+            self.assertEqual(transitions, ["suspend", "flush", "resume"])
 
         asyncio.run(scenario())
 
@@ -594,6 +621,61 @@ class COBSRecoveryTestCase(unittest.TestCase):
         simulator.add_testbench(sender)
         simulator.add_testbench(receiver)
         simulator.run()
+
+
+class ConsoleTransportTestCase(unittest.TestCase):
+    def test_telnet_negotiation_and_iac_escaping(self):
+        async def scenario():
+            received = asyncio.get_running_loop().create_future()
+
+            async def handler(reader, writer):
+                writer.write(bytes((
+                    TelnetTransport.IAC, TelnetTransport.WILL, TelnetTransport.ECHO,
+                    TelnetTransport.IAC, TelnetTransport.DO,
+                    TelnetTransport.SUPPRESS_GO_AHEAD,
+                )) + b"hello\xff\xff!")
+                await writer.drain()
+                negotiation = await reader.readexactly(6)
+                application = await reader.readexactly(4)
+                received.set_result((negotiation, application))
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            try:
+                port = server.sockets[0].getsockname()[1]
+                transport = await TelnetTransport.connect("127.0.0.1", port)
+                self.assertEqual(await transport.read_some(), b"hello\xff!")
+                await transport.send(b"A\xffB")
+                negotiation, application = await received
+                self.assertEqual(negotiation, bytes((
+                    TelnetTransport.IAC, TelnetTransport.DO, TelnetTransport.ECHO,
+                    TelnetTransport.IAC, TelnetTransport.WILL,
+                    TelnetTransport.SUPPRESS_GO_AHEAD,
+                )))
+                self.assertEqual(application, b"A\xff\xffB")
+                await transport.close()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(scenario())
+
+    def test_serial_transport_over_pseudoterminal(self):
+        async def scenario():
+            master_fd, slave_fd = os.openpty()
+            try:
+                transport = await SerialTransport.connect(os.ttyname(slave_fd), 9600)
+                await transport.send(b"host-to-target")
+                self.assertEqual(os.read(master_fd, 14), b"host-to-target")
+                os.write(master_fd, b"target-to-host")
+                self.assertEqual(await transport.read_some(), b"target-to-host")
+                await transport.close()
+            finally:
+                os.close(master_fd)
+                os.close(slave_fd)
+
+        asyncio.run(scenario())
 
 
 class FileBlockBackendTestCase(unittest.TestCase):

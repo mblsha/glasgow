@@ -1,8 +1,9 @@
-from amaranth import C, Cat, Mux, Value
+from amaranth import C, Cat, Const, Mux, Value
 from amaranth.lib import enum
 
+from ._protocol import BLOCK_SIZE
 
-BLOCK_SIZE = 512
+
 MAX_IMAGE_SIZE = 16 * 1024 * 1024
 IMAGE_SIZE_GRANULARITY = 2048
 
@@ -46,3 +47,15 @@ def crc16_byte_value(crc: Value, octet: Value) -> Value:
     for bitno in reversed(range(8)):
         crc = crc16_value(crc, octet[bitno])
     return crc
+
+
+def frame_header_bytes(schema, values):
+    """Return gateware byte values for a declarative little-endian frame schema."""
+    result = []
+    for field, byte_index in schema.byte_fields:
+        if field.constant is not None:
+            value = Const(field.constant, field.byte_width * 8)
+        else:
+            value = Value.cast(values[field.name])
+        result.append(value.word_select(byte_index, 8))
+    return result

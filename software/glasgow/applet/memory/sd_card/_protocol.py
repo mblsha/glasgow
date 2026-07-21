@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import IntEnum
 import struct
 
@@ -5,11 +6,14 @@ from glasgow.gateware import cobs
 
 
 __all__ = [
-    "FRAME_VERSION", "BackendStatus", "FrameError", "HostEvent", "HostReply",
+    "BLOCK_SIZE", "FRAME_VERSION", "REQUEST_SCHEMA", "REPLY_SCHEMA",
+    "BackendStatus", "FrameError", "FrameField", "FrameSchema", "HostEvent", "HostReply",
+    "HOST_EVENT_PAYLOAD_LENGTH", "HOST_REPLY_FOR_EVENT", "HOST_REPLY_PAYLOAD_LENGTH",
     "RequestFrame", "RequestHeader", "ReplyFrame", "ReplyHeader", "frame_crc16",
 ]
 
 
+BLOCK_SIZE = 512
 FRAME_VERSION = 1
 
 
@@ -33,8 +37,111 @@ class BackendStatus(IntEnum):
     ShortIO     = 0x04
 
 
+HOST_EVENT_PAYLOAD_LENGTH = {
+    HostEvent.Read: 4,
+    HostEvent.Write: 4 + BLOCK_SIZE,
+    HostEvent.Erase: 8,
+}
+HOST_REPLY_FOR_EVENT = {
+    HostEvent.Read: HostReply.ReadData,
+    HostEvent.Write: HostReply.WriteAck,
+    HostEvent.Erase: HostReply.EraseAck,
+}
+HOST_REPLY_PAYLOAD_LENGTH = {
+    HostReply.ReadData: BLOCK_SIZE,
+    HostReply.WriteAck: 0,
+    HostReply.EraseAck: 0,
+}
+
+
 class FrameError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class FrameField:
+    name: str
+    byte_width: int
+    enum: type[IntEnum] | None = None
+    constant: int | None = None
+
+    def __post_init__(self):
+        if self.byte_width < 1:
+            raise ValueError("frame fields must contain at least one byte")
+        if self.constant is not None and self.constant not in range(1 << (self.byte_width * 8)):
+            raise ValueError(f"constant does not fit in field {self.name}")
+
+
+class FrameSchema:
+    """Declarative little-endian frame header shared by Python and gateware."""
+
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = tuple(fields)
+        self.size = sum(field.byte_width for field in self.fields)
+        if len({field.name for field in self.fields}) != len(self.fields):
+            raise ValueError(f"duplicate field in {name} frame schema")
+
+    @property
+    def byte_fields(self):
+        for field in self.fields:
+            for byte_index in range(field.byte_width):
+                yield field, byte_index
+
+    def field_offset(self, name):
+        offset = 0
+        for field in self.fields:
+            if field.name == name:
+                return offset
+            offset += field.byte_width
+        raise KeyError(name)
+
+    def encode(self, **values):
+        result = bytearray()
+        for field in self.fields:
+            value = field.constant if field.constant is not None else values[field.name]
+            result.extend(int(value).to_bytes(field.byte_width, "little"))
+        return bytes(result)
+
+    def decode(self, value):
+        if len(value) != self.size:
+            raise FrameError(
+                f"{self.name} header is {len(value)} bytes, expected {self.size}")
+        result = {}
+        offset = 0
+        for field in self.fields:
+            decoded = int.from_bytes(value[offset:offset + field.byte_width], "little")
+            offset += field.byte_width
+            if field.constant is not None:
+                if decoded != field.constant:
+                    raise FrameError(
+                        f"unsupported {self.name} {field.name} {decoded}")
+                continue
+            if field.enum is not None:
+                try:
+                    decoded = field.enum(decoded)
+                except ValueError as error:
+                    raise FrameError(
+                        f"unknown {self.name} {field.name} {decoded:#04x}") from error
+            result[field.name] = decoded
+        return result
+
+
+REQUEST_SCHEMA = FrameSchema("request", (
+    FrameField("version", 1, constant=FRAME_VERSION),
+    FrameField("opcode", 1, enum=HostEvent),
+    FrameField("generation", 2),
+    FrameField("request_id", 2),
+    FrameField("payload_length", 2),
+))
+REPLY_SCHEMA = FrameSchema("reply", (
+    FrameField("version", 1, constant=FRAME_VERSION),
+    FrameField("opcode", 1, enum=HostReply),
+    FrameField("generation", 2),
+    FrameField("request_id", 2),
+    FrameField("status", 1, enum=BackendStatus),
+    FrameField("payload_length", 2),
+))
 
 
 def frame_crc16(value: bytes) -> int:
@@ -72,8 +179,7 @@ def _decode_packet(packet: bytes) -> bytes:
 class RequestHeader:
     """Header shared by every FPGA-to-host block request."""
 
-    _STRUCT = struct.Struct("<BBHHH")
-    size = _STRUCT.size
+    size = REQUEST_SCHEMA.size
 
     def __init__(self, opcode: HostEvent, generation: int, request_id: int,
             payload_length: int = 0):
@@ -83,19 +189,13 @@ class RequestHeader:
         self.payload_length = payload_length
 
     def encode(self) -> bytes:
-        return self._STRUCT.pack(
-            FRAME_VERSION, self.opcode, self.generation, self.request_id,
-            self.payload_length)
+        return REQUEST_SCHEMA.encode(
+            opcode=self.opcode, generation=self.generation, request_id=self.request_id,
+            payload_length=self.payload_length)
 
     @classmethod
     def decode(cls, value: bytes):
-        version, opcode, generation, request_id, payload_length = cls._STRUCT.unpack(value)
-        if version != FRAME_VERSION:
-            raise FrameError(f"unsupported request frame version {version}")
-        try:
-            return cls(HostEvent(opcode), generation, request_id, payload_length)
-        except ValueError as error:
-            raise FrameError(f"unknown request opcode {opcode:#04x}") from error
+        return cls(**REQUEST_SCHEMA.decode(value))
 
 
 class RequestFrame:
@@ -128,8 +228,7 @@ class RequestFrame:
 class ReplyHeader:
     """Header shared by every host-to-FPGA block reply."""
 
-    _STRUCT = struct.Struct("<BBHHBH")
-    size = _STRUCT.size
+    size = REPLY_SCHEMA.size
 
     def __init__(self, opcode: HostReply, generation: int, request_id: int,
             status: BackendStatus = BackendStatus.OK, payload_length: int = 0):
@@ -140,22 +239,13 @@ class ReplyHeader:
         self.payload_length = payload_length
 
     def encode(self) -> bytes:
-        return self._STRUCT.pack(
-            FRAME_VERSION, self.opcode, self.generation, self.request_id, self.status,
-            self.payload_length)
+        return REPLY_SCHEMA.encode(
+            opcode=self.opcode, generation=self.generation, request_id=self.request_id,
+            status=self.status, payload_length=self.payload_length)
 
     @classmethod
     def decode(cls, value: bytes):
-        version, opcode, generation, request_id, status, payload_length = \
-            cls._STRUCT.unpack(value)
-        if version != FRAME_VERSION:
-            raise FrameError(f"unsupported reply frame version {version}")
-        try:
-            return cls(
-                HostReply(opcode), generation, request_id, BackendStatus(status), payload_length)
-        except ValueError as error:
-            raise FrameError(
-                f"unknown reply opcode/status {opcode:#04x}/{status:#04x}") from error
+        return cls(**REPLY_SCHEMA.decode(value))
 
 
 class ReplyFrame:

@@ -22,10 +22,10 @@ from ._gateware_support import (
     BLOCK_SIZE, IMAGE_SIZE_GRANULARITY, MAX_IMAGE_SIZE,
 )
 from ._host import elaborate_host_block_engine
-from ._interfaces import SDCardEngineSignature
+from ._interfaces import CommandDataSignature, DataHostSignature
 from ._protocol import (
-    BackendStatus, FrameError, HostEvent, HostReply, ReplyFrame, ReplyHeader,
-    RequestFrame, RequestHeader,
+    HOST_EVENT_PAYLOAD_LENGTH, HOST_REPLY_FOR_EVENT, BackendStatus, FrameError,
+    HostEvent, HostReply, ReplyFrame, ReplyHeader, RequestFrame, RequestHeader,
 )
 
 
@@ -252,12 +252,15 @@ class SDCardComponent(wiring.Component):
                 buffer.oe.eq(dat_oe_latched[index]),
             ]
 
-        core = SDCardEngineSignature().create(path=("core",))
-        elaborate_command_engine(m, self, cmd_buffer, enabled_sd, core)
+        command_data = CommandDataSignature().create(path=("command_data",))
+        data_host = DataHostSignature().create(path=("data_host",))
+        elaborate_command_engine(m, self, cmd_buffer, enabled_sd, command_data)
         elaborate_host_block_engine(
-            m, self, host_to_sd, sd_to_host, block_write, block_read, core)
+            m, self, host_to_sd, sd_to_host, block_write, block_read,
+            wiring.flipped(data_host), wiring.flipped(command_data))
         elaborate_data_transfer_engine(
-            m, self, block_write, block_read, dat_i, dat_o, dat_oe, core)
+            m, self, block_write, block_read, dat_i, dat_o, dat_oe,
+            wiring.flipped(command_data), data_host)
 
         # Disabling the applet always releases the shared card bus, even if it happens halfway
         # through a transfer. The command engine clears its state on the following SD clock.
@@ -269,7 +272,8 @@ class SDCardComponent(wiring.Component):
 
 class SDCardInterface:
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
-            clk: GlasgowPin, cmd: GlasgowPin, dat: tuple[GlasgowPin, ...]):
+            clk: GlasgowPin, cmd: GlasgowPin, dat: tuple[GlasgowPin, ...],
+            worker_factory=BackendWorker):
         self._logger = logger
         self._level = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
@@ -300,6 +304,7 @@ class SDCardInterface:
 
         self._backend = None
         self._worker = None
+        self._worker_factory = worker_factory
         self._generation = 0
         self._sync_writes = True
         self._active = False
@@ -326,7 +331,7 @@ class SDCardInterface:
             raise ValueError("exactly one of image_path or backend must be provided")
         if backend is None:
             backend = FileBlockBackend(image_path, read_only=read_only)
-        worker = BackendWorker(backend)
+        worker = self._worker_factory(backend)
         try:
             size = backend.size
             csd = build_csd(size, read_only=backend.read_only)
@@ -379,7 +384,7 @@ class SDCardInterface:
 
     async def monitor_power(self, device, port, *, off_threshold: float = 1.0,
             on_threshold: float = 1.8, interval: float = 0.25, debounce_samples: int = 3):
-        async def before_suspend():
+        async def flush_after_suspend():
             try:
                 await self.flush()
             except BackendError as error:
@@ -390,7 +395,7 @@ class SDCardInterface:
                 self._logger,
                 sample_voltage=lambda: device.measure_voltage(str(port)),
                 is_active=lambda: self._active,
-                before_suspend=before_suspend,
+                after_suspend=flush_after_suspend,
                 suspend=lambda voltage: self.suspend(
                     reason=f"target rail fell to {voltage:.2f} V"),
                 resume=lambda voltage: self.resume(
@@ -469,20 +474,12 @@ class SDCardInterface:
                 "discarding stale %s request %#06x/%#06x",
                 header.opcode.name.lower(), header.generation, header.request_id)
             return
-        expected_length = {
-            HostEvent.Read: 4,
-            HostEvent.Write: 4 + BLOCK_SIZE,
-            HostEvent.Erase: 8,
-        }[header.opcode]
+        expected_length = HOST_EVENT_PAYLOAD_LENGTH[header.opcode]
         if len(payload) != expected_length:
             self._logger.warning(
                 "invalid %s request length %d (expected %d)",
                 header.opcode.name.lower(), len(payload), expected_length)
-            reply_opcode = {
-                HostEvent.Read: HostReply.ReadData,
-                HostEvent.Write: HostReply.WriteAck,
-                HostEvent.Erase: HostReply.EraseAck,
-            }[header.opcode]
+            reply_opcode = HOST_REPLY_FOR_EVENT[header.opcode]
             reply_payload = bytes([0xff]) * BLOCK_SIZE \
                 if header.opcode == HostEvent.Read else b""
             await self._reply(

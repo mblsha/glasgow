@@ -1,8 +1,8 @@
 """End-to-end validation of ``memory-sd-card`` with a Zaurus SL-C860.
 
 This is deliberately an opt-in hardware harness rather than a unit test. It starts Glasgow,
-controls the Zaurus over telnet, reloads the Linux 2.4 SD driver, compares raw sectors, mounts FAT,
-and checks a write all the way back in the host image.
+controls the Zaurus over Telnet or a serial console, reloads the Linux 2.4 SD driver, compares raw
+sectors, mounts FAT, and checks a write all the way back in the host image.
 """
 
 import argparse
@@ -11,7 +11,6 @@ from contextlib import suppress
 import hashlib
 import os
 from pathlib import Path
-import pty
 import re
 import secrets
 import shlex
@@ -21,6 +20,7 @@ import tempfile
 import time
 
 from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
+from ._console import SerialTransport, TelnetTransport
 
 
 MODULE = "/lib/modules.rom/2.4.18-rmk7-pxa3-embedix/kernel/drivers/block/sharp_mmcsd_m.o"
@@ -30,59 +30,47 @@ class E2EError(Exception):
     pass
 
 
-class TelnetShell:
-    def __init__(self, process, master_fd, *, timeout):
-        self.process = process
-        self.master_fd = master_fd
+class ConsoleShell:
+    def __init__(self, transport, *, timeout):
+        self.transport = transport
         self.timeout = timeout
 
     @classmethod
     async def connect(cls, host, port=23, *, timeout=15):
-        master_fd, slave_fd = pty.openpty()
+        transport = await TelnetTransport.connect(host, port)
+        shell = cls(transport, timeout=timeout)
         try:
-            process = await asyncio.create_subprocess_exec(
-                "telnet", host, str(port),
-                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-                start_new_session=True)
-        finally:
-            os.close(slave_fd)
-        shell = cls(process, master_fd, timeout=timeout)
-        try:
-            await shell._read_until(b"Escape character is")
-            # The Cacko telnet console does not consistently display a prompt, especially after
-            # another console disconnected. Probe command execution with a marker that does not
-            # appear contiguously in the echoed command line instead of waiting for ``$``.
-            await shell.send("bash --noprofile --norc")
-            token = secrets.token_hex(8)
-            marker = f"__GLASGOW_E2E_READY_{token}__"
-            await shell.send(
-                f"printf '%s%s\\n' '__GLASGOW_E2E_READY_' '{token}__'")
-            await shell._read_until(marker.encode())
+            await shell._establish()
         except BaseException:
             await shell.close()
             raise
         return shell
 
-    async def _read_some(self):
-        loop = asyncio.get_running_loop()
-        ready = loop.create_future()
-
-        def readable():
-            if not ready.done():
-                ready.set_result(None)
-
-        loop.add_reader(self.master_fd, readable)
+    @classmethod
+    async def connect_serial(cls, path, baud=115200, *, timeout=15):
+        transport = await SerialTransport.connect(path, baud)
+        shell = cls(transport, timeout=timeout)
         try:
-            await ready
-            try:
-                chunk = os.read(self.master_fd, 4096)
-            except OSError as error:
-                raise E2EError("telnet disconnected") from error
-            if not chunk:
-                raise E2EError("telnet disconnected")
-            return chunk
-        finally:
-            loop.remove_reader(self.master_fd)
+            await shell._establish()
+        except BaseException:
+            await shell.close()
+            raise
+        return shell
+
+    async def _establish(self):
+        # The Cacko console does not consistently display a prompt. Probe command execution with
+        # a marker that does not appear contiguously in the echoed command line.
+        await self.send("bash --noprofile --norc")
+        token = secrets.token_hex(8)
+        marker = f"__GLASGOW_E2E_READY_{token}__"
+        await self.send(f"printf '%s%s\\n' '__GLASGOW_E2E_READY_' '{token}__'")
+        await self._read_until(marker.encode())
+
+    async def _read_some(self):
+        try:
+            return await self.transport.read_some()
+        except (EOFError, OSError) as error:
+            raise E2EError(str(error)) from error
 
     async def _read_until(self, marker: bytes, *, timeout=None):
         output = bytearray()
@@ -130,39 +118,26 @@ class TelnetShell:
         return status, output_text
 
     async def send(self, command):
-        data = command.encode() + b"\n"
-        while data:
-            try:
-                length = os.write(self.master_fd, data)
-            except BlockingIOError:
-                await asyncio.sleep(0)
-            else:
-                data = data[length:]
+        await self.transport.send(command.encode() + b"\n")
 
     async def close(self):
-        if self.process.returncode is None:
-            with suppress(OSError):
-                os.write(self.master_fd, b"\x1dquit\n")
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self.process.wait(), 2)
-        if self.process.returncode is None:
-            self.process.terminate()
-            await self.process.wait()
-        with suppress(OSError):
-            os.close(self.master_fd)
+        await self.transport.close()
 
 
-async def connect_after_boot(host, port, *, timeout):
+async def connect_after_boot(host, port, *, timeout, serial_device=None, serial_baud=115200):
     deadline = time.monotonic() + timeout
     last_error = None
     while time.monotonic() < deadline:
         try:
-            return await TelnetShell.connect(host, port, timeout=10)
+            if serial_device is not None:
+                return await ConsoleShell.connect_serial(
+                    serial_device, serial_baud, timeout=10)
+            return await ConsoleShell.connect(host, port, timeout=10)
         except (OSError, asyncio.TimeoutError, E2EError) as error:
             last_error = error
             await asyncio.sleep(5)
     raise E2EError(
-        f"Zaurus did not provide a usable telnet shell within {timeout:.0f} seconds; "
+        f"Zaurus did not provide a usable console shell within {timeout:.0f} seconds; "
         f"close any other console session and retry: {last_error}")
 
 
@@ -309,14 +284,17 @@ async def async_main(args):
     driver_restored = False
     try:
         process, log_task = await start_glasgow(args)
-        shell = await connect_after_boot(args.host, args.port, timeout=30)
+        shell = await connect_after_boot(
+            args.host, args.port, timeout=30,
+            serial_device=args.serial_device, serial_baud=args.serial_baud)
         if args.reboot:
             await shell.send(root("sync; /sbin/reboot"))
             await shell.close()
             shell = None
             print(f"waiting up to {args.reboot_timeout:.0f} seconds for the Zaurus reboot")
             shell = await connect_after_boot(
-                args.host, args.port, timeout=args.reboot_timeout)
+                args.host, args.port, timeout=args.reboot_timeout,
+                serial_device=args.serial_device, serial_baud=args.serial_baud)
 
         mbr, bpb, marker = await verify(args, shell)
         await restore_driver(shell, args.mount_point)
@@ -337,6 +315,10 @@ def make_parser():
         help="prepared FAT16 image containing HOST-FILE (default: generate a deterministic image)")
     parser.add_argument("--host", default="192.168.10.2", help="Zaurus telnet address")
     parser.add_argument("--port", type=int, default=23, help="Zaurus telnet port")
+    parser.add_argument("--serial-device",
+        help="use a directly attached serial console instead of Telnet")
+    parser.add_argument("--serial-baud", type=int, default=115200,
+        help="serial console baud rate (default: 115200)")
     parser.add_argument("--host-file", default="HOST.TXT",
         help="file already present in the image")
     parser.add_argument("--host-marker", default="glasgow-host-marker",
@@ -347,7 +329,7 @@ def make_parser():
     parser.add_argument("--reboot", action="store_true",
         help="reboot after starting Glasgow to exercise automatic power-cycle recovery")
     parser.add_argument("--reboot-timeout", type=float, default=240,
-        help="seconds to wait for telnet after reboot (default: 240)")
+        help="seconds to wait for the console after reboot (default: 240)")
     parser.add_argument("--glasgow", default="glasgow", help="Glasgow executable")
     parser.add_argument("--glasgow-timeout", type=float, default=90)
     parser.add_argument("--voltage", default="B=SB")
@@ -371,7 +353,7 @@ def main():
             print(f"generated deterministic FAT16 image {args.image}")
         try:
             asyncio.run(async_main(args))
-        except (E2EError, FAT16Error, OSError, asyncio.TimeoutError) as error:
+        except (E2EError, FAT16Error, OSError, ValueError, asyncio.TimeoutError) as error:
             raise SystemExit(f"FAIL: {error}") from error
 
 

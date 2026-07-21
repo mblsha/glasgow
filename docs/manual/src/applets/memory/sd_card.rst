@@ -100,7 +100,8 @@ Zaurus-specific gotchas
   is still present; close any manual or tmux telnet session first.
 * The Zaurus removes SD power during reboot, but Glasgow itself remains powered. The applet polls
   the ``Vsense`` rail for the CLK pin's port and automatically suspends, resets, changes transport
-  generation, and resumes when power returns. Reload ``sharp_mmcsd_m`` after reconnecting; the
+  generation, flushes the image after releasing the SD pins, and resumes when power returns.
+  Reload ``sharp_mmcsd_m`` after reconnecting; the
   applet itself should remain running. ``--no-power-monitor`` restores the manual behavior.
 * A failed probe can leave the Linux 2.4 block driver with stale device state. Reloading the module
   is more reliable than repeatedly opening ``/dev/mmcda``. If ``rmmod`` reports that the module is
@@ -132,9 +133,10 @@ To test a prepared image instead::
 
     python -m glasgow.applet.memory.sd_card.e2e_zaurus card.img
 
-The harness requires the system ``telnet`` client and assumes that ``su -c`` on the Zaurus does
-not prompt for a password. It restores ``sdmgr`` and runs ``glasgow safe`` during cleanup,
-including after a failed check.
+The harness includes its own asyncio Telnet implementation and assumes that ``su -c`` on the
+Zaurus does not prompt for a password. A directly attached console can be used instead with
+``--serial-device /dev/tty... --serial-baud 115200``. It restores ``sdmgr`` and runs
+``glasgow safe`` during cleanup, including after a failed check.
 
 CLI reference
 -------------
