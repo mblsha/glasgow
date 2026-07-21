@@ -8,9 +8,14 @@ from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
 from glasgow.simulation.assembly import SimulationAssembly
 
 from . import (
-    BLOCK_SIZE, HostEvent, HostReply, SDCardApplet, SDCardInterface,
+    BLOCK_SIZE, BackendError, BackendStatus, BlockBackend, FileBlockBackend, HostEvent, HostReply,
+    ReplyHeader, RequestHeader, SDCardApplet, SDCardInterface,
     build_cid, build_csd, build_scr, crc7, crc16,
 )
+
+
+GENERATION = 0x4321
+REQUEST_ID = 0x1234
 
 
 class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
@@ -27,6 +32,10 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
         for register in (build_cid(), build_csd(16 * 1024 * 1024)):
             self.assertEqual((register >> 1) & 0x7f, crc7(register >> 8, 120))
             self.assertEqual(register & 1, 1)
+
+    def test_read_only_csd(self):
+        self.assertEqual((build_csd(16 * 1024 * 1024) >> 12) & 1, 0)
+        self.assertEqual((build_csd(16 * 1024 * 1024, read_only=True) >> 12) & 1, 1)
 
     def test_csd_capacity_through_16_mib(self):
         for size in (2048, 1 << 20, 8 << 20, 16 << 20):
@@ -303,50 +312,241 @@ class _FakePipe:
     async def flush(self):
         self.flushes += 1
 
+    async def reset(self):
+        self.request.clear()
+        self.replies.clear()
+
+
+class _MemoryBackend(BlockBackend):
+    def __init__(self, image, *, read_only=False):
+        self.image = bytearray(image)
+        self._read_only = read_only
+        self.flushes = 0
+        self.closed = False
+
+    @property
+    def size(self):
+        return len(self.image)
+
+    @property
+    def read_only(self):
+        return self._read_only
+
+    @property
+    def identity(self):
+        return 0x1234_5678
+
+    def _check(self, address):
+        if address % BLOCK_SIZE or address < 0 or address > self.size - BLOCK_SIZE:
+            raise BackendError(BackendStatus.Invalid, "invalid block")
+
+    def read_block(self, address):
+        self._check(address)
+        return bytes(self.image[address:address + BLOCK_SIZE])
+
+    def write_block(self, address, block):
+        self._check(address)
+        if self.read_only:
+            raise BackendError(BackendStatus.ReadOnly, "read-only backend")
+        self.image[address:address + BLOCK_SIZE] = block
+
+    def erase(self, start, end):
+        self._check(start)
+        self._check(end)
+        if start > end:
+            raise BackendError(BackendStatus.Invalid, "invalid erase range")
+        if self.read_only:
+            raise BackendError(BackendStatus.ReadOnly, "read-only backend")
+        self.image[start:end + BLOCK_SIZE] = bytes([0xff]) * (end - start + BLOCK_SIZE)
+
+    def flush(self):
+        self.flushes += 1
+
+    def close(self):
+        self.closed = True
+
 
 class SDCardInterfaceTestCase(unittest.TestCase):
-    def make_iface(self, fd, size, request):
+    def make_iface(self, backend, request, *, generation=GENERATION, sync_writes=True):
         iface = object.__new__(SDCardInterface)
-        iface._fd = fd
-        iface._size = size
+        iface._backend = backend
+        iface._generation = generation
+        iface._sync_writes = sync_writes
+        iface._flush_count = 0
+        iface._host_backend_errors = 0
         iface._pipe = _FakePipe(request)
         iface._logger = __import__("logging").getLogger(__name__)
         iface._level = __import__("logging").DEBUG
         return iface
 
+    def request(self, opcode, payload=b"", *, generation=GENERATION, request_id=REQUEST_ID):
+        return RequestHeader(opcode, generation, request_id).encode() + payload
+
+    def reply(self, pipe):
+        header = ReplyHeader.decode(bytes(pipe.replies[:ReplyHeader.size]))
+        payload = bytes(pipe.replies[ReplyHeader.size:])
+        return header, payload
+
     def test_host_read_event(self):
         image = bytes(index & 0xff for index in range(BLOCK_SIZE * 4))
-        with tempfile.TemporaryFile() as file:
-            file.write(image)
-            file.flush()
-            request = bytes([HostEvent.Read.value]) + struct.pack("<I", BLOCK_SIZE)
-            iface = self.make_iface(file.fileno(), len(image), request)
-            asyncio.run(iface.serve_once())
-            self.assertEqual(iface._pipe.replies[0], HostReply.ReadData.value)
-            self.assertEqual(iface._pipe.replies[1:], image[BLOCK_SIZE:BLOCK_SIZE * 2])
-            self.assertEqual(iface._pipe.flushes, 1)
+        backend = _MemoryBackend(image)
+        request = self.request(HostEvent.Read, struct.pack("<I", BLOCK_SIZE))
+        iface = self.make_iface(backend, request)
+        asyncio.run(iface.serve_once())
+        header, payload = self.reply(iface._pipe)
+        self.assertEqual(header.opcode, HostReply.ReadData)
+        self.assertEqual(header.generation, GENERATION)
+        self.assertEqual(header.request_id, REQUEST_ID)
+        self.assertEqual(header.status, BackendStatus.OK)
+        self.assertEqual(payload, image[BLOCK_SIZE:BLOCK_SIZE * 2])
+        self.assertEqual(iface._pipe.flushes, 1)
+
+    def test_host_read_error_is_reported(self):
+        backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+        request = self.request(HostEvent.Read, struct.pack("<I", 1))
+        iface = self.make_iface(backend, request)
+        asyncio.run(iface.serve_once())
+        header, payload = self.reply(iface._pipe)
+        self.assertEqual(header.opcode, HostReply.ReadData)
+        self.assertEqual(header.status, BackendStatus.Invalid)
+        self.assertEqual(payload, bytes([0xff]) * BLOCK_SIZE)
+        self.assertEqual(iface._host_backend_errors, 1)
 
     def test_host_write_event(self):
         image_size = BLOCK_SIZE * 4
         payload = bytes([0xa5]) * BLOCK_SIZE
-        with tempfile.TemporaryFile() as file:
-            file.truncate(image_size)
-            request = bytes([HostEvent.Write.value]) + struct.pack("<I", BLOCK_SIZE) + payload
-            iface = self.make_iface(file.fileno(), image_size, request)
-            asyncio.run(iface.serve_once())
-            self.assertEqual(iface._pipe.replies, bytes([HostReply.WriteAck.value, 0]))
-            self.assertEqual(os.pread(file.fileno(), BLOCK_SIZE, BLOCK_SIZE), payload)
+        backend = _MemoryBackend(bytes(image_size))
+        request = self.request(
+            HostEvent.Write, struct.pack("<I", BLOCK_SIZE) + payload)
+        iface = self.make_iface(backend, request)
+        asyncio.run(iface.serve_once())
+        header, reply_payload = self.reply(iface._pipe)
+        self.assertEqual(header.opcode, HostReply.WriteAck)
+        self.assertEqual(header.status, BackendStatus.OK)
+        self.assertEqual(reply_payload, b"")
+        self.assertEqual(backend.image[BLOCK_SIZE:BLOCK_SIZE * 2], payload)
+        self.assertEqual(backend.flushes, 1)
+
+    def test_volatile_write_skips_per_request_flush(self):
+        backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+        payload = bytes([0xa5]) * BLOCK_SIZE
+        request = self.request(
+            HostEvent.Write, struct.pack("<I", BLOCK_SIZE) + payload)
+        iface = self.make_iface(backend, request, sync_writes=False)
+        asyncio.run(iface.serve_once())
+        header, _ = self.reply(iface._pipe)
+        self.assertEqual(header.status, BackendStatus.OK)
+        self.assertEqual(backend.flushes, 0)
 
     def test_host_erase_event(self):
         image_size = BLOCK_SIZE * 4
-        with tempfile.TemporaryFile() as file:
-            file.write(bytes([0x55]) * image_size)
-            file.flush()
-            request = bytes([HostEvent.Erase.value]) + struct.pack(
-                "<II", BLOCK_SIZE, BLOCK_SIZE * 2)
-            iface = self.make_iface(file.fileno(), image_size, request)
-            asyncio.run(iface.serve_once())
-            self.assertEqual(iface._pipe.replies, bytes([HostReply.EraseAck.value, 0]))
-            self.assertEqual(
-                os.pread(file.fileno(), BLOCK_SIZE * 2, BLOCK_SIZE),
-                bytes([0xff]) * BLOCK_SIZE * 2)
+        backend = _MemoryBackend(bytes([0x55]) * image_size)
+        request = self.request(HostEvent.Erase, struct.pack(
+            "<II", BLOCK_SIZE, BLOCK_SIZE * 2))
+        iface = self.make_iface(backend, request)
+        asyncio.run(iface.serve_once())
+        header, payload = self.reply(iface._pipe)
+        self.assertEqual(header.opcode, HostReply.EraseAck)
+        self.assertEqual(header.status, BackendStatus.OK)
+        self.assertEqual(payload, b"")
+        self.assertEqual(
+            backend.image[BLOCK_SIZE:BLOCK_SIZE * 3], bytes([0xff]) * BLOCK_SIZE * 2)
+        self.assertEqual(backend.flushes, 1)
+
+    def test_stale_generation_is_discarded(self):
+        backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+        payload = bytes([0xa5]) * BLOCK_SIZE
+        request = self.request(
+            HostEvent.Write, struct.pack("<I", BLOCK_SIZE) + payload,
+            generation=GENERATION ^ 0xffff)
+        iface = self.make_iface(backend, request)
+        asyncio.run(iface.serve_once())
+        self.assertEqual(iface._pipe.replies, b"")
+        self.assertEqual(backend.image, bytes(BLOCK_SIZE * 4))
+
+    def test_read_only_backend_reports_status(self):
+        backend = _MemoryBackend(bytes(BLOCK_SIZE * 4), read_only=True)
+        payload = bytes([0xa5]) * BLOCK_SIZE
+        request = self.request(
+            HostEvent.Write, struct.pack("<I", BLOCK_SIZE) + payload)
+        iface = self.make_iface(backend, request)
+        asyncio.run(iface.serve_once())
+        header, reply_payload = self.reply(iface._pipe)
+        self.assertEqual(header.opcode, HostReply.WriteAck)
+        self.assertEqual(header.status, BackendStatus.ReadOnly)
+        self.assertEqual(reply_payload, b"")
+        self.assertEqual(iface._host_backend_errors, 1)
+
+    def test_power_monitor_suspends_and_resumes(self):
+        class Device:
+            def __init__(self):
+                self.samples = iter((3.3, 0.0, 0.0, 3.3, 3.3))
+                self.last = 3.3
+
+            async def measure_voltage(self, port):
+                self.last = next(self.samples, self.last)
+                return self.last
+
+        async def scenario():
+            iface = object.__new__(SDCardInterface)
+            iface._logger = __import__("logging").getLogger(__name__)
+            iface._active = True
+            transitions = []
+            complete = asyncio.Event()
+
+            async def flush():
+                transitions.append("flush")
+
+            async def suspend(*, reason):
+                transitions.append("suspend")
+                iface._active = False
+
+            async def resume(*, reason):
+                transitions.append("resume")
+                iface._active = True
+                complete.set()
+
+            iface.flush = flush
+            iface.suspend = suspend
+            iface.resume = resume
+            task = asyncio.create_task(iface.monitor_power(
+                Device(), "B", interval=0.001, debounce_samples=2))
+            await asyncio.wait_for(complete.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(transitions, ["flush", "suspend", "resume"])
+
+        asyncio.run(scenario())
+
+
+class FileBlockBackendTestCase(unittest.TestCase):
+    def test_file_backend_read_write_erase_and_flush(self):
+        with tempfile.NamedTemporaryFile() as image:
+            image.write(bytes([0x55]) * BLOCK_SIZE * 4)
+            image.flush()
+            backend = FileBlockBackend(image.name)
+            try:
+                self.assertEqual(backend.read_block(BLOCK_SIZE), bytes([0x55]) * BLOCK_SIZE)
+                backend.write_block(BLOCK_SIZE, bytes([0xa5]) * BLOCK_SIZE)
+                backend.erase(BLOCK_SIZE * 2, BLOCK_SIZE * 3)
+                backend.flush()
+                self.assertEqual(backend.read_block(BLOCK_SIZE), bytes([0xa5]) * BLOCK_SIZE)
+                self.assertEqual(
+                    backend.read_block(BLOCK_SIZE * 2), bytes([0xff]) * BLOCK_SIZE)
+                self.assertEqual(
+                    backend.read_block(BLOCK_SIZE * 3), bytes([0xff]) * BLOCK_SIZE)
+            finally:
+                backend.close()
+
+    def test_file_backend_read_only(self):
+        with tempfile.NamedTemporaryFile() as image:
+            image.truncate(BLOCK_SIZE * 4)
+            backend = FileBlockBackend(image.name, read_only=True)
+            try:
+                self.assertEqual(backend.read_block(0), bytes(BLOCK_SIZE))
+                with self.assertRaises(BackendError) as context:
+                    backend.write_block(0, bytes([0xa5]) * BLOCK_SIZE)
+                self.assertEqual(context.exception.status, BackendStatus.ReadOnly)
+            finally:
+                backend.close()

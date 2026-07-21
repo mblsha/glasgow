@@ -1,67 +1,37 @@
 from collections.abc import Buffer
+import asyncio
 import logging
-import os
+import secrets
 import struct
 
 from amaranth import *
-from amaranth.lib import cdc, data, enum, io, memory, stream, wiring
+from amaranth.lib import cdc, data, io, memory, stream, wiring
 from amaranth.lib.wiring import In, Out
 
 from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 from glasgow.gateware.stream import AsyncQueue
 
+from ._backend import BackendError, BlockBackend, FileBlockBackend
+from ._command import elaborate_command_engine
+from ._data import elaborate_data_transfer_engine
+from ._gateware_support import (
+    BLOCK_SIZE, IMAGE_SIZE_GRANULARITY, MAX_IMAGE_SIZE,
+)
+from ._host import elaborate_host_block_engine
+from ._protocol import BackendStatus, HostEvent, HostReply, RequestHeader, ReplyHeader
+
 
 __all__ = [
+    "BackendError", "BackendStatus", "BlockBackend", "FileBlockBackend",
+    "HostEvent", "HostReply", "RequestHeader", "ReplyHeader",
     "SDCardError", "SDCardComponent", "SDCardInterface", "SDCardApplet",
     "crc7", "crc16", "build_cid", "build_csd", "build_scr",
 ]
 
 
-BLOCK_SIZE = 512
-MAX_IMAGE_SIZE = 16 * 1024 * 1024
-IMAGE_SIZE_GRANULARITY = 2048
-
-RCA = 0x1234
-OCR = 0x80ff_8000  # ready, 2.7 V through 3.6 V
-
-
 class SDCardError(GlasgowAppletError):
     pass
-
-
-class CardState(enum.Enum, shape=4):
-    Idle  = 0
-    Ready = 1
-    Ident = 2
-    Stby  = 3
-    Tran  = 4
-    Data  = 5
-    Rcv   = 6
-    Prg   = 7
-    Dis   = 8
-
-
-class DataMode(enum.Enum, shape=4):
-    Idle        = 0
-    ReadSingle  = 1
-    ReadMulti   = 2
-    WriteSingle = 3
-    WriteMulti  = 4
-    ReadSCR     = 5
-    Erase       = 6
-
-
-class HostEvent(enum.Enum, shape=8):
-    Read  = 0x01
-    Write = 0x02
-    Erase = 0x03
-
-
-class HostReply(enum.Enum, shape=8):
-    ReadData = 0x81
-    WriteAck = 0x82
-    EraseAck = 0x83
 
 
 def _crc7_step(crc: int, bit: int) -> int:
@@ -140,7 +110,7 @@ def _capacity_fields(size: int) -> tuple[int, int]:
     raise SDCardError(f"image size {size} cannot be represented by a CSD v1 register")
 
 
-def build_csd(size: int) -> int:
+def build_csd(size: int, *, read_only: bool = False) -> int:
     """Build a CSD v1 register describing a byte-addressed SDSC image."""
     c_size, c_size_mult = _capacity_fields(size)
 
@@ -164,6 +134,7 @@ def build_csd(size: int) -> int:
     csd = _set_field(csd, 25, 22, 9)         # WRITE_BL_LEN: 512 bytes
     csd = _set_field(csd, 21, 21, 0)         # fixed-size writes only
     csd = _set_field(csd, 15, 15, 0)
+    csd = _set_field(csd, 12, 12, read_only)  # temporary write protection
     csd = _set_field(csd, 11, 10, 0)         # partitioned/DOS-style image
     return _finish_register_crc(csd)
 
@@ -179,14 +150,18 @@ def build_scr() -> int:
     return scr
 
 
-def _crc7_value(crc: Value, bit: Value) -> Value:
-    feedback = bit ^ crc[6]
-    return Cat(C(0, 1), crc[:6]) ^ Mux(feedback, C(0x09, 7), C(0, 7))
+class _SDCardCore:
+    """Namespace for signals shared by the independently maintained gateware engines."""
 
-
-def _crc16_value(crc: Value, bit: Value) -> Value:
-    feedback = bit ^ crc[15]
-    return Cat(C(0, 1), crc[:15]) ^ Mux(feedback, C(0x1021, 16), C(0, 16))
+    __slots__ = (
+        "card_state", "data_mode", "bus_width_4", "current_address",
+        "erase_start", "erase_end", "response_active",
+        "read_request", "write_request", "erase_request", "stop_requested", "request_sent",
+        "read_buffer_ready", "read_buffer_address", "read_buffer_consume", "read_reply_error",
+        "host_ack_valid", "host_ack_status", "host_ack_consume",
+        "event_pending", "event_kind", "event_count", "event_read_address",
+        "event_read_advance",
+    )
 
 
 class SDCardComponent(wiring.Component):
@@ -195,6 +170,8 @@ class SDCardComponent(wiring.Component):
     o_flush:  Out(1)
 
     enabled:        In(1)
+    generation:     In(16)
+    read_only:      In(1)
     image_size:     In(25)
     cid:            In(128)
     csd:            In(128)
@@ -207,6 +184,8 @@ class SDCardComponent(wiring.Component):
     read_count:     Out(32)
     write_count:    Out(32)
     protocol_errors: Out(16)
+    backend_errors: Out(16)
+    stale_replies:  Out(16)
 
     def __init__(self, ports):
         self._ports = ports
@@ -260,58 +239,6 @@ class SDCardComponent(wiring.Component):
         block_write = block_memory.write_port(domain="sd")
         block_read = block_memory.read_port(domain="sd")
 
-        card_state = Signal(CardState, init=CardState.Idle)
-        data_mode = Signal(DataMode, init=DataMode.Idle)
-        bus_width_4 = Signal()
-        current_address = Signal(32)
-        erase_start = Signal(32)
-        erase_end = Signal(32)
-        erase_start_valid = Signal()
-        erase_end_valid = Signal()
-        app_command = Signal()
-
-        cmd_shift = Signal(48)
-        cmd_bits = Signal(range(49))
-        cmd_crc_calc = Signal(7)
-        response_shift = Signal(136)
-        response_bits = Signal(range(137))
-        response_has_crc = Signal()
-        response_crc = Signal(7)
-        response_crc_bits = Signal(range(8))
-        response_end = Signal()
-        response_pending = Signal(2)
-        response_pending_prefix = Signal(40)
-        response_pending_data = Signal(136)
-        response_driving = (response_bits != 0) | (response_crc_bits != 0) | response_end
-        response_active = response_driving | (response_pending != 0)
-
-        cmd_word = Cat(cmd_buffer.i, cmd_shift[:47])
-        cmd_index = cmd_word[40:46]
-        cmd_argument = cmd_word[8:40]
-        cmd_crc = cmd_word[1:8]
-
-        # These counters are deliberately kept in the SD clock domain. Besides being useful
-        # diagnostics on a real host, they make it possible to distinguish a wiring or clocking
-        # problem from a malformed command frame without buffering a full logic trace.
-        with m.If(enabled_sd):
-            m.d.sd += self.clock_count.eq(self.clock_count + 1)
-            with m.If(~cmd_buffer.i):
-                m.d.sd += self.command_low_count.eq(self.command_low_count + 1)
-
-        cmd_o_next = Mux(
-            response_bits != 0, response_shift[135],
-            Mux(response_crc_bits != 0, response_crc[6], 1))
-        cmd_o = Signal(init=1)
-        cmd_oe = Signal()
-        m.d.sd_fall += [
-            cmd_o.eq(cmd_o_next),
-            cmd_oe.eq(response_driving & enabled_sd),
-        ]
-        m.d.comb += [
-            cmd_buffer.o.eq(cmd_o),
-            cmd_buffer.oe.eq(cmd_oe),
-        ]
-
         dat_i = Cat(*(buffer.i for buffer in dat_buffers))
         dat_o = Signal(4, init=0xf)
         dat_oe = Signal(4)
@@ -327,772 +254,12 @@ class SDCardComponent(wiring.Component):
                 buffer.oe.eq(dat_oe_latched[index]),
             ]
 
-        def status_value(*, extra=0, app=False):
-            return (card_state.as_value() << 9) | (C(1, 32) << 8) | C(extra, 32) | \
-                Mux(app, C(1, 32) << 5, C(0, 32))
-
-        def load_r1(command, status):
-            m.d.sd += [
-                response_pending.eq(1),
-                response_pending_prefix[:32].eq(status),
-                response_pending_prefix[32:38].eq(command),
-                response_pending_prefix[38:40].eq(0),
-            ]
-
-        def load_r2(register):
-            response = Cat(C(1, 1), register[1:128], C(0x3f, 6), C(0, 2))
-            m.d.sd += [
-                response_pending.eq(3),
-                response_pending_data.eq(response),
-            ]
-
-        def load_r3():
-            response = Cat(C(1, 1), C(0x7f, 7), C(OCR, 32), C(0x3f, 6), C(0, 2))
-            m.d.sd += [
-                response_pending.eq(2),
-                response_pending_data.eq(response),
-            ]
-
-        def load_r6(status):
-            r6_status = Cat(status[:13], status[19], status[22], status[23])
-            argument = Cat(r6_status, C(RCA, 16))
-            m.d.sd += [
-                response_pending.eq(1),
-                response_pending_prefix[:32].eq(argument),
-                response_pending_prefix[32:38].eq(3),
-                response_pending_prefix[38:40].eq(0),
-            ]
-
-        read_request = Signal()
-        write_request = Signal()
-        erase_request = Signal()
-        stop_requested = Signal()
-        request_sent = Signal()
-
-        with m.If(response_bits != 0):
-            m.d.sd += [
-                response_shift.eq(response_shift << 1),
-                response_bits.eq(response_bits - 1),
-            ]
-            with m.If(response_has_crc):
-                m.d.sd += response_crc.eq(_crc7_value(response_crc, response_shift[135]))
-                with m.If(response_bits == 1):
-                    m.d.sd += response_crc_bits.eq(7)
-        with m.Elif(response_crc_bits != 0):
-            m.d.sd += [
-                response_crc.eq(response_crc << 1),
-                response_crc_bits.eq(response_crc_bits - 1),
-            ]
-            with m.If(response_crc_bits == 1):
-                m.d.sd += response_end.eq(1)
-        with m.Elif(response_end):
-            m.d.sd += [
-                response_end.eq(0),
-                response_has_crc.eq(0),
-            ]
-        with m.Elif(response_pending != 0):
-            with m.Switch(response_pending):
-                with m.Case(1):
-                    m.d.sd += [
-                        response_shift.eq(response_pending_prefix << 96),
-                        response_bits.eq(40),
-                        response_has_crc.eq(1),
-                        response_crc.eq(0),
-                    ]
-                with m.Case(2):
-                    m.d.sd += [
-                        response_shift.eq(response_pending_data << 88),
-                        response_bits.eq(48),
-                        response_has_crc.eq(0),
-                    ]
-                with m.Case(3):
-                    m.d.sd += [
-                        response_shift.eq(response_pending_data),
-                        response_bits.eq(136),
-                        response_has_crc.eq(0),
-                    ]
-            m.d.sd += response_pending.eq(0)
-
-        with m.If(~enabled_sd):
-            m.d.sd += [
-                cmd_bits.eq(0),
-                cmd_crc_calc.eq(0),
-                response_bits.eq(0),
-                response_crc_bits.eq(0),
-                response_end.eq(0),
-                response_pending.eq(0),
-                card_state.eq(CardState.Idle),
-                data_mode.eq(DataMode.Idle),
-                app_command.eq(0),
-            ]
-        with m.Elif(~response_active):
-            with m.If(cmd_bits == 0):
-                with m.If(cmd_buffer.i == 0):
-                    m.d.sd += [
-                        cmd_shift.eq(0),
-                        cmd_bits.eq(1),
-                        cmd_crc_calc.eq(0),
-                    ]
-            with m.Else():
-                m.d.sd += [
-                    cmd_shift.eq(cmd_word),
-                    cmd_bits.eq(cmd_bits + 1),
-                ]
-                with m.If(cmd_bits < 40):
-                    m.d.sd += cmd_crc_calc.eq(_crc7_value(cmd_crc_calc, cmd_buffer.i))
-                with m.If(cmd_bits == 47):
-                    m.d.sd += [
-                        cmd_bits.eq(0),
-                        self.last_command.eq(cmd_index),
-                        self.command_count.eq(self.command_count + 1),
-                        read_request.eq(0),
-                        write_request.eq(0),
-                        erase_request.eq(0),
-                        stop_requested.eq(0),
-                    ]
-
-                    valid_frame = (cmd_word[47] == 0) & (cmd_word[46] == 1) & (cmd_word[0] == 1)
-                    with m.If(~valid_frame | (cmd_crc != cmd_crc_calc)):
-                        m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
-                    with m.Else():
-                        with m.If(cmd_index != 55):
-                            m.d.sd += app_command.eq(0)
-
-                        with m.If(app_command):
-                            with m.Switch(cmd_index):
-                                with m.Case(6):
-                                    with m.If((card_state == CardState.Tran) &
-                                              ((cmd_argument[:2] == 0) |
-                                               (cmd_argument[:2] == 2))):
-                                        load_r1(cmd_index, status_value())
-                                        m.d.sd += bus_width_4.eq(cmd_argument[:2] == 2)
-                                    with m.Else():
-                                        load_r1(cmd_index, status_value(extra=1 << 22))
-                                with m.Case(23, 42):
-                                    load_r1(cmd_index, status_value())
-                                with m.Case(41):
-                                    with m.If((card_state == CardState.Idle) |
-                                              (card_state == CardState.Ready)):
-                                        load_r3()
-                                        m.d.sd += card_state.eq(CardState.Ready)
-                                with m.Case(51):
-                                    with m.If(card_state == CardState.Tran):
-                                        load_r1(cmd_index, status_value())
-                                        m.d.sd += [
-                                            data_mode.eq(DataMode.ReadSCR),
-                                            card_state.eq(CardState.Data),
-                                        ]
-                                    with m.Else():
-                                        load_r1(cmd_index, status_value(extra=1 << 22))
-                                with m.Default():
-                                    load_r1(cmd_index, status_value(extra=1 << 22))
-                        with m.Else():
-                            with m.Switch(cmd_index):
-                                with m.Case(0):
-                                    m.d.sd += [
-                                        response_bits.eq(0),
-                                        response_crc_bits.eq(0),
-                                        response_end.eq(0),
-                                        response_pending.eq(0),
-                                        card_state.eq(CardState.Idle),
-                                        data_mode.eq(DataMode.Idle),
-                                        bus_width_4.eq(0),
-                                        erase_start_valid.eq(0),
-                                        erase_end_valid.eq(0),
-                                    ]
-                                with m.Case(2):
-                                    with m.If(card_state == CardState.Ready):
-                                        load_r2(self.cid)
-                                        m.d.sd += card_state.eq(CardState.Ident)
-                                with m.Case(3):
-                                    with m.If((card_state == CardState.Ident) |
-                                              (card_state == CardState.Stby)):
-                                        load_r6(status_value())
-                                        m.d.sd += card_state.eq(CardState.Stby)
-                                with m.Case(7):
-                                    with m.If(cmd_argument[16:32] == RCA):
-                                        load_r1(cmd_index, status_value())
-                                        m.d.sd += card_state.eq(CardState.Tran)
-                                    with m.Elif(cmd_argument[16:32] == 0):
-                                        with m.If(card_state == CardState.Tran):
-                                            load_r1(cmd_index, status_value())
-                                        m.d.sd += [
-                                            card_state.eq(CardState.Stby),
-                                            data_mode.eq(DataMode.Idle),
-                                        ]
-                                with m.Case(9):
-                                    with m.If((card_state == CardState.Stby) &
-                                              (cmd_argument[16:32] == RCA)):
-                                        load_r2(self.csd)
-                                with m.Case(10):
-                                    with m.If((card_state == CardState.Stby) &
-                                              (cmd_argument[16:32] == RCA)):
-                                        load_r2(self.cid)
-                                with m.Case(12):
-                                    with m.If((card_state == CardState.Data) |
-                                              (card_state == CardState.Rcv) |
-                                              (card_state == CardState.Prg)):
-                                        load_r1(cmd_index, status_value())
-                                        m.d.sd += [
-                                            stop_requested.eq(1),
-                                            data_mode.eq(DataMode.Idle),
-                                            card_state.eq(CardState.Tran),
-                                        ]
-                                with m.Case(13):
-                                    with m.If(cmd_argument[16:32] == RCA):
-                                        load_r1(cmd_index, status_value())
-                                with m.Case(15):
-                                    with m.If(cmd_argument[16:32] == RCA):
-                                        m.d.sd += [
-                                            card_state.eq(CardState.Dis),
-                                            data_mode.eq(DataMode.Idle),
-                                        ]
-                                with m.Case(16):
-                                    with m.If(card_state == CardState.Tran):
-                                        with m.If(cmd_argument == BLOCK_SIZE):
-                                            load_r1(cmd_index, status_value())
-                                        with m.Else():
-                                            load_r1(cmd_index, status_value(extra=1 << 29))
-                                with m.Case(17, 18, 24, 25):
-                                    status = status_value()
-                                    aligned = cmd_argument[:9] == 0
-                                    in_range = cmd_argument <= (self.image_size - BLOCK_SIZE)
-                                    with m.If(card_state != CardState.Tran):
-                                        load_r1(cmd_index, status_value(extra=1 << 22))
-                                    with m.Elif(~aligned):
-                                        load_r1(cmd_index, status_value(extra=1 << 30))
-                                    with m.Elif(~in_range):
-                                        load_r1(cmd_index, status_value(extra=1 << 31))
-                                    with m.Else():
-                                        load_r1(cmd_index, status)
-                                        m.d.sd += current_address.eq(cmd_argument)
-                                        with m.Switch(cmd_index):
-                                            with m.Case(17):
-                                                m.d.sd += [
-                                                    data_mode.eq(DataMode.ReadSingle),
-                                                    request_sent.eq(0),
-                                                ]
-                                            with m.Case(18):
-                                                m.d.sd += [
-                                                    data_mode.eq(DataMode.ReadMulti),
-                                                    request_sent.eq(0),
-                                                ]
-                                            with m.Case(24):
-                                                m.d.sd += data_mode.eq(DataMode.WriteSingle)
-                                            with m.Case(25):
-                                                m.d.sd += data_mode.eq(DataMode.WriteMulti)
-                                        with m.If(cmd_index.matches(17, 18)):
-                                            m.d.sd += card_state.eq(CardState.Data)
-                                        with m.Else():
-                                            m.d.sd += card_state.eq(CardState.Rcv)
-                                with m.Case(32):
-                                    with m.If((card_state == CardState.Tran) &
-                                              (cmd_argument[:9] == 0) &
-                                              (cmd_argument <= self.image_size - BLOCK_SIZE)):
-                                        load_r1(cmd_index, status_value())
-                                        m.d.sd += [
-                                            erase_start.eq(cmd_argument),
-                                            erase_start_valid.eq(1),
-                                        ]
-                                    with m.Else():
-                                        load_r1(cmd_index, status_value(extra=1 << 30))
-                                with m.Case(33):
-                                    with m.If((card_state == CardState.Tran) &
-                                              (cmd_argument[:9] == 0) &
-                                              (cmd_argument <= self.image_size - BLOCK_SIZE)):
-                                        load_r1(cmd_index, status_value())
-                                        m.d.sd += [
-                                            erase_end.eq(cmd_argument),
-                                            erase_end_valid.eq(1),
-                                        ]
-                                    with m.Else():
-                                        load_r1(cmd_index, status_value(extra=1 << 30))
-                                with m.Case(38):
-                                    with m.If((card_state == CardState.Tran) &
-                                              erase_start_valid & erase_end_valid &
-                                              (erase_start <= erase_end)):
-                                        load_r1(cmd_index, status_value())
-                                        m.d.sd += [
-                                            data_mode.eq(DataMode.Erase),
-                                            card_state.eq(CardState.Prg),
-                                            erase_request.eq(1),
-                                            erase_start_valid.eq(0),
-                                            erase_end_valid.eq(0),
-                                        ]
-                                    with m.Else():
-                                        load_r1(cmd_index, status_value(extra=1 << 28))
-                                with m.Case(55):
-                                    load_r1(cmd_index, status_value(app=True))
-                                    m.d.sd += app_command.eq(1)
-                                with m.Default():
-                                    load_r1(cmd_index, status_value(extra=1 << 22))
-
-        # Host reply receiver. A complete read response is staged into one 512-byte block RAM.
-        read_buffer_ready = Signal()
-        read_buffer_address = Signal(32)
-        read_buffer_consume = Signal()
-        read_in_flight = Signal()
-        read_in_flight_address = Signal(32)
-        host_ack_valid = Signal()
-        host_ack_status = Signal(8)
-        host_ack_consume = Signal()
-        reply_count = Signal(range(BLOCK_SIZE + 1))
-
-        with m.If(read_buffer_consume):
-            m.d.sd += read_buffer_ready.eq(0)
-        with m.If(host_ack_consume):
-            m.d.sd += host_ack_valid.eq(0)
-
-        m.d.comb += [
-            host_to_sd.o.ready.eq(0),
-            block_write.en.eq(0),
-            block_write.addr.eq(0),
-            block_write.data.eq(0),
-        ]
-        with m.FSM(domain="sd", name="host_reply"):
-            with m.State("Opcode"):
-                m.d.comb += host_to_sd.o.ready.eq(1)
-                with m.If(host_to_sd.o.valid):
-                    with m.Switch(host_to_sd.o.payload):
-                        with m.Case(HostReply.ReadData):
-                            m.d.sd += reply_count.eq(0)
-                            m.next = "Read-Data"
-                        with m.Case(HostReply.WriteAck, HostReply.EraseAck):
-                            m.next = "Ack"
-                        with m.Default():
-                            m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
-
-            with m.State("Read-Data"):
-                m.d.comb += [
-                    host_to_sd.o.ready.eq(1),
-                    block_write.en.eq(host_to_sd.o.valid),
-                    block_write.addr.eq(reply_count),
-                    block_write.data.eq(host_to_sd.o.payload),
-                ]
-                with m.If(host_to_sd.o.valid):
-                    with m.If(reply_count == BLOCK_SIZE - 1):
-                        m.d.sd += [
-                            read_buffer_ready.eq(1),
-                            read_buffer_address.eq(read_in_flight_address),
-                            read_in_flight.eq(0),
-                        ]
-                        m.next = "Opcode"
-                    with m.Else():
-                        m.d.sd += reply_count.eq(reply_count + 1)
-
-            with m.State("Ack"):
-                m.d.comb += host_to_sd.o.ready.eq(1)
-                with m.If(host_to_sd.o.valid):
-                    m.d.sd += [
-                        host_ack_status.eq(host_to_sd.o.payload),
-                        host_ack_valid.eq(1),
-                    ]
-                    m.next = "Opcode"
-
-        # Event transmitter. Events are framed by the `end` bit so the USB side flushes short
-        # requests immediately instead of waiting for a full endpoint packet.
-        event_address = Signal(32)
-        event_count = Signal(range(BLOCK_SIZE + 1))
-        event_read_address = Signal(range(BLOCK_SIZE))
-        event_read_advance = Signal()
-        event_kind = Signal(HostEvent, init=HostEvent.Read)
-        event_pending = Signal()
-
-        with m.If(read_request & ~event_pending & ~read_in_flight):
-            m.d.sd += [
-                event_kind.eq(HostEvent.Read),
-                event_address.eq(current_address),
-                read_in_flight_address.eq(current_address),
-                event_pending.eq(1),
-                read_request.eq(0),
-            ]
-        with m.Elif(write_request & ~event_pending):
-            m.d.sd += [
-                event_kind.eq(HostEvent.Write),
-                event_address.eq(current_address),
-                event_pending.eq(1),
-                write_request.eq(0),
-            ]
-        with m.Elif(erase_request & ~event_pending):
-            m.d.sd += [
-                event_kind.eq(HostEvent.Erase),
-                event_address.eq(erase_start),
-                event_pending.eq(1),
-                erase_request.eq(0),
-            ]
-
-        m.d.comb += [
-            sd_to_host.i.valid.eq(0),
-            sd_to_host.i.p.data.eq(0),
-            sd_to_host.i.p.end.eq(0),
-            event_read_advance.eq(0),
-        ]
-
-        with m.FSM(domain="sd", name="host_event"):
-            with m.State("Idle"):
-                with m.If(event_pending):
-                    m.d.sd += event_count.eq(0)
-                    m.next = "Opcode"
-
-            with m.State("Opcode"):
-                m.d.comb += [
-                    sd_to_host.i.valid.eq(1),
-                    sd_to_host.i.p.data.eq(event_kind),
-                ]
-                with m.If(sd_to_host.i.ready):
-                    m.next = "Address"
-
-            with m.State("Address"):
-                m.d.comb += [
-                    sd_to_host.i.valid.eq(1),
-                    sd_to_host.i.p.data.eq(event_address.word_select(event_count, 8)),
-                ]
-                with m.If(sd_to_host.i.ready):
-                    with m.If(event_count == 3):
-                        m.d.sd += event_count.eq(0)
-                        with m.Switch(event_kind):
-                            with m.Case(HostEvent.Read):
-                                m.d.comb += sd_to_host.i.p.end.eq(1)
-                                m.d.sd += [
-                                    event_pending.eq(0),
-                                    read_in_flight.eq(1),
-                                ]
-                                m.next = "Idle"
-                            with m.Case(HostEvent.Write):
-                                m.d.sd += event_read_address.eq(0)
-                                m.next = "Write-Prefetch"
-                            with m.Case(HostEvent.Erase):
-                                m.next = "Erase-End"
-                    with m.Else():
-                        m.d.sd += event_count.eq(event_count + 1)
-
-            with m.State("Write-Prefetch"):
-                m.next = "Write-Data"
-
-            with m.State("Write-Data"):
-                m.d.comb += [
-                    sd_to_host.i.valid.eq(1),
-                    sd_to_host.i.p.data.eq(block_read.data),
-                ]
-                with m.If(sd_to_host.i.ready):
-                    with m.If(event_count == BLOCK_SIZE - 1):
-                        m.d.comb += sd_to_host.i.p.end.eq(1)
-                        m.d.sd += event_pending.eq(0)
-                        m.next = "Idle"
-                    with m.Else():
-                        m.d.comb += event_read_advance.eq(1)
-                        m.d.sd += [
-                            event_count.eq(event_count + 1),
-                            event_read_address.eq(event_count + 1),
-                        ]
-
-            with m.State("Erase-End"):
-                m.d.comb += [
-                    sd_to_host.i.valid.eq(1),
-                    sd_to_host.i.p.data.eq(erase_end.word_select(event_count, 8)),
-                ]
-                with m.If(sd_to_host.i.ready):
-                    with m.If(event_count == 3):
-                        m.d.comb += sd_to_host.i.p.end.eq(1)
-                        m.d.sd += event_pending.eq(0)
-                        m.next = "Idle"
-                    with m.Else():
-                        m.d.sd += event_count.eq(event_count + 1)
-
-        # Data transfer engine. It never depends on a full image being resident on the FPGA: one
-        # block is refilled or drained for each SD data packet.
-        data_byte = Signal(range(BLOCK_SIZE))
-        data_bit = Signal(range(16))
-        high_nibble = Signal(4)
-        write_shift = Signal(8)
-        crc_lanes = Array(Signal(16, name=f"crc_lane_{index}") for index in range(4))
-        received_crc = Array(Signal(16, name=f"received_crc_{index}") for index in range(4))
-        data_response = Signal(5)
-        data_response_bits = Signal(range(6))
-        write_accepted = Signal()
-        read_advance = Signal()
-
-        # The single block RAM read port is shared by card-to-host writes and host-to-card reads;
-        # those operations are mutually exclusive by construction.
-        with m.If(event_pending & (event_kind == HostEvent.Write)):
-            m.d.comb += block_read.addr.eq(
-                Mux(event_read_advance, event_count + 1, event_read_address))
-        with m.Else():
-            m.d.comb += block_read.addr.eq(Mux(read_advance, data_byte + 1, data_byte))
-
-        m.d.comb += [
-            dat_o.eq(0xf),
-            dat_oe.eq(0),
-            read_buffer_consume.eq(0),
-            host_ack_consume.eq(0),
-            read_advance.eq(0),
-        ]
-
-        with m.FSM(domain="sd", name="data_transfer"):
-            with m.State("Idle"):
-                with m.Switch(data_mode):
-                    with m.Case(DataMode.ReadSingle, DataMode.ReadMulti):
-                        with m.If(~request_sent):
-                            m.d.sd += [
-                                read_request.eq(1),
-                                request_sent.eq(1),
-                            ]
-                        with m.If(~response_active & read_buffer_ready &
-                                  (read_buffer_address == current_address)):
-                            m.d.comb += read_buffer_consume.eq(1)
-                            m.d.sd += [
-                                data_byte.eq(0),
-                                data_bit.eq(0),
-                            ]
-                            for lane in range(4):
-                                m.d.sd += crc_lanes[lane].eq(0)
-                            m.next = "Read-Start"
-                    with m.Case(DataMode.ReadSCR):
-                        with m.If(~response_active):
-                            m.d.sd += [
-                                data_byte.eq(0),
-                                data_bit.eq(0),
-                            ]
-                            for lane in range(4):
-                                m.d.sd += crc_lanes[lane].eq(0)
-                            m.next = "Read-Start"
-                    with m.Case(DataMode.WriteSingle, DataMode.WriteMulti):
-                        with m.If(~response_active):
-                            m.next = "Write-Wait-Start"
-                    with m.Case(DataMode.Erase):
-                        with m.If(~response_active):
-                            m.next = "Busy"
-                    with m.Default():
-                        m.d.sd += request_sent.eq(0)
-
-            with m.State("Read-Start"):
-                with m.If(bus_width_4):
-                    m.d.comb += [dat_o.eq(0), dat_oe.eq(0xf)]
-                with m.Else():
-                    m.d.comb += [dat_o.eq(0xe), dat_oe.eq(0x1)]
-                m.next = "Read-Data"
-
-            with m.State("Read-Data"):
-                source_byte = Mux(
-                    data_mode == DataMode.ReadSCR,
-                    self.scr.word_select(data_byte[:3] ^ 0b111, 8),
-                    block_read.data)
-                with m.If(bus_width_4):
-                    nibble = Mux(data_bit == 0, source_byte[4:8], source_byte[0:4])
-                    m.d.comb += [dat_o.eq(nibble), dat_oe.eq(0xf)]
-                    for lane in range(4):
-                        m.d.sd += crc_lanes[lane].eq(_crc16_value(crc_lanes[lane], nibble[lane]))
-                    with m.If(data_bit == 1):
-                        m.d.sd += data_bit.eq(0)
-                        block_last = Mux(data_mode == DataMode.ReadSCR,
-                            data_byte == 7, data_byte == BLOCK_SIZE - 1)
-                        with m.If(block_last):
-                            m.d.sd += data_bit.eq(15)
-                            m.next = "Read-CRC"
-                        with m.Else():
-                            m.d.comb += read_advance.eq(1)
-                            m.d.sd += data_byte.eq(data_byte + 1)
-                    with m.Else():
-                        m.d.sd += data_bit.eq(1)
-                with m.Else():
-                    bit_value = source_byte.bit_select(data_bit[:3] ^ 0b111, 1)
-                    m.d.comb += [dat_o.eq(Cat(bit_value, C(0b111, 3))), dat_oe.eq(0x1)]
-                    m.d.sd += crc_lanes[0].eq(_crc16_value(crc_lanes[0], bit_value))
-                    with m.If(data_bit == 7):
-                        m.d.sd += data_bit.eq(0)
-                        block_last = Mux(data_mode == DataMode.ReadSCR,
-                            data_byte == 7, data_byte == BLOCK_SIZE - 1)
-                        with m.If(block_last):
-                            m.d.sd += data_bit.eq(15)
-                            m.next = "Read-CRC"
-                        with m.Else():
-                            m.d.comb += read_advance.eq(1)
-                            m.d.sd += data_byte.eq(data_byte + 1)
-                    with m.Else():
-                        m.d.sd += data_bit.eq(data_bit + 1)
-
-            with m.State("Read-CRC"):
-                with m.If(bus_width_4):
-                    crc_bits = Cat(*(crc_lanes[lane].bit_select(data_bit, 1) for lane in range(4)))
-                    m.d.comb += [dat_o.eq(crc_bits), dat_oe.eq(0xf)]
-                with m.Else():
-                    m.d.comb += [
-                        dat_o.eq(Cat(crc_lanes[0].bit_select(data_bit, 1), C(0b111, 3))),
-                        dat_oe.eq(0x1),
-                    ]
-                with m.If(data_bit == 0):
-                    m.next = "Read-End"
-                with m.Else():
-                    m.d.sd += data_bit.eq(data_bit - 1)
-
-            with m.State("Read-End"):
-                with m.If(bus_width_4):
-                    m.d.comb += [dat_o.eq(0xf), dat_oe.eq(0xf)]
-                with m.Else():
-                    m.d.comb += [dat_o.eq(0xf), dat_oe.eq(0x1)]
-                m.d.sd += self.read_count.eq(self.read_count + 1)
-                with m.If(data_mode == DataMode.ReadMulti):
-                    with m.If(current_address <= self.image_size - (2 * BLOCK_SIZE)):
-                        m.d.sd += [
-                            current_address.eq(current_address + BLOCK_SIZE),
-                            request_sent.eq(0),
-                        ]
-                    with m.Else():
-                        m.d.sd += [
-                            data_mode.eq(DataMode.Idle),
-                            card_state.eq(CardState.Tran),
-                            self.protocol_errors.eq(self.protocol_errors + 1),
-                        ]
-                with m.Else():
-                    m.d.sd += [
-                        data_mode.eq(DataMode.Idle),
-                        card_state.eq(CardState.Tran),
-                    ]
-                m.next = "Idle"
-
-            with m.State("Write-Wait-Start"):
-                start_seen = Mux(bus_width_4, dat_i == 0, dat_i[0] == 0)
-                with m.If(stop_requested |
-                          ((data_mode != DataMode.WriteSingle) &
-                           (data_mode != DataMode.WriteMulti))):
-                    m.next = "Idle"
-                with m.Elif(start_seen):
-                    m.d.sd += [
-                        data_byte.eq(0),
-                        data_bit.eq(0),
-                        write_shift.eq(0),
-                    ]
-                    for lane in range(4):
-                        m.d.sd += [
-                            crc_lanes[lane].eq(0),
-                            received_crc[lane].eq(0),
-                        ]
-                    m.next = "Write-Data"
-
-            with m.State("Write-Data"):
-                with m.If(bus_width_4):
-                    for lane in range(4):
-                        m.d.sd += crc_lanes[lane].eq(_crc16_value(crc_lanes[lane], dat_i[lane]))
-                    with m.If(data_bit == 0):
-                        m.d.sd += [
-                            high_nibble.eq(dat_i),
-                            data_bit.eq(1),
-                        ]
-                    with m.Else():
-                        m.d.comb += [
-                            block_write.en.eq(1),
-                            block_write.addr.eq(data_byte),
-                            block_write.data.eq(Cat(dat_i, high_nibble)),
-                        ]
-                        m.d.sd += data_bit.eq(0)
-                        with m.If(data_byte == BLOCK_SIZE - 1):
-                            m.d.sd += data_bit.eq(0)
-                            m.next = "Write-CRC"
-                        with m.Else():
-                            m.d.sd += data_byte.eq(data_byte + 1)
-                with m.Else():
-                    next_octet = Cat(dat_i[0], write_shift[:7])
-                    m.d.sd += [
-                        write_shift.eq(next_octet),
-                        crc_lanes[0].eq(_crc16_value(crc_lanes[0], dat_i[0])),
-                    ]
-                    with m.If(data_bit == 7):
-                        m.d.comb += [
-                            block_write.en.eq(1),
-                            block_write.addr.eq(data_byte),
-                            block_write.data.eq(next_octet),
-                        ]
-                        m.d.sd += data_bit.eq(0)
-                        with m.If(data_byte == BLOCK_SIZE - 1):
-                            m.next = "Write-CRC"
-                        with m.Else():
-                            m.d.sd += data_byte.eq(data_byte + 1)
-                    with m.Else():
-                        m.d.sd += data_bit.eq(data_bit + 1)
-
-            with m.State("Write-CRC"):
-                for lane in range(4):
-                    with m.If(bus_width_4 | (lane == 0)):
-                        m.d.sd += received_crc[lane].eq(
-                            Cat(dat_i[lane], received_crc[lane][:15]))
-                with m.If(data_bit == 15):
-                    m.next = "Write-End"
-                with m.Else():
-                    m.d.sd += data_bit.eq(data_bit + 1)
-
-            with m.State("Write-End"):
-                crc_ok = (received_crc[0] == crc_lanes[0])
-                for lane in range(1, 4):
-                    crc_ok &= ~bus_width_4 | (received_crc[lane] == crc_lanes[lane])
-                end_ok = Mux(bus_width_4, dat_i == 0xf, dat_i[0] == 1)
-                m.d.sd += [
-                    data_response.eq(Mux(crc_ok & end_ok, 0b00101, 0b01011)),
-                    data_response_bits.eq(5),
-                    write_accepted.eq(crc_ok & end_ok),
-                    data_bit.eq(0),
-                ]
-                m.next = "Write-Response-Delay"
-
-            with m.State("Write-Response-Delay"):
-                with m.If(data_bit == 1):
-                    m.next = "Write-Response"
-                with m.Else():
-                    m.d.sd += data_bit.eq(data_bit + 1)
-
-            with m.State("Write-Response"):
-                m.d.comb += [
-                    dat_o.eq(Cat(data_response[4], C(0b111, 3))),
-                    dat_oe.eq(0x1),
-                ]
-                m.d.sd += data_response.eq(data_response << 1)
-                with m.If(data_response_bits == 1):
-                    m.d.sd += data_response_bits.eq(0)
-                    with m.If(write_accepted):
-                        m.d.sd += [
-                            write_request.eq(1),
-                            card_state.eq(CardState.Prg),
-                        ]
-                        m.next = "Busy"
-                    with m.Else():
-                        m.d.sd += [
-                            data_mode.eq(DataMode.Idle),
-                            card_state.eq(CardState.Tran),
-                        ]
-                        m.next = "Idle"
-                with m.Else():
-                    m.d.sd += data_response_bits.eq(data_response_bits - 1)
-
-            with m.State("Busy"):
-                m.d.comb += [dat_o.eq(0xe), dat_oe.eq(0x1)]
-                with m.If(host_ack_valid):
-                    m.d.comb += host_ack_consume.eq(1)
-                    with m.If((host_ack_status == 0) &
-                              (data_mode == DataMode.WriteMulti)):
-                        m.d.sd += self.write_count.eq(self.write_count + 1)
-                        with m.If(current_address <= self.image_size - (2 * BLOCK_SIZE)):
-                            m.d.sd += [
-                                current_address.eq(current_address + BLOCK_SIZE),
-                                card_state.eq(CardState.Rcv),
-                            ]
-                            m.next = "Write-Wait-Start"
-                        with m.Else():
-                            m.d.sd += [
-                                data_mode.eq(DataMode.Idle),
-                                card_state.eq(CardState.Tran),
-                                self.protocol_errors.eq(self.protocol_errors + 1),
-                            ]
-                            m.next = "Idle"
-                    with m.Else():
-                        with m.If((host_ack_status == 0) &
-                                  (data_mode == DataMode.WriteSingle)):
-                            m.d.sd += self.write_count.eq(self.write_count + 1)
-                        with m.If(host_ack_status != 0):
-                            m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
-                        m.d.sd += [
-                            data_mode.eq(DataMode.Idle),
-                            card_state.eq(CardState.Tran),
-                        ]
-                        m.next = "Idle"
+        core = _SDCardCore()
+        elaborate_command_engine(m, self, cmd_buffer, enabled_sd, core)
+        elaborate_host_block_engine(
+            m, self, host_to_sd, sd_to_host, block_write, block_read, core)
+        elaborate_data_transfer_engine(
+            m, self, block_write, block_read, dat_i, dat_o, dat_oe, core)
 
         # Disabling the applet always releases the shared card bus, even if it happens halfway
         # through a transfer. The command engine clears its state on the following SD clock.
@@ -1117,6 +284,8 @@ class SDCardInterface:
             in_buffer_size=4096, out_buffer_size=4096)
 
         self._enabled = assembly.add_rw_register(component.enabled)
+        self._generation_reg = assembly.add_rw_register(component.generation)
+        self._read_only_reg = assembly.add_rw_register(component.read_only)
         self._image_size = assembly.add_rw_register(component.image_size)
         self._cid = assembly.add_rw_register(component.cid)
         self._csd = assembly.add_rw_register(component.csd)
@@ -1128,111 +297,228 @@ class SDCardInterface:
         self.read_count = assembly.add_ro_register(component.read_count)
         self.write_count = assembly.add_ro_register(component.write_count)
         self.protocol_errors = assembly.add_ro_register(component.protocol_errors)
+        self.backend_errors = assembly.add_ro_register(component.backend_errors)
+        self.stale_replies = assembly.add_ro_register(component.stale_replies)
 
-        self._fd = None
-        self._size = None
+        self._backend = None
+        self._generation = 0
+        self._sync_writes = True
+        self._active = False
+        self._flush_count = 0
+        self._host_backend_errors = 0
 
-    async def configure(self, image_path: str):
-        fd = os.open(image_path, os.O_RDWR)
+    @property
+    def backend(self) -> BlockBackend | None:
+        return self._backend
+
+    def _next_generation(self) -> int:
+        # Randomizing the initial value also protects against replies retained when the same
+        # bitstream is reused by a later applet process.
+        generation = secrets.randbits(16)
+        while generation == 0 or generation == self._generation:
+            generation = secrets.randbits(16)
+        self._generation = generation
+        return generation
+
+    async def configure(self, image_path: str | None = None, *,
+            backend: BlockBackend | None = None, read_only: bool = False,
+            sync_writes: bool = True):
+        if (image_path is None) == (backend is None):
+            raise ValueError("exactly one of image_path or backend must be provided")
+        if backend is None:
+            backend = FileBlockBackend(image_path, read_only=read_only)
         try:
-            stat = os.fstat(fd)
-            size = stat.st_size
-            csd = build_csd(size)
-            serial = (stat.st_ino ^ stat.st_size) & 0xffff_ffff
-            cid = build_cid(serial=serial)
+            size = backend.size
+            csd = build_csd(size, read_only=backend.read_only)
+            cid = build_cid(serial=backend.identity)
             scr = build_scr()
 
             await self._enabled.set(0)
+            await self._pipe.reset()
+            await self._generation_reg.set(self._next_generation())
+            await self._read_only_reg.set(backend.read_only)
             await self._image_size.set(size)
             await self._cid.set(cid)
             await self._csd.set(csd)
             await self._scr.set(scr)
             await self._enabled.set(1)
+            self._active = True
         except BaseException:
-            os.close(fd)
+            backend.close()
             raise
 
-        if self._fd is not None:
-            os.close(self._fd)
-        self._fd = fd
-        self._size = size
-        self._logger.info("serving %s as a %.2f MiB SDSC image", image_path, size / 2**20)
+        if self._backend is not None:
+            self._backend.close()
+        self._backend = backend
+        self._sync_writes = sync_writes
+        access = "read-only" if backend.read_only else "writable"
+        durability = "synchronous" if sync_writes else "write-back"
+        self._logger.info(
+            "serving %s as a %.2f MiB SDSC image (%s, %s)",
+            getattr(backend, "path", backend.__class__.__name__), size / 2**20,
+            access, durability)
+
+    async def suspend(self, *, reason: str = "requested"):
+        if not self._active:
+            return
+        self._logger.info("suspending SD card: %s", reason)
+        await self._enabled.set(0)
+        self._active = False
+        await self._generation_reg.set(self._next_generation())
+        await self._pipe.reset()
+
+    async def resume(self, *, reason: str = "requested"):
+        if self._backend is None or self._active:
+            return
+        await self._pipe.reset()
+        await self._generation_reg.set(self._next_generation())
+        await self._enabled.set(1)
+        self._active = True
+        self._logger.info("resumed SD card: %s (generation %#06x)", reason, self._generation)
+
+    async def monitor_power(self, device, port, *, off_threshold: float = 1.0,
+            on_threshold: float = 1.8, interval: float = 0.25, debounce_samples: int = 3):
+        if not 0 <= off_threshold < on_threshold:
+            raise SDCardError("power thresholds must satisfy 0 <= off < on")
+        if interval <= 0 or debounce_samples < 1:
+            raise SDCardError("power polling interval and debounce count must be positive")
+
+        below_count = above_count = 0
+        self._logger.info(
+            "monitoring port %s target power (off below %.2f V, on above %.2f V)",
+            port, off_threshold, on_threshold)
+        while True:
+            try:
+                voltage = await device.measure_voltage(str(port))
+            except Exception as error:
+                self._logger.warning("cannot sample port %s target power: %s", port, error)
+                await asyncio.sleep(interval)
+                continue
+
+            if self._active:
+                below_count = below_count + 1 if voltage < off_threshold else 0
+                above_count = 0
+                if below_count >= debounce_samples:
+                    try:
+                        await self.flush()
+                    except BackendError as error:
+                        self._record_backend_error("power-loss flush", error)
+                    await self.suspend(reason=f"target rail fell to {voltage:.2f} V")
+                    below_count = 0
+            else:
+                above_count = above_count + 1 if voltage > on_threshold else 0
+                below_count = 0
+                if above_count >= debounce_samples:
+                    await self.resume(reason=f"target rail rose to {voltage:.2f} V")
+                    above_count = 0
+            await asyncio.sleep(interval)
 
     async def close(self):
         statistics = None
-        if self._fd is not None:
+        if self._backend is not None:
             statistics = (
                 await self.clock_count, await self.command_low_count,
                 await self.command_count, await self.read_count,
                 await self.write_count, await self.protocol_errors,
+                await self.backend_errors, await self.stale_replies,
             )
         await self._enabled.set(0)
+        self._active = False
         if statistics is not None:
             self._logger.info(
                 "stopped after %d SD clocks (%d CMD-low), %d commands, %d reads, %d writes, "
-                "%d protocol errors",
-                *statistics)
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
-            self._size = None
+                "%d protocol errors, %d FPGA-reported backend errors, %d stale replies; "
+                "%d host backend errors, %d durable flushes",
+                *statistics, self._host_backend_errors, self._flush_count)
+        if self._backend is not None:
+            try:
+                self._backend.flush()
+            except BackendError as error:
+                self._record_backend_error("close flush", error)
+            self._backend.close()
+            self._backend = None
 
-    async def _reply(self, opcode: HostReply, payload=b""):
-        await self._pipe.send(bytes([opcode.value]) + bytes(payload))
+    def _record_backend_error(self, operation: str, error: BackendError):
+        self._host_backend_errors += 1
+        self._logger.error("host-backed SD %s failed (%s): %s",
+            operation, error.status.name, error)
+
+    async def flush(self):
+        if self._backend is None:
+            raise SDCardError("no image is configured")
+        self._backend.flush()
+        self._flush_count += 1
+
+    async def _reply(self, opcode: HostReply, generation: int, request_id: int,
+            status: BackendStatus = BackendStatus.OK, payload=b""):
+        header = ReplyHeader(opcode, generation, request_id, status)
+        await self._pipe.send(header.encode() + bytes(payload))
         await self._pipe.flush()
 
     async def serve_once(self):
-        if self._fd is None or self._size is None:
+        if self._backend is None:
             raise SDCardError("no image is configured")
 
-        opcode, = await self._pipe.recv(1)
-        if opcode == HostEvent.Read.value:
+        header = RequestHeader.decode(bytes(await self._pipe.recv(RequestHeader.size)))
+        if header.opcode == HostEvent.Read:
             address, = struct.unpack("<I", await self._pipe.recv(4))
+            if header.generation != self._generation:
+                self._logger.debug(
+                    "discarding stale read request %#06x/%#06x", header.generation,
+                    header.request_id)
+                return
             self._logger.log(self._level, "read block at %#x", address)
-            if address % BLOCK_SIZE or address > self._size - BLOCK_SIZE:
-                self._logger.error("read request outside image: %#x", address)
-                data = bytes([0xff]) * BLOCK_SIZE
-            else:
-                data = os.pread(self._fd, BLOCK_SIZE, address)
-                if len(data) != BLOCK_SIZE:
-                    raise SDCardError(f"short image read at {address:#x}")
-            await self._reply(HostReply.ReadData, data)
+            status = BackendStatus.OK
+            try:
+                block = self._backend.read_block(address)
+            except BackendError as error:
+                self._record_backend_error("read", error)
+                status = error.status
+                block = bytes([0xff]) * BLOCK_SIZE
+            await self._reply(
+                HostReply.ReadData, header.generation, header.request_id, status, block)
 
-        elif opcode == HostEvent.Write.value:
+        elif header.opcode == HostEvent.Write:
             address, = struct.unpack("<I", await self._pipe.recv(4))
-            data = await self._pipe.recv(BLOCK_SIZE)
+            block = bytes(await self._pipe.recv(BLOCK_SIZE))
+            if header.generation != self._generation:
+                self._logger.debug(
+                    "discarding stale write request %#06x/%#06x", header.generation,
+                    header.request_id)
+                return
             self._logger.log(self._level, "write block at %#x", address)
-            status = 0
+            status = BackendStatus.OK
             try:
-                if address % BLOCK_SIZE or address > self._size - BLOCK_SIZE:
-                    raise SDCardError(f"write request outside image: {address:#x}")
-                if os.pwrite(self._fd, data, address) != BLOCK_SIZE:
-                    raise SDCardError(f"short image write at {address:#x}")
-            except (OSError, SDCardError) as error:
-                self._logger.error("host-backed SD write failed: %s", error)
-                status = 1
-            await self._reply(HostReply.WriteAck, bytes([status]))
+                self._backend.write_block(address, block)
+                if self._sync_writes:
+                    await self.flush()
+            except BackendError as error:
+                self._record_backend_error("write", error)
+                status = error.status
+            await self._reply(
+                HostReply.WriteAck, header.generation, header.request_id, status)
 
-        elif opcode == HostEvent.Erase.value:
+        elif header.opcode == HostEvent.Erase:
             start, end = struct.unpack("<II", await self._pipe.recv(8))
+            if header.generation != self._generation:
+                self._logger.debug(
+                    "discarding stale erase request %#06x/%#06x", header.generation,
+                    header.request_id)
+                return
             self._logger.log(self._level, "erase blocks at %#x..%#x", start, end)
-            status = 0
+            status = BackendStatus.OK
             try:
-                if start % BLOCK_SIZE or end % BLOCK_SIZE or start > end:
-                    raise SDCardError(f"invalid erase range {start:#x}..{end:#x}")
-                if end > self._size - BLOCK_SIZE:
-                    raise SDCardError(f"erase request outside image: {start:#x}..{end:#x}")
-                erased = bytes([0xff]) * BLOCK_SIZE
-                for address in range(start, end + 1, BLOCK_SIZE):
-                    if os.pwrite(self._fd, erased, address) != BLOCK_SIZE:
-                        raise SDCardError(f"short image erase write at {address:#x}")
-            except (OSError, SDCardError) as error:
-                self._logger.error("host-backed SD erase failed: %s", error)
-                status = 1
-            await self._reply(HostReply.EraseAck, bytes([status]))
+                self._backend.erase(start, end)
+                if self._sync_writes:
+                    await self.flush()
+            except BackendError as error:
+                self._record_backend_error("erase", error)
+                status = error.status
+            await self._reply(
+                HostReply.EraseAck, header.generation, header.request_id, status)
 
         else:
-            raise SDCardError(f"unknown FPGA event opcode {opcode:#04x}")
+            raise SDCardError(f"unknown FPGA event opcode {header.opcode:#04x}")
 
     async def serve(self):
         try:
@@ -1250,7 +536,9 @@ class SDCardApplet(GlasgowAppletV2):
 
     The FPGA stores only one 512-byte data block and bounded transport FIFOs. Read blocks are
     fetched from the host during the card access delay, and write blocks keep DAT0 busy until the
-    host has written them to the image. Images must be 2 KiB aligned and no larger than 16 MiB.
+    host has written and synchronized them to the image. Images must be 2 KiB aligned and no
+    larger than 16 MiB. Target-power monitoring automatically resets protocol and transport state
+    when a device such as a Zaurus removes and restores its SD rail.
 
     The default pins match the SD-to-Glasgow breakout on port A. For port B, use ``--clk B2
     --cmd B5 --dat B1,B0,B7,B6``. The DAT pins are specified in DAT0,DAT1,DAT2,DAT3 order.
@@ -1272,20 +560,46 @@ class SDCardApplet(GlasgowAppletV2):
             self.assembly.use_voltage(args.voltage)
             self.sd_card_iface = SDCardInterface(self.logger, self.assembly,
                 clk=args.clk, cmd=args.cmd, dat=args.dat)
+            self._sd_port = args.clk.port
 
     @classmethod
     def add_setup_arguments(cls, parser):
         parser.add_argument("image", metavar="IMAGE",
             help="serve IMAGE as a writable SDSC card (2 KiB aligned, at most 16 MiB)")
+        parser.add_argument("--read-only", action="store_true",
+            help="advertise write protection and open IMAGE read-only")
+        parser.add_argument("--volatile-writes", action="store_true",
+            help="acknowledge writes before fsync (the image is still flushed on exit)")
+        parser.add_argument("--no-power-monitor", action="store_true",
+            help="do not reset the applet when the CLK port target rail changes")
+        parser.add_argument("--power-off-threshold", type=float, default=1.0, metavar="V",
+            help="treat the target rail as off below V (default: 1.0)")
+        parser.add_argument("--power-on-threshold", type=float, default=1.8, metavar="V",
+            help="treat the target rail as on above V (default: 1.8)")
+        parser.add_argument("--power-poll-interval", type=float, default=0.25, metavar="SECONDS",
+            help="target-power polling interval (default: 0.25)")
+        parser.add_argument("--power-debounce-samples", type=int, default=3, metavar="COUNT",
+            help="consecutive samples required for a power transition (default: 3)")
 
     async def setup(self, args):
         try:
-            await self.sd_card_iface.configure(args.image)
+            await self.sd_card_iface.configure(
+                args.image, read_only=args.read_only, sync_writes=not args.volatile_writes)
         except OSError as error:
             raise SDCardError(f"cannot open image {args.image!r}: {error.strerror}") from error
 
     async def run(self, args):
-        await self.sd_card_iface.serve()
+        if args.no_power_monitor:
+            await self.sd_card_iface.serve()
+            return
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self.sd_card_iface.serve())
+            tasks.create_task(self.sd_card_iface.monitor_power(
+                self.device, self._sd_port,
+                off_threshold=args.power_off_threshold,
+                on_threshold=args.power_on_threshold,
+                interval=args.power_poll_interval,
+                debounce_samples=args.power_debounce_samples))
 
     @classmethod
     def tests(cls):
