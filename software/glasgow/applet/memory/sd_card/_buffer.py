@@ -3,6 +3,7 @@ from amaranth.lib import memory, wiring
 from amaranth.lib.wiring import In, Out
 
 from ._gateware_support import BLOCK_SIZE
+from ._interfaces import ReadBufferState
 
 
 __all__ = ["BUFFER_BLOCKS", "BUFFER_SIZE", "BlockBuffer", "BlockBufferPortSignature"]
@@ -39,8 +40,11 @@ class BlockBuffer(wiring.Component):
         super().__init__({
             "host": In(BlockBufferPortSignature()),
             "data": In(BlockBufferPortSignature()),
+            "bank_states": In(4),
             "collision": Out(1),
             "collision_count": Out(16),
+            "ownership_violation": Out(1),
+            "fault_count": Out(16),
             "fault": Out(1),
         })
 
@@ -51,7 +55,11 @@ class BlockBuffer(wiring.Component):
         write_port = block_memory.write_port(domain="sd")
         read_port = block_memory.read_port(domain="sd")
 
-        collision_active = Signal()
+        fault_active = Signal()
+        host_write_state = self.bank_states.word_select(
+            self.host.write_address[BUFFER_BANK_BIT], 2)
+        data_read_state = self.bank_states.word_select(
+            self.data.read_address[BUFFER_BANK_BIT], 2)
         m.d.comb += self.collision.eq(
             (self.host.write_en & self.data.write_en) |
             (self.host.read_active & self.data.read_active) |
@@ -61,15 +69,21 @@ class BlockBuffer(wiring.Component):
             (self.data.write_en & self.host.read_active &
                 (self.data.write_address[BUFFER_BANK_BIT] ==
                  self.host.read_address[BUFFER_BANK_BIT])))
-        m.d.sd += collision_active.eq(self.collision)
-        with m.If(self.collision & ~collision_active):
+        m.d.comb += self.ownership_violation.eq(
+            (self.host.write_en & (host_write_state != ReadBufferState.Filling)) |
+            (self.data.read_active & (data_read_state != ReadBufferState.Active)))
+        fault_event = self.collision | self.ownership_violation
+        m.d.sd += fault_active.eq(fault_event)
+        with m.If(self.collision & ~fault_active):
             m.d.sd += self.collision_count.eq(self.collision_count + 1)
-        with m.If(self.collision):
+        with m.If(fault_event & ~fault_active):
+            m.d.sd += self.fault_count.eq(self.fault_count + 1)
+        with m.If(fault_event):
             m.d.sd += self.fault.eq(1)
 
         # Any ownership violation poisons the buffer until the SD domain is reset. Both clients
         # are denied on the collision cycle as well, so priority cannot silently corrupt a block.
-        healthy = ~self.collision & ~self.fault
+        healthy = ~fault_event & ~self.fault
         host_write_grant = healthy & self.host.write_en
         data_write_grant = healthy & self.data.write_en
         host_read_grant = healthy & self.host.read_active

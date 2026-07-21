@@ -1,6 +1,6 @@
 from collections.abc import Buffer
 import asyncio
-import enum
+from dataclasses import dataclass
 import logging
 import secrets
 
@@ -34,9 +34,10 @@ __all__ = [
     "FAT16Error", "FAT16Image", "FrameError", "HostEvent", "HostReply",
     "RequestFrame", "RequestHeader",
     "ReplyFrame", "ReplyHeader",
-    "CSDTransferSpeedProfile", "SDCardError", "SDCardComponent", "SDCardInterface",
-    "SDCardApplet",
+    "DEFAULT_TRANSFER_SPEED", "SDCardDiagnostics", "SDCardError", "SDCardComponent",
+    "SDCardInterface", "SDCardApplet",
     "crc7", "crc16", "build_cid", "build_csd", "build_scr", "create_fat16_image",
+    "decode_csd_transfer_speed", "encode_csd_transfer_speed", "parse_transfer_speed",
 ]
 
 
@@ -44,17 +45,91 @@ class SDCardError(GlasgowAppletError):
     pass
 
 
-class CSDTransferSpeedProfile(enum.IntEnum):
-    """CSD ``TRAN_SPEED`` values offered by the emulator."""
+DEFAULT_TRANSFER_SPEED = 25_000_000
 
-    Default = 0x32       # 2.5 * 10 Mbit/s = 25 Mbit/s
-    Conservative = 0x59  # 5.0 * 1 Mbit/s = 5 Mbit/s
+# SD Physical Layer Specification 1.01, CSD TRAN_SPEED. Multipliers are represented in tenths
+# so that every advertised rate is computed exactly without floating-point rounding.
+_TRANSFER_SPEED_UNITS = (100_000, 1_000_000, 10_000_000, 100_000_000)
+_TRANSFER_SPEED_MULTIPLIERS = (0, 10, 12, 13, 15, 20, 25, 30, 35,
+                               40, 45, 50, 55, 60, 70, 80)
 
-    @property
-    def description(self):
-        if self is self.Conservative:
-            return "conservative 5 Mbit/s"
-        return "default 25 Mbit/s"
+
+def decode_csd_transfer_speed(encoded: int) -> int:
+    """Decode a CSD ``TRAN_SPEED`` byte into bits per second."""
+    if not isinstance(encoded, int) or encoded not in range(0x80):
+        raise SDCardError(f"invalid CSD transfer-speed value {encoded!r}")
+    unit_code = encoded & 0x7
+    multiplier_code = (encoded >> 3) & 0xf
+    if unit_code >= len(_TRANSFER_SPEED_UNITS) or multiplier_code == 0:
+        raise SDCardError(f"reserved CSD transfer-speed value {encoded:#04x}")
+    return (_TRANSFER_SPEED_UNITS[unit_code] *
+            _TRANSFER_SPEED_MULTIPLIERS[multiplier_code] // 10)
+
+
+def encode_csd_transfer_speed(bits_per_second: int) -> int:
+    """Encode the greatest representable CSD transfer speed at most *bits_per_second*."""
+    if not isinstance(bits_per_second, int) or isinstance(bits_per_second, bool):
+        raise SDCardError(f"transfer speed must be an integer, not {bits_per_second!r}")
+    candidates = []
+    for unit_code, unit in enumerate(_TRANSFER_SPEED_UNITS):
+        for multiplier_code, multiplier in enumerate(_TRANSFER_SPEED_MULTIPLIERS[1:], 1):
+            candidates.append((unit * multiplier // 10,
+                               (multiplier_code << 3) | unit_code))
+    minimum = min(rate for rate, _ in candidates)
+    maximum = max(rate for rate, _ in candidates)
+    if bits_per_second < minimum or bits_per_second > maximum:
+        raise SDCardError(
+            f"transfer speed must be between {minimum} and {maximum} bit/s")
+    return max((candidate for candidate in candidates if candidate[0] <= bits_per_second))[1]
+
+
+def parse_transfer_speed(value: str) -> int:
+    """Parse a command-line bit rate such as ``25m``, ``12.5mbit/s``, or ``500k``."""
+    text = value.strip().lower().replace(" ", "")
+    suffixes = (
+        ("mbit/s", 1_000_000), ("mbps", 1_000_000), ("m", 1_000_000),
+        ("kbit/s", 1_000), ("kbps", 1_000), ("k", 1_000),
+        ("bit/s", 1), ("bps", 1),
+    )
+    multiplier = 1
+    for suffix, candidate_multiplier in suffixes:
+        if text.endswith(suffix):
+            text = text[:-len(suffix)]
+            multiplier = candidate_multiplier
+            break
+    try:
+        rate = float(text) * multiplier
+    except ValueError as error:
+        raise ValueError(f"invalid transfer speed {value!r}") from error
+    if not rate.is_integer():
+        raise ValueError(f"transfer speed {value!r} is not a whole number of bit/s")
+    rate = int(rate)
+    try:
+        encode_csd_transfer_speed(rate)
+    except SDCardError as error:
+        raise ValueError(str(error)) from error
+    return rate
+
+
+@dataclass(frozen=True)
+class SDCardDiagnostics:
+    sd_clocks: int
+    command_low_clocks: int
+    commands: int
+    reads: int
+    writes: int
+    protocol_errors: int
+    fpga_backend_errors: int
+    stale_replies: int
+    buffer_faults: int
+    prefetch_waits: int
+    prefetch_wait_cycles: int
+    max_prefetch_wait_cycles: int
+    max_host_service_latency_cycles: int
+    host_backend_errors: int
+    durable_flushes: int
+    backend_calls: int
+    max_backend_call_seconds: float
 
 
 def _crc7_step(crc: int, bit: int) -> int:
@@ -134,19 +209,16 @@ def _capacity_fields(size: int) -> tuple[int, int]:
 
 
 def build_csd(size: int, *, read_only: bool = False,
-        transfer_speed: CSDTransferSpeedProfile = CSDTransferSpeedProfile.Default) -> int:
+        transfer_speed: int = DEFAULT_TRANSFER_SPEED) -> int:
     """Build a CSD v1 register describing a byte-addressed SDSC image."""
     c_size, c_size_mult = _capacity_fields(size)
-    try:
-        transfer_speed = CSDTransferSpeedProfile(transfer_speed)
-    except ValueError as error:
-        raise SDCardError(f"unsupported CSD transfer-speed profile {transfer_speed!r}") from error
+    encoded_transfer_speed = encode_csd_transfer_speed(transfer_speed)
 
     csd = 0
     csd = _set_field(csd, 127, 126, 0)       # CSD_STRUCTURE v1
     csd = _set_field(csd, 119, 112, 0x7f)    # TAAC: 80 ms
     csd = _set_field(csd, 111, 104, 0xff)    # NSAC: 25,500 clocks
-    csd = _set_field(csd, 103, 96, transfer_speed)  # TRAN_SPEED
+    csd = _set_field(csd, 103, 96, encoded_transfer_speed)  # TRAN_SPEED
     csd = _set_field(csd, 95, 84, 0x135)     # classes 0, 2, 4, 5, 8
     csd = _set_field(csd, 83, 80, 9)         # READ_BL_LEN: 512 bytes
     csd = _set_field(csd, 79, 79, 0)         # fixed-size reads only
@@ -202,6 +274,8 @@ class SDCardComponent(wiring.Component):
     stale_replies:  Out(16)
     buffer_faults:  Out(16)
     prefetch_waits: Out(32)
+    prefetch_wait_cycles: Out(32)
+    max_prefetch_wait: Out(32)
     max_host_service_latency: Out(32)
 
     def __init__(self, ports):
@@ -312,6 +386,7 @@ class SDCardComponent(wiring.Component):
             host_engine.current_address.eq(command_engine.control.current_address),
             host_engine.erase_start.eq(command_engine.control.erase_start),
             host_engine.erase_end.eq(command_engine.control.erase_end),
+            block_buffer.bank_states.eq(data_engine.read_bank_states),
 
             self.last_command.eq(command_engine.last_command),
             self.clock_count.eq(command_engine.clock_count),
@@ -321,11 +396,13 @@ class SDCardComponent(wiring.Component):
             self.write_count.eq(data_engine.write_count),
             self.protocol_errors.eq(
                 command_engine.protocol_errors + data_engine.protocol_errors +
-                host_engine.protocol_errors + block_buffer.collision_count),
+                host_engine.protocol_errors + block_buffer.fault_count),
             self.backend_errors.eq(host_engine.backend_errors),
             self.stale_replies.eq(host_engine.stale_replies),
-            self.buffer_faults.eq(block_buffer.collision_count),
+            self.buffer_faults.eq(block_buffer.fault_count),
             self.prefetch_waits.eq(data_engine.prefetch_waits),
+            self.prefetch_wait_cycles.eq(data_engine.prefetch_wait_cycles),
+            self.max_prefetch_wait.eq(data_engine.max_prefetch_wait),
             self.max_host_service_latency.eq(host_engine.max_host_service_latency),
         ]
 
@@ -378,6 +455,8 @@ class SDCardInterface:
         self.stale_replies = assembly.add_ro_register(component.stale_replies)
         self.buffer_faults = assembly.add_ro_register(component.buffer_faults)
         self.prefetch_waits = assembly.add_ro_register(component.prefetch_waits)
+        self.prefetch_wait_cycles = assembly.add_ro_register(component.prefetch_wait_cycles)
+        self.max_prefetch_wait = assembly.add_ro_register(component.max_prefetch_wait)
         self.max_host_service_latency = assembly.add_ro_register(
             component.max_host_service_latency)
 
@@ -406,7 +485,7 @@ class SDCardInterface:
     async def configure(self, image_path: str | None = None, *,
             backend: BlockBackend | None = None, read_only: bool = False,
             sync_writes: bool = True,
-            transfer_speed: CSDTransferSpeedProfile = CSDTransferSpeedProfile.Default):
+            transfer_speed: int = DEFAULT_TRANSFER_SPEED):
         if (image_path is None) == (backend is None):
             raise ValueError("exactly one of image_path or backend must be provided")
         if backend is None:
@@ -414,7 +493,8 @@ class SDCardInterface:
         worker = self._worker_factory(backend)
         try:
             size = backend.size
-            transfer_speed = CSDTransferSpeedProfile(transfer_speed)
+            encoded_transfer_speed = encode_csd_transfer_speed(transfer_speed)
+            advertised_transfer_speed = decode_csd_transfer_speed(encoded_transfer_speed)
             csd = build_csd(
                 size, read_only=backend.read_only, transfer_speed=transfer_speed)
             cid = build_cid(serial=backend.identity)
@@ -442,9 +522,11 @@ class SDCardInterface:
         access = "read-only" if backend.read_only else "writable"
         durability = "synchronous" if sync_writes else "write-back"
         self._logger.info(
-            "serving %s as a %.2f MiB SDSC image (%s, %s, %s CSD)",
+            "serving %s as a %.2f MiB SDSC image (%s, %s, %.3g Mbit/s CSD%s)",
             getattr(backend, "path", backend.__class__.__name__), size / 2**20,
-            access, durability, transfer_speed.description)
+            access, durability, advertised_transfer_speed / 1_000_000,
+            ("" if advertised_transfer_speed == transfer_speed else
+             f", requested {transfer_speed / 1_000_000:.3g} Mbit/s"))
 
     async def suspend(self, *, reason: str = "requested"):
         if not self._active:
@@ -493,26 +575,27 @@ class SDCardInterface:
             raise SDCardError(str(error)) from error
 
     async def close(self):
-        statistics = None
+        diagnostics = None
         if self._backend is not None:
-            statistics = (
-                await self.clock_count, await self.command_low_count,
-                await self.command_count, await self.read_count,
-                await self.write_count, await self.protocol_errors,
-                await self.backend_errors, await self.stale_replies,
-                await self.buffer_faults, await self.prefetch_waits,
-                await self.max_host_service_latency,
-            )
+            diagnostics = await self.read_diagnostics()
         await self._enabled.set(0)
         self._active = False
-        if statistics is not None:
+        if diagnostics is not None:
             self._logger.info(
                 "stopped after %d SD clocks (%d CMD-low), %d commands, %d reads, %d writes, "
                 "%d protocol errors, %d FPGA-reported backend errors, %d stale replies; "
-                "%d buffer faults, %d prefetch waits, %d max host-service SD clocks; "
-                "%d host backend errors, %d durable flushes, %.3f ms max backend call",
-                *statistics, self._host_backend_errors, self._flush_count,
-                getattr(self._worker, "max_service_latency", 0.0) * 1e3)
+                "%d buffer faults, %d prefetch waits (%d total, %d max SD clocks), "
+                "%d max host-service SD clocks; %d host backend errors, %d durable flushes, "
+                "%d backend calls, %.3f ms max backend call",
+                diagnostics.sd_clocks, diagnostics.command_low_clocks,
+                diagnostics.commands, diagnostics.reads, diagnostics.writes,
+                diagnostics.protocol_errors, diagnostics.fpga_backend_errors,
+                diagnostics.stale_replies, diagnostics.buffer_faults,
+                diagnostics.prefetch_waits, diagnostics.prefetch_wait_cycles,
+                diagnostics.max_prefetch_wait_cycles,
+                diagnostics.max_host_service_latency_cycles,
+                diagnostics.host_backend_errors, diagnostics.durable_flushes,
+                diagnostics.backend_calls, diagnostics.max_backend_call_seconds * 1e3)
         if self._backend is not None:
             try:
                 await self._worker.flush()
@@ -521,6 +604,29 @@ class SDCardInterface:
             await self._worker.close()
             self._worker = None
             self._backend = None
+
+    async def read_diagnostics(self) -> SDCardDiagnostics:
+        """Return a named snapshot of FPGA and host-side pipeline diagnostics."""
+        worker = self._worker
+        return SDCardDiagnostics(
+            sd_clocks=await self.clock_count,
+            command_low_clocks=await self.command_low_count,
+            commands=await self.command_count,
+            reads=await self.read_count,
+            writes=await self.write_count,
+            protocol_errors=await self.protocol_errors,
+            fpga_backend_errors=await self.backend_errors,
+            stale_replies=await self.stale_replies,
+            buffer_faults=await self.buffer_faults,
+            prefetch_waits=await self.prefetch_waits,
+            prefetch_wait_cycles=await self.prefetch_wait_cycles,
+            max_prefetch_wait_cycles=await self.max_prefetch_wait,
+            max_host_service_latency_cycles=await self.max_host_service_latency,
+            host_backend_errors=self._host_backend_errors,
+            durable_flushes=self._flush_count,
+            backend_calls=getattr(worker, "service_count", 0),
+            max_backend_call_seconds=getattr(worker, "max_service_latency", 0.0),
+        )
 
     def _record_backend_error(self, operation: str, error: BackendError):
         self._host_backend_errors += 1
@@ -668,8 +774,9 @@ class SDCardApplet(GlasgowAppletV2):
             help="advertise write protection and open IMAGE read-only")
         parser.add_argument("--volatile-writes", action="store_true",
             help="acknowledge writes before fsync (the image is still flushed on exit)")
-        parser.add_argument("--conservative-speed", action="store_true",
-            help="advertise a conservative 5 Mbit/s CSD transfer speed for compatibility tests")
+        parser.add_argument("--transfer-speed", type=parse_transfer_speed,
+            default=DEFAULT_TRANSFER_SPEED, metavar="RATE",
+            help="advertise a CSD transfer speed such as 25m or 5m (default: 25m)")
         parser.add_argument("--no-power-monitor", action="store_true",
             help="do not reset the applet when the CLK port target rail changes")
         parser.add_argument("--power-off-threshold", type=float, default=1.0, metavar="V",
@@ -685,8 +792,7 @@ class SDCardApplet(GlasgowAppletV2):
         try:
             await self.sd_card_iface.configure(
                 args.image, read_only=args.read_only, sync_writes=not args.volatile_writes,
-                transfer_speed=(CSDTransferSpeedProfile.Conservative
-                    if args.conservative_speed else CSDTransferSpeedProfile.Default))
+                transfer_speed=args.transfer_speed)
         except OSError as error:
             raise SDCardError(f"cannot open image {args.image!r}: {error.strerror}") from error
 

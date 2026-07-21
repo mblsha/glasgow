@@ -8,6 +8,7 @@ sectors, mounts FAT, and checks a write all the way back in the host image.
 import argparse
 import asyncio
 from contextlib import suppress
+from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import time
 
+from . import DEFAULT_TRANSFER_SPEED, parse_transfer_speed
 from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 from ._console import SerialTransport, TelnetTransport
 
@@ -28,6 +30,20 @@ MODULE = "/lib/modules.rom/2.4.18-rmk7-pxa3-embedix/kernel/drivers/block/sharp_m
 
 class E2EError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class ZaurusMountState:
+    source: str
+    filesystem: str
+    options: str
+
+
+@dataclass(frozen=True)
+class ZaurusSDState:
+    module_loaded: bool
+    daemon_running: bool
+    mount: ZaurusMountState | None
 
 
 class ConsoleShell:
@@ -147,7 +163,7 @@ def root(command):
 
 
 class ZaurusSDController:
-    """Idempotently hand the Sharp SD driver between the E2E test and ``sdmgr``."""
+    """Temporarily take over Sharp SD services and restore their exact prior state."""
 
     def __init__(self, shell, mount_point, *, module=MODULE, settle_delay=2):
         self.shell = shell
@@ -156,9 +172,38 @@ class ZaurusSDController:
         self.settle_delay = settle_delay
         self._prepared = False
         self._restore_needed = False
+        self._initial_state = None
 
     async def _run_root(self, command, *, check=True):
         return await self.shell.run(root(command), check=check, timeout=30)
+
+    async def capture_state(self):
+        marker = "__GLASGOW_SD_STATE__"
+        mount_point = shlex.quote(self.mount_point)
+        command = (
+            "module=0; grep -q '^sharp_mmcsd_m ' /proc/modules && module=1; "
+            "daemon=0; ps | grep '[s]dmgr' >/dev/null 2>&1 && daemon=1; "
+            f"mount_line=$(awk -v point={mount_point} "
+            "'$2 == point { print $1 \"\\t\" $3 \"\\t\" $4; exit }' /proc/mounts); "
+            "printf '%s%s\\t%s\\t%s\\t%s\\n' "
+            "'__GLASGOW_SD_' 'STATE__' \"$module\" \"$daemon\" \"$mount_line\"")
+        _, output = await self._run_root(command)
+        for line in output.splitlines():
+            if not line.startswith(marker + "\t"):
+                continue
+            fields = line.split("\t")
+            if len(fields) not in (4, 6) or fields[1] not in ("0", "1") or \
+                    fields[2] not in ("0", "1"):
+                break
+            mount = None
+            if len(fields) == 6 and fields[3]:
+                mount = ZaurusMountState(
+                    source=fields[3], filesystem=fields[4], options=fields[5])
+            return ZaurusSDState(
+                module_loaded=fields[1] == "1",
+                daemon_running=fields[2] == "1",
+                mount=mount)
+        raise E2EError(f"could not parse Zaurus SD lifecycle state:\n{output}")
 
     async def unmount(self):
         mount_pattern = shlex.quote(f" {self.mount_point} ")
@@ -189,29 +234,66 @@ class ZaurusSDController:
             "if ! ps | grep '[s]dmgr' >/dev/null 2>&1; then "
             "rm -f /var/run/sdmgr.pid; /sbin/sdmgr; fi")
 
+    async def restore_mount(self, mount):
+        if mount is None:
+            return
+        mount_pattern = shlex.quote(f" {self.mount_point} ")
+        await self._run_root(
+            f"mkdir -p {shlex.quote(self.mount_point)}; "
+            f"if ! grep -F {mount_pattern} /proc/mounts >/dev/null 2>&1; then "
+            f"mount -t {shlex.quote(mount.filesystem)} -o {shlex.quote(mount.options)} "
+            f"{shlex.quote(mount.source)} {shlex.quote(self.mount_point)}; fi")
+
     async def prepare(self):
         if self._prepared:
             return
+        self._initial_state = await self.capture_state()
         self._restore_needed = True
-        await self.unmount()
-        await self.stop_daemon()
-        if self.settle_delay:
-            await asyncio.sleep(self.settle_delay)
-        await self.unload_driver()
-        if self.settle_delay:
-            await asyncio.sleep(self.settle_delay)
-        await self.load_driver()
-        self._prepared = True
+        try:
+            await self.unmount()
+            await self.stop_daemon()
+            if self.settle_delay:
+                await asyncio.sleep(self.settle_delay)
+            await self.unload_driver()
+            if self.settle_delay:
+                await asyncio.sleep(self.settle_delay)
+            await self.load_driver()
+            self._prepared = True
+        except BaseException:
+            await self.restore()
+            raise
 
     async def restore(self):
         if not self._restore_needed:
             return
+        state = self._initial_state
+        if state is None:
+            raise E2EError("Zaurus SD lifecycle restoration has no captured state")
         await self.unmount()
         await self.stop_daemon()
-        await self.load_driver()
-        await self.start_daemon()
+        if state.module_loaded:
+            await self.load_driver()
+        else:
+            await self.unload_driver()
+        if state.daemon_running:
+            await self.start_daemon()
+        if state.mount is None:
+            # sdmgr can mount opportunistically while starting; preserve an originally unmounted
+            # slot as well as an originally mounted one.
+            await self.unmount()
+        else:
+            await self.restore_mount(state.mount)
         self._prepared = False
         self._restore_needed = False
+        self._initial_state = None
+
+    async def __aenter__(self):
+        await self.prepare()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.restore()
+        return False
 
 
 def md5(block):
@@ -243,8 +325,8 @@ async def start_glasgow(args):
     ]
     if args.volatile_writes:
         command.append("--volatile-writes")
-    if args.conservative_speed:
-        command.append("--conservative-speed")
+    if args.transfer_speed != DEFAULT_TRANSFER_SPEED:
+        command += ["--transfer-speed", str(args.transfer_speed)]
     command.append(os.fspath(args.image))
     process = await asyncio.create_subprocess_exec(
         *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -355,9 +437,8 @@ async def async_main(args):
                 serial_device=args.serial_device, serial_baud=args.serial_baud)
 
         controller = ZaurusSDController(shell, args.mount_point)
-        await controller.prepare()
-        mbr, bpb, marker = await verify(args, shell)
-        await controller.restore()
+        async with controller:
+            mbr, bpb, marker = await verify(args, shell)
         print(f"PASS: MBR {mbr}, BPB {bpb}, write marker {marker}")
     finally:
         if shell is not None:
@@ -400,8 +481,9 @@ def make_parser():
     parser.add_argument("--cmd", default="B5")
     parser.add_argument("--dat", default="B1,B0,B7,B6")
     parser.add_argument("--volatile-writes", action="store_true")
-    parser.add_argument("--conservative-speed", action="store_true",
-        help="make Glasgow advertise the conservative 5 Mbit/s CSD profile")
+    parser.add_argument("--transfer-speed", type=parse_transfer_speed,
+        default=DEFAULT_TRANSFER_SPEED, metavar="RATE",
+        help="make Glasgow advertise a CSD transfer speed such as 25m or 5m (default: 25m)")
     return parser
 
 

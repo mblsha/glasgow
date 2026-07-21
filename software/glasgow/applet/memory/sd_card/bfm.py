@@ -14,7 +14,6 @@ class SDHostBFM:
         self.cmd = cmd
         self.dat = tuple(dat)
         self.half_period = half_period
-        self.cycle_hook = None
 
         context.set(clk.i, 0)
         context.set(cmd.i, 1)
@@ -32,8 +31,6 @@ class SDHostBFM:
         )
         self.context.set(self.clk.i, 0)
         await self.context.delay(self.half_period)
-        if self.cycle_hook is not None:
-            await self.cycle_hook()
         return sample
 
     async def idle(self, cycles):

@@ -10,10 +10,12 @@ inter-block USB stall without retaining the image in FPGA memory. Each bank foll
 ``empty`` → ``filling`` → ``ready`` → ``active`` ownership sequence, so a late prefetch cannot be
 mistaken for the current block after CMD12. Images must be no larger than 16 MiB and a multiple of
 2 KiB so their capacity can be represented exactly by a version 1 CSD register. Add
-``--read-only`` to open an image read-only
-and advertise the CSD temporary-write-protect bit. The normal CSD advertises a 25 Mbit/s maximum
-transfer rate. ``--conservative-speed`` instead advertises 5 Mbit/s for compatibility experiments
-with hosts that select an unreliable clock from the normal profile.
+``--read-only`` to open an image read-only and advertise the CSD temporary-write-protect bit. The
+normal CSD advertises a 25 Mbit/s maximum transfer rate. ``--transfer-speed RATE`` accepts values
+such as ``12.5m`` or ``5m`` for compatibility experiments with hosts that select an unreliable
+clock from the normal profile. If the requested rate is not exactly representable in the CSD,
+the applet advertises the greatest standard rate below it (for example, ``12.5m`` becomes
+12 Mbit/s) and reports both values when it starts.
 
 The applet supports 1-bit and 4-bit SD buses. Pin arguments list the data pins in
 ``DAT0,DAT1,DAT2,DAT3`` order. For the SD breakout on Glasgow port B, invoke it as follows::
@@ -32,9 +34,10 @@ delimiter lets either endpoint recover at the next frame after truncated or corr
 Frames also carry a randomized session generation and a monotonically increasing request ID;
 replies from a previous applet run or target-power cycle are discarded and counted. Backend
 failures, malformed frames, and stale replies are included in the applet's exit statistics.
-The statistics also report buffer-ownership faults, multi-block prefetch waits, and the maximum
-host request/reply service latency measured in SD clock cycles. The longest blocking backend call
-is reported separately in milliseconds.
+The named diagnostics snapshot and exit statistics report buffer-ownership faults, the number of
+multi-block prefetch waits, their total and maximum duration, and the maximum host request/reply
+service latency, all measured in SD clock cycles. Host backend errors, durable flushes, backend
+call count, and the longest blocking backend call are tracked separately.
 
 Reads, writes, erases, and synchronization run on one dedicated worker thread. Backends advertise
 their efficient contiguous-read capability: generic backends default to one block, while the file
@@ -121,9 +124,10 @@ Zaurus-specific gotchas
   busy, check for every ``sdmgr`` process rather than trusting only ``/var/run/sdmgr.pid``; an
   interrupted test can leave an older daemon that the current PID file does not name.
 * An intermittent high-speed CRC failure has been observed around CMD7 with the Sharp driver.
-  ``--conservative-speed`` changes only the advertised CSD transfer speed to 5 Mbit/s, providing a
-  controlled way to determine whether the driver's selected SD clock is the cause. It is optional;
-  the normal 25 Mbit/s profile remains the default.
+  ``--transfer-speed 5m`` changes only the advertised CSD transfer speed, providing a controlled
+  way to determine whether the driver's selected SD clock is the cause. Intermediate rates such as
+  ``--transfer-speed 12.5m`` can narrow down the threshold. This is optional; 25 Mbit/s remains the
+  default.
 * Run with ``-v`` while bringing up new wiring. Block addresses logged by the applet confirm that
   the command and host-streaming paths are active. CMD55/ACMD41 timeouts with no logged commands
   usually mean that the applet was not reset or that CLK/CMD wiring is wrong. The E2E harness uses
@@ -149,7 +153,7 @@ by default and rejects reboot timeouts below two minutes::
         --glasgow software/.venv/bin/glasgow \
         --host-marker glasgow-host-marker --reboot
 
-Add ``--conservative-speed`` to run the same check with the experimental 5 Mbit/s CSD profile.
+Add ``--transfer-speed 5m`` to run the same check with the experimental 5 Mbit/s CSD profile.
 
 To test a prepared image instead::
 
@@ -159,8 +163,11 @@ The harness includes its own asyncio Telnet implementation, exports ``USER=zauru
 NEW-ENVIRON negotiation (override it with ``--username``), and assumes that ``su -c`` does not
 prompt for a password. A directly attached console can be used instead with ``--serial-device
 /dev/tty... --serial-baud 115200``. Driver unload/load, daemon ownership, and unmounting are managed
-by one idempotent controller, so cleanup can safely be retried after a partial failure. The harness
-restores ``sdmgr`` and runs ``glasgow safe`` during cleanup, including after a failed check.
+by one idempotent async context manager, so cleanup can safely be retried after a partial failure.
+Before taking over it snapshots whether the driver and ``sdmgr`` were running and records the
+mounted device, filesystem, and mount options. Cleanup restores that exact state rather than
+always starting the daemon or mounting the card. The harness also runs ``glasgow safe`` during
+cleanup, including after a failed check.
 
 CLI reference
 -------------
@@ -175,6 +182,8 @@ API reference
 .. module:: glasgow.applet.memory.sd_card
 
 .. autoclass:: SDCardInterface
+
+.. autoclass:: SDCardDiagnostics
 
 .. autoclass:: BlockBackend
 
