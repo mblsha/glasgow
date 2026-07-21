@@ -1,7 +1,7 @@
 from amaranth.lib import enum, wiring
 from amaranth.lib.wiring import In, Out
 
-from ._gateware_support import CardState, DataMode
+from ._gateware_support import BUFFER_BANK_BITS, CardState, DataMode
 
 
 __all__ = [
@@ -34,6 +34,7 @@ class CommandDataSignature(wiring.Signature):
             "erase_end": Out(32),
             "response_active": Out(1),
             "stop_requested": Out(1),
+            "card_reset": Out(1),
 
             # Data-engine state transitions captured by the command engine.
             "state_update_valid": In(1),
@@ -52,11 +53,12 @@ class ReadHostSignature(wiring.Signature):
         super().__init__({
             "request": Out(1),
             "request_address": Out(32),
-            "request_bank": Out(1),
+            "request_bank": Out(BUFFER_BANK_BITS),
+            "request_blocks": Out(2),
             "request_accepted": In(1),
             "reply_ready": In(1),
             "reply_address": In(32),
-            "reply_bank": In(1),
+            "reply_bank": In(BUFFER_BANK_BITS),
             "reply_consume": Out(1),
             "reply_error": In(1),
         })

@@ -45,8 +45,8 @@ class SDCardAppletTestCase(
         self.assertEqual(self._parse_args(["--transfer-speed", "5m", "card.img"]).transfer_speed,
             5_000_000)
 
-    def test_csd_capacity_through_16_mib(self):
-        for size in (2048, 1 << 20, 8 << 20, 16 << 20):
+    def test_csd_capacity_through_1_gib(self):
+        for size in (2048, 1 << 20, 16 << 20, 512 << 20, 1024 << 20):
             csd = build_csd(size)
             read_block_length = 1 << ((csd >> 80) & 0xf)
             c_size = (csd >> 62) & 0xfff
@@ -58,6 +58,7 @@ class SDCardAppletTestCase(
         scr = build_scr()
         self.assertEqual((scr >> 56) & 0xf, 0)  # SD 1.0/1.01
         self.assertEqual((scr >> 48) & 0xf, 0b0101)
+        self.assertEqual((build_scr(support_4bit=False) >> 48) & 0xf, 0b0001)
 
 
 # Keep the applet's historical test module as the single suite entry point while the focused

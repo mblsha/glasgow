@@ -2,7 +2,10 @@ from amaranth import *
 from amaranth.lib import wiring
 from amaranth.lib.wiring import In, Out
 
-from ._gateware_support import CardState, DataMode, BLOCK_SIZE, RCA, crc7_value as _crc7_value
+from ._gateware_support import (
+    BLOCK_SIZE, IMAGE_SIZE_WIDTH, RCA, CardState, DataMode,
+    crc7_value as _crc7_value,
+)
 from ._interfaces import CommandDataSignature
 from ._response import ResponseEngine
 
@@ -16,7 +19,8 @@ class CommandEngine(wiring.Component):
     cmd_oe: Out(1)
     enabled: In(1)
     read_only: In(1)
-    image_size: In(25)
+    support_4bit: In(1)
+    image_size: In(IMAGE_SIZE_WIDTH)
     cid: In(128)
     csd: In(128)
 
@@ -88,6 +92,7 @@ def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, co
 
     response.elaborate(m)
     m.d.comb += control.response_active.eq(response_active)
+    m.d.sd += control.card_reset.eq(0)
 
     with m.If(control.state_update_valid):
         m.d.sd += card_state.eq(control.state_update)
@@ -137,10 +142,20 @@ def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, co
 
                     with m.If(app_command):
                         with m.Switch(cmd_index):
+                            with m.Case(13):
+                                with m.If(card_state == CardState.Tran):
+                                    load_r1(cmd_index, status_value())
+                                    m.d.sd += [
+                                        data_mode.eq(DataMode.ReadSDStatus),
+                                        card_state.eq(CardState.Data),
+                                    ]
+                                with m.Else():
+                                    load_r1(cmd_index, status_value(extra=1 << 22))
                             with m.Case(6):
                                 with m.If((card_state == CardState.Tran) &
                                           ((cmd_argument[:2] == 0) |
-                                           (cmd_argument[:2] == 2))):
+                                           ((cmd_argument[:2] == 2) &
+                                            self.support_4bit))):
                                     load_r1(cmd_index, status_value())
                                     m.d.sd += bus_width_4.eq(cmd_argument[:2] == 2)
                                 with m.Else():
@@ -169,11 +184,17 @@ def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, co
                                     m.d.sd += [
                                         *response.reset(),
                                         card_state.eq(CardState.Idle),
-                                    data_mode.eq(DataMode.Idle),
-                                    bus_width_4.eq(0),
-                                    erase_start_valid.eq(0),
-                                    erase_end_valid.eq(0),
-                                ]
+                                        data_mode.eq(DataMode.Idle),
+                                        bus_width_4.eq(0),
+                                        erase_start_valid.eq(0),
+                                        erase_end_valid.eq(0),
+                                        control.card_reset.eq(1),
+                                    ]
+                            with m.Case(1):
+                                # CMD1 is the MMC operating-condition probe. An SD card must not
+                                # respond; legacy hosts such as Sharp MAINTE use that timeout to
+                                # select the SD ACMD41 initialization path.
+                                pass
                             with m.Case(2):
                                 with m.If(card_state == CardState.Ready):
                                     load_r2(self.cid)

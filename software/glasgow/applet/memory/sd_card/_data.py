@@ -3,7 +3,9 @@ from amaranth.lib import wiring
 from amaranth.lib.wiring import In, Out
 
 from ._buffer import BlockBufferPortSignature
-from ._gateware_support import BLOCK_SIZE, CardState, DataMode
+from ._gateware_support import (
+    BLOCK_SIZE, BUFFER_BLOCKS, IMAGE_SIZE_WIDTH, CardState, DataMode,
+)
 from ._interfaces import CommandDataSignature, DataHostSignature
 from ._lanes import SDDataLaneCodec
 from ._read_buffer import ReadBufferManager
@@ -17,12 +19,13 @@ class DataEngine(wiring.Component):
     dat_o: Out(4, init=0xf)
     dat_oe: Out(4)
     scr: In(64)
-    image_size: In(25)
+    image_size: In(IMAGE_SIZE_WIDTH)
+    prime_first_read: In(1)
 
     control: In(CommandDataSignature())
     storage: Out(DataHostSignature())
     buffer: Out(BlockBufferPortSignature())
-    read_bank_states: Out(6)
+    read_bank_states: Out(BUFFER_BLOCKS * 3)
 
     read_count: Out(32)
     write_count: Out(32)
@@ -59,13 +62,18 @@ def _elaborate_data_transfer_engine(
     host_ack_status = mutation.ack_status
     host_ack_consume = mutation.ack_consume
     read_error_pending = Signal()
-    prefetch_wait_active = Signal()
-    prefetch_wait_current = Signal(32)
+    # Start only after a complete, CRC-valid CMD0. External CLK can be intermittent while the
+    # target is off or the applet is being configured, which is not enough to frame a host event.
+    boot_prime_active = Signal()
+    boot_prime_started = Signal()
     m.d.comb += [
-        read_buffers.reset.eq(stop_requested | (data_mode == DataMode.Idle)),
+        read_buffers.reset.eq(
+            stop_requested | ((data_mode == DataMode.Idle) & ~boot_prime_active)),
         read_buffers.lookup_address.eq(current_address),
         read_buffers.reserve.eq(0),
         read_buffers.reserve_address.eq(0),
+        read_buffers.reserve_blocks.eq(Mux(data_mode == DataMode.ReadMulti, 2, 1)),
+        read_buffers.discard_stale.eq(0),
         read_buffers.activate.eq(0),
         read_buffers.release.eq(0),
     ]
@@ -98,23 +106,19 @@ def _elaborate_data_transfer_engine(
         m.d.sd += erase_request.eq(0)
     with m.If(read_buffers.reply_fault):
         m.d.sd += read_error_pending.eq(1)
-
-    with m.If(prefetch_wait_active):
-        with m.If(~self.prefetch_wait_cycles.all()):
-            m.d.sd += self.prefetch_wait_cycles.eq(self.prefetch_wait_cycles + 1)
-        with m.If(~prefetch_wait_current.all()):
-            m.d.sd += prefetch_wait_current.eq(prefetch_wait_current + 1)
-
-    def finish_prefetch_wait():
-        with m.If(prefetch_wait_current > self.max_prefetch_wait):
-            m.d.sd += self.max_prefetch_wait.eq(prefetch_wait_current)
+    # Start the boot-bank fill as soon as the coherent configuration snapshot reaches the SD
+    # domain. This uses the plentiful identification clocks before the legacy host starts its
+    # first, very short CMD18 data timer. CMD0 re-arms the same fill for warm target resets.
+    with m.If(component.prime_first_read & ~boot_prime_started):
         m.d.sd += [
-            prefetch_wait_active.eq(0),
-            prefetch_wait_current.eq(0),
+            boot_prime_active.eq(1),
+            boot_prime_started.eq(1),
         ]
+    with m.Elif(control.card_reset & component.prime_first_read):
+        m.d.sd += boot_prime_active.eq(1)
+    with m.Elif(data_mode != DataMode.Idle):
+        m.d.sd += boot_prime_active.eq(0)
 
-    with m.If((stop_requested | (data_mode == DataMode.Idle)) & prefetch_wait_active):
-        finish_prefetch_wait()
     # Data transfer engine. It never depends on a full image being resident on the FPGA: reads
     # ping-pong between two blocks, and writes drain one block at a time.
     data_byte = Signal(range(BLOCK_SIZE))
@@ -127,6 +131,12 @@ def _elaborate_data_transfer_engine(
     data_response_bits = Signal(range(6))
     write_accepted = Signal()
     read_advance = Signal()
+    inter_block_gap = Signal(range(65))
+    register_read = ((data_mode == DataMode.ReadSCR) |
+                     (data_mode == DataMode.ReadSDStatus))
+    valid_read = ((data_mode == DataMode.ReadSingle) |
+                  (data_mode == DataMode.ReadMulti) |
+                  register_read)
     lanes = SDDataLaneCodec(
         bus_width_4=bus_width_4, dat_i=dat_i, bit_index=data_bit,
         crc_lanes=crc_lanes, received_crc=received_crc)
@@ -143,7 +153,7 @@ def _elaborate_data_transfer_engine(
         block_buffer.read_address.eq(Cat(
             Mux(read_advance, data_byte + 1, data_byte)[:9], read_buffers.active_bank)),
     ]
-    m.d.sd += Assert(~(block_buffer.write_en & block_buffer.read_active))
+    m.d.sd += Assert(~(block_buffer.write_en.any() & block_buffer.read_active))
 
     with m.FSM(domain="sd", name="data_transfer"):
         with m.State("Idle"):
@@ -152,71 +162,99 @@ def _elaborate_data_transfer_engine(
                     read_error_pending.eq(0),
                     self.protocol_errors.eq(self.protocol_errors + 1),
                 ]
-                with m.If(prefetch_wait_active):
-                    finish_prefetch_wait()
                 update_mode(DataMode.Idle)
                 update_state(CardState.Tran)
             with m.Else():
-                with m.Switch(data_mode):
-                    with m.Case(DataMode.ReadSingle, DataMode.ReadMulti):
-                        m.d.comb += read_buffers.reserve_address.eq(current_address)
-                        with m.If(read_buffers.reserve_ready & ~read_buffers.filling &
-                                  ~read_buffers.ready):
-                            m.d.comb += read_buffers.reserve.eq(1)
-                        with m.If(~response_active & read_buffers.ready):
-                            m.d.comb += read_buffers.activate.eq(1)
-                            m.d.sd += [
-                                data_byte.eq(0),
-                                data_bit.eq(0),
-                            ]
-                            with m.If(prefetch_wait_active):
-                                finish_prefetch_wait()
-                            for lane in range(4):
-                                m.d.sd += crc_lanes[lane].eq(0)
-                            m.next = "Read-Start"
-                    with m.Case(DataMode.ReadSCR):
-                        with m.If(~response_active):
-                            m.d.sd += [
-                                data_byte.eq(0),
-                                data_bit.eq(0),
-                            ]
-                            for lane in range(4):
-                                m.d.sd += crc_lanes[lane].eq(0)
-                            m.next = "Read-Start"
-                    with m.Case(DataMode.WriteSingle, DataMode.WriteMulti):
-                        with m.If(~response_active):
-                            m.next = "Write-Wait-Start"
-                    with m.Case(DataMode.Erase):
-                        with m.If(~response_active):
-                            m.d.sd += erase_request.eq(1)
-                            m.next = "Busy"
+                with m.If((data_mode == DataMode.Idle) & boot_prime_active):
+                    # Refill the first two sectors as soon as card initialization supplies
+                    # clocks. MAINTE starts with CMD18 at address zero and cannot tolerate a
+                    # cold USB round trip before its first data token. Ready banks survive the
+                    # ordinary idle reset and are consumed by that first transfer. CMD0 re-arms
+                    # this path for every target reboot even when Glasgow stays powered.
+                    m.d.comb += read_buffers.lookup_address.eq(0)
+                    reserve_address = read_buffers.ready_ahead * BLOCK_SIZE
+                    m.d.comb += [
+                        read_buffers.reserve_address.eq(reserve_address),
+                        read_buffers.reserve_blocks.eq(2),
+                    ]
+                    with m.If(read_buffers.reserve_ready &
+                              (read_buffers.ready_ahead < BUFFER_BLOCKS)):
+                        m.d.comb += read_buffers.reserve.eq(1)
+                    with m.If(read_buffers.ready_ahead == BUFFER_BLOCKS):
+                        m.d.sd += boot_prime_active.eq(0)
+                with m.Else():
+                    with m.Switch(data_mode):
+                        with m.Case(DataMode.ReadSingle, DataMode.ReadMulti):
+                            m.d.comb += read_buffers.discard_stale.eq(1)
+                            reserve_address = current_address + \
+                                read_buffers.ready_ahead * BLOCK_SIZE
+                            m.d.comb += read_buffers.reserve_address.eq(reserve_address)
+                            with m.If(read_buffers.reserve_ready &
+                                      (read_buffers.ready_ahead < BUFFER_BLOCKS) &
+                                      (reserve_address <= self.image_size - BLOCK_SIZE)):
+                                m.d.comb += read_buffers.reserve.eq(1)
+                            with m.If(~response_active & read_buffers.ready &
+                                      (read_buffers.ready_ahead >= 1)):
+                                m.d.comb += read_buffers.activate.eq(1)
+                                m.d.sd += [
+                                    data_byte.eq(0),
+                                    data_bit.eq(0),
+                                ]
+                                for lane in range(4):
+                                    m.d.sd += crc_lanes[lane].eq(0)
+                                m.next = "Read-Start"
+                        with m.Case(DataMode.ReadSCR, DataMode.ReadSDStatus):
+                            with m.If(~response_active):
+                                m.d.sd += [
+                                    data_byte.eq(0),
+                                    data_bit.eq(0),
+                                ]
+                                for lane in range(4):
+                                    m.d.sd += crc_lanes[lane].eq(0)
+                                m.next = "Read-Start"
+                        with m.Case(DataMode.WriteSingle, DataMode.WriteMulti):
+                            with m.If(~response_active):
+                                m.next = "Write-Wait-Start"
+                        with m.Case(DataMode.Erase):
+                            with m.If(~response_active):
+                                m.d.sd += erase_request.eq(1)
+                                m.next = "Busy"
 
         with m.State("Read-Start"):
             m.d.comb += [
                 dat_o.eq(lanes.start_symbol),
                 dat_oe.eq(lanes.output_enable),
             ]
-            # In multi-block mode the inactive bank is filled from the host while this bank is
-            # shifted onto DAT. This hides USB/backend latency from controllers with short FIFO
-            # service timeouts without retaining more than two blocks in FPGA memory.
-            m.d.comb += read_buffers.reserve_address.eq(current_address + BLOCK_SIZE)
+            # Fetch the next aligned sector pair while the active bank is being shifted out.
+            # The host engine tags the speculative second packet and drains it on a nonsequential
+            # request, so an early CMD12 cannot relabel surplus data.
+            m.d.comb += [
+                read_buffers.reserve_address.eq(current_address + BLOCK_SIZE),
+                read_buffers.reserve_blocks.eq(2),
+            ]
             with m.If((data_mode == DataMode.ReadMulti) & read_buffers.reserve_ready &
                       (current_address <= self.image_size - (2 * BLOCK_SIZE))):
                 m.d.comb += read_buffers.reserve.eq(1)
             m.next = "Read-Data"
+            with m.If(stop_requested |
+                      ~valid_read):
+                m.next = "Idle"
 
         with m.State("Read-Data"):
             source_byte = Mux(
                 data_mode == DataMode.ReadSCR,
                 self.scr.word_select(data_byte[:3] ^ 0b111, 8),
-                block_buffer.read_data)
+                Mux(data_mode == DataMode.ReadSDStatus, C(0, 8),
+                    block_buffer.read_data))
             symbol = lanes.read_symbol(source_byte)
             m.d.comb += [dat_o.eq(symbol), dat_oe.eq(lanes.output_enable)]
             lanes.advance_read_crc(m, symbol)
             with m.If(lanes.byte_done):
                 m.d.sd += data_bit.eq(0)
                 block_last = Mux(data_mode == DataMode.ReadSCR,
-                    data_byte == 7, data_byte == BLOCK_SIZE - 1)
+                    data_byte == 7,
+                    Mux(data_mode == DataMode.ReadSDStatus,
+                        data_byte == 63, data_byte == BLOCK_SIZE - 1))
                 with m.If(block_last):
                     m.d.sd += data_bit.eq(15)
                     m.next = "Read-CRC"
@@ -225,6 +263,9 @@ def _elaborate_data_transfer_engine(
                     m.d.sd += data_byte.eq(data_byte + 1)
             with m.Else():
                 m.d.sd += data_bit.eq(data_bit + 1)
+            with m.If(stop_requested |
+                      ~valid_read):
+                m.next = "Idle"
 
         with m.State("Read-CRC"):
             m.d.comb += [
@@ -235,6 +276,9 @@ def _elaborate_data_transfer_engine(
                 m.next = "Read-End"
             with m.Else():
                 m.d.sd += data_bit.eq(data_bit - 1)
+            with m.If(stop_requested |
+                      ~valid_read):
+                m.next = "Idle"
 
         with m.State("Read-End"):
             m.d.comb += [
@@ -252,20 +296,34 @@ def _elaborate_data_transfer_engine(
                     next_ready = read_buffers.ready | (
                         storage.read.reply_ready &
                         (storage.read.reply_address == next_address))
-                    with m.If(~next_ready & ~prefetch_wait_active):
-                        m.d.sd += [
-                            self.prefetch_waits.eq(self.prefetch_waits + 1),
-                            prefetch_wait_active.eq(1),
-                        ]
+                    with m.If(~next_ready):
+                        m.d.sd += self.prefetch_waits.eq(self.prefetch_waits + 1)
                     update_address(current_address + BLOCK_SIZE)
                 with m.Else():
                     m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
                     update_mode(DataMode.Idle)
                     update_state(CardState.Tran)
+                m.d.sd += inter_block_gap.eq(64)
+                m.next = "Read-Gap"
             with m.Else():
                 update_mode(DataMode.Idle)
                 update_state(CardState.Tran)
-            m.next = "Idle"
+                m.next = "Idle"
+            with m.If(stop_requested |
+                      ~valid_read):
+                m.next = "Idle"
+
+        with m.State("Read-Gap"):
+            # Leave at least one complete command frame between blocks. The legacy Sharp PXA25x
+            # stack can then issue CMD12 without racing the following data token. Longer fixed
+            # gaps starve its genuine multi-block transfers, so host compatibility is obtained by
+            # advertising a conservative transfer rate instead of extending this Nac interval.
+            with m.If(stop_requested | (data_mode != DataMode.ReadMulti)):
+                m.next = "Idle"
+            with m.Elif(inter_block_gap == 0):
+                m.next = "Idle"
+            with m.Else():
+                m.d.sd += inter_block_gap.eq(inter_block_gap - 1)
 
         with m.State("Write-Wait-Start"):
             with m.If(stop_requested |
@@ -290,9 +348,9 @@ def _elaborate_data_transfer_engine(
             lanes.advance_write_data(m, high_nibble, write_shift)
             with m.If(lanes.byte_done):
                 m.d.comb += [
-                    block_buffer.write_en.eq(1),
+                    block_buffer.write_en.eq(1 << data_byte[:3]),
                     block_buffer.write_address.eq(data_byte),
-                    block_buffer.write_data.eq(received_octet),
+                    block_buffer.write_data.eq(Cat(*([received_octet] * 8))),
                 ]
                 m.d.sd += data_bit.eq(0)
                 with m.If(data_byte == BLOCK_SIZE - 1):

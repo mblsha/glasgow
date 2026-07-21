@@ -4,8 +4,12 @@ from amaranth.lib import crc, data, enum
 from ._protocol import BLOCK_SIZE
 
 
-MAX_IMAGE_SIZE = 16 * 1024 * 1024
+MAX_IMAGE_SIZE = 1024 * 1024 * 1024
+IMAGE_SIZE_WIDTH = 31
 IMAGE_SIZE_GRANULARITY = 2048
+BUFFER_BLOCKS = 2
+BUFFER_BANK_BITS = (BUFFER_BLOCKS - 1).bit_length()
+BUFFER_STATE_WIDTH = BUFFER_BLOCKS * 3
 
 RCA = 0x1234
 OCR = 0x80ff_8000
@@ -35,6 +39,7 @@ class DataMode(enum.Enum, shape=4):
     WriteMulti  = 4
     ReadSCR     = 5
     Erase       = 6
+    ReadSDStatus = 7
 
 
 def crc7_value(crc: Value, bit: Value) -> Value:

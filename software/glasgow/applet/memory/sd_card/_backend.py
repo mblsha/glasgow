@@ -190,6 +190,8 @@ class BackendWorker:
 
 
 class FileBlockBackend(BlockBackend):
+    READ_AHEAD_BLOCKS = 8192
+
     def __init__(self, path: str, *, read_only: bool = False):
         self.path = os.fspath(path)
         flags = os.O_RDONLY if read_only else os.O_RDWR
@@ -213,8 +215,11 @@ class FileBlockBackend(BlockBackend):
 
     @property
     def preferred_read_ahead_blocks(self):
-        # One pread amortizes the worker handoff and retains a bounded 128 KiB host cache.
-        return 256
+        # One pread amortizes the worker handoff and retains a bounded 4 MiB host cache. Legacy
+        # PXA25x controllers have a very short first-data FIFO timeout, so configure() warms this
+        # window before enabling the card; subsequent sequential FPGA requests avoid a blocking
+        # backend handoff while the first few MiB (including an SD boot kernel) are streamed.
+        return self.READ_AHEAD_BLOCKS
 
     def _check_block(self, address: int):
         if address % BLOCK_SIZE or address < 0 or address > self.size - BLOCK_SIZE:

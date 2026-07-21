@@ -22,6 +22,12 @@ FPGA_DIAGNOSTICS_LAYOUT = data.StructLayout({
     "prefetch_wait_cycles": 32,
     "max_prefetch_wait_cycles": 32,
     "max_host_service_latency_cycles": 32,
+    "card_state": 4,
+    "data_mode": 4,
+    "read_bank_states": 6,
+    "host_transaction_phase": 2,
+    "host_reply_header_bytes": 4,
+    "host_reply_payload_bytes": 10,
 })
 
 

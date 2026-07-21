@@ -149,9 +149,11 @@ class TestSDCardInterface(SDCardInterface):
         self._logger = logging.getLogger(__name__)
         self._level = logging.DEBUG
         self._pipe = FakePipe(request)
+        self._read_pipe = FakePipe()
         self._enabled = ImmediateRegister(1 if backend is not None else 0)
         self._generation_reg = ImmediateRegister(generation)
         self._read_only_reg = ImmediateRegister(0)
+        self._prime_first_read_reg = ImmediateRegister(0)
         self._image_size = ImmediateRegister(0)
         self._cid = ImmediateRegister(0)
         self._csd = ImmediateRegister(0)
