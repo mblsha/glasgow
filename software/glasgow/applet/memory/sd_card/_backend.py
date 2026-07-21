@@ -38,6 +38,11 @@ class BlockBackend(metaclass=ABCMeta):
     def read_block(self, address: int) -> bytes:
         pass
 
+    def read_blocks(self, address: int, count: int) -> bytes:
+        """Read a contiguous block run, with a correct fallback for non-file backends."""
+        return b"".join(
+            self.read_block(address + index * BLOCK_SIZE) for index in range(count))
+
     @abstractmethod
     def write_block(self, address: int, block: bytes) -> None:
         pass
@@ -60,40 +65,82 @@ class BackendWorker:
 
     Only one operation may be queued in addition to the operation currently executing. This
     keeps a slow disk or network-backed implementation from accumulating unbounded work while
-    preserving the strict ordering required for write-and-flush acknowledgements.
+    preserving the strict ordering required for write-and-flush acknowledgements. A bounded
+    host-memory read-ahead window avoids an executor handoff for every sequential SD block; any
+    modifying operation invalidates that window before it reaches the backend.
     """
 
-    def __init__(self, backend: BlockBackend):
+    def __init__(self, backend: BlockBackend, *, read_ahead_blocks=256):
+        if read_ahead_blocks < 1:
+            raise ValueError("read_ahead_blocks must be positive")
         self.backend = backend
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="glasgow-sd")
         self._slots = asyncio.Semaphore(2)
+        self._ordering = asyncio.Lock()
+        self._read_ahead_blocks = read_ahead_blocks
+        self._read_cache_address = 0
+        self._read_cache = b""
         self._closing = False
         self._closed = False
 
-    async def _execute(self, function, *args, _allow_closing=False):
+    def _invalidate_read_cache(self):
+        self._read_cache = b""
+
+    async def _run(self, function, *args):
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(self._executor, partial(function, *args))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # A running thread cannot be cancelled. Keep the ordered operation active until it
+            # finishes so a following read cannot overtake a cancelled write or erase.
+            await asyncio.shield(future)
+            raise
+
+    async def _execute(self, function, *args, _allow_closing=False, _invalidate_cache=False):
         if self._closed or (self._closing and not _allow_closing):
             raise RuntimeError("backend worker is closed")
         async with self._slots:
             if self._closed or (self._closing and not _allow_closing):
                 raise RuntimeError("backend worker is closed")
-            loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(self._executor, partial(function, *args))
-            try:
-                return await asyncio.shield(future)
-            except asyncio.CancelledError:
-                # A running thread cannot be cancelled. Keep the bounded slot occupied until it
-                # finishes so repeated task cancellation cannot grow the executor's work queue.
-                await asyncio.shield(future)
-                raise
+            async with self._ordering:
+                if self._closed or (self._closing and not _allow_closing):
+                    raise RuntimeError("backend worker is closed")
+                if _invalidate_cache:
+                    self._invalidate_read_cache()
+                return await self._run(function, *args)
 
     async def read_block(self, address: int) -> bytes:
-        return await self._execute(self.backend.read_block, address)
+        if self._closed or self._closing:
+            raise RuntimeError("backend worker is closed")
+        async with self._slots:
+            if self._closed or self._closing:
+                raise RuntimeError("backend worker is closed")
+            async with self._ordering:
+                cache_offset = address - self._read_cache_address
+                if address % BLOCK_SIZE == 0 and cache_offset >= 0 and \
+                        cache_offset + BLOCK_SIZE <= len(self._read_cache):
+                    return self._read_cache[cache_offset:cache_offset + BLOCK_SIZE]
+
+                available_blocks = (self.backend.size - address) // BLOCK_SIZE
+                count = min(self._read_ahead_blocks, max(1, available_blocks))
+                blocks = await self._run(self.backend.read_blocks, address, count)
+                expected_length = count * BLOCK_SIZE
+                if len(blocks) != expected_length:
+                    raise BackendError(
+                        BackendStatus.ShortIO,
+                        f"short read-ahead at {address:#x}: "
+                        f"received {len(blocks)} bytes, expected {expected_length}")
+                self._read_cache_address = address
+                self._read_cache = blocks
+                return blocks[:BLOCK_SIZE]
 
     async def write_block(self, address: int, block: bytes) -> None:
-        await self._execute(self.backend.write_block, address, block)
+        await self._execute(
+            self.backend.write_block, address, block, _invalidate_cache=True)
 
     async def erase(self, start: int, end: int) -> None:
-        await self._execute(self.backend.erase, start, end)
+        await self._execute(self.backend.erase, start, end, _invalidate_cache=True)
 
     async def flush(self) -> None:
         await self._execute(self.backend.flush)
@@ -145,6 +192,20 @@ class FileBlockBackend(BlockBackend):
         if len(block) != BLOCK_SIZE:
             raise BackendError(BackendStatus.ShortIO, f"short image read at {address:#x}")
         return block
+
+    def read_blocks(self, address: int, count: int) -> bytes:
+        if count < 1:
+            raise BackendError(BackendStatus.Invalid, "block count must be positive")
+        self._check_block(address)
+        self._check_block(address + (count - 1) * BLOCK_SIZE)
+        length = count * BLOCK_SIZE
+        try:
+            blocks = os.pread(self._fd, length, address)
+        except OSError as error:
+            raise BackendError(BackendStatus.IOError, str(error)) from error
+        if len(blocks) != length:
+            raise BackendError(BackendStatus.ShortIO, f"short image read at {address:#x}")
+        return blocks
 
     def write_block(self, address: int, block: bytes) -> None:
         self._check_block(address)

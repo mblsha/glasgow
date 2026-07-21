@@ -36,8 +36,8 @@ class ConsoleShell:
         self.timeout = timeout
 
     @classmethod
-    async def connect(cls, host, port=23, *, timeout=15):
-        transport = await TelnetTransport.connect(host, port)
+    async def connect(cls, host, port=23, *, username="zaurus", timeout=15):
+        transport = await TelnetTransport.connect(host, port, username=username)
         shell = cls(transport, timeout=timeout)
         try:
             await shell._establish()
@@ -124,7 +124,8 @@ class ConsoleShell:
         await self.transport.close()
 
 
-async def connect_after_boot(host, port, *, timeout, serial_device=None, serial_baud=115200):
+async def connect_after_boot(host, port, *, username, timeout,
+        serial_device=None, serial_baud=115200):
     deadline = time.monotonic() + timeout
     last_error = None
     while time.monotonic() < deadline:
@@ -132,7 +133,7 @@ async def connect_after_boot(host, port, *, timeout, serial_device=None, serial_
             if serial_device is not None:
                 return await ConsoleShell.connect_serial(
                     serial_device, serial_baud, timeout=10)
-            return await ConsoleShell.connect(host, port, timeout=10)
+            return await ConsoleShell.connect(host, port, username=username, timeout=15)
         except (OSError, asyncio.TimeoutError, E2EError) as error:
             last_error = error
             await asyncio.sleep(5)
@@ -165,8 +166,11 @@ def image_sectors(path):
 
 
 async def start_glasgow(args):
-    command = [
-        args.glasgow, "-v", "run", "memory-sd-card", "-V", args.voltage,
+    command = [args.glasgow]
+    if args.verbose_glasgow:
+        command.append("-v")
+    command += [
+        "run", "memory-sd-card", "-V", args.voltage,
         "--clk", args.clk, "--cmd", args.cmd, "--dat", args.dat,
     ]
     if args.volatile_writes:
@@ -222,18 +226,17 @@ async def stop_glasgow(process, log_task, glasgow):
 
 async def reload_driver(shell):
     command = (
-        "SDPID=$(cat /var/run/sdmgr.pid 2>/dev/null); "
-        "test -z \"$SDPID\" || kill \"$SDPID\"; "
-        "sleep 2; rmmod sharp_mmcsd_m 2>/dev/null || true; sleep 2; "
-        f"insmod {shlex.quote(MODULE)}")
+        "/usr/bin/killall sdmgr 2>/dev/null || true; "
+        "rm -f /var/run/sdmgr.pid; "
+        "sleep 2; /sbin/rmmod sharp_mmcsd_m 2>/dev/null || true; sleep 2; "
+        f"/sbin/insmod {shlex.quote(MODULE)}")
     await shell.run(root(command), timeout=30)
 
 
 async def restore_driver(shell, mount_point):
     command = (
         f"umount {shlex.quote(mount_point)} 2>/dev/null || true; "
-        "SDPID=$(cat /var/run/sdmgr.pid 2>/dev/null); "
-        "test -z \"$SDPID\" || kill \"$SDPID\" 2>/dev/null || true; "
+        "/usr/bin/killall sdmgr 2>/dev/null || true; "
         "rm -f /var/run/sdmgr.pid; /sbin/sdmgr")
     await shell.run(root(command), check=False, timeout=30)
 
@@ -243,10 +246,14 @@ async def verify(args, shell):
     await reload_driver(shell)
 
     raw_command = (
-        "dd if=/dev/mmcda of=/tmp/glasgow-mbr bs=512 count=1; "
-        f"dd if=/dev/mmcda of=/tmp/glasgow-bpb bs=512 skip={partition_lba} count=1; "
-        "md5sum /tmp/glasgow-mbr /tmp/glasgow-bpb")
-    _, output = await shell.run(root(raw_command), timeout=45)
+        "rm -f /tmp/glasgow-mbr /tmp/glasgow-bpb; "
+        "dd if=/dev/mmcda of=/tmp/glasgow-mbr bs=512 count=1 && "
+        f"dd if=/dev/mmcda of=/tmp/glasgow-bpb bs=512 skip={partition_lba} count=1 && "
+        "md5sum /tmp/glasgow-mbr /tmp/glasgow-bpb; result=$?; "
+        "test $result -eq 0 || dmesg | tail -40; exit $result")
+    status, output = await shell.run(root(raw_command), check=False, timeout=45)
+    if status != 0:
+        raise E2EError(f"raw Zaurus sector read failed:\n{output}")
     expected_mbr = md5(host_mbr)
     expected_bpb = md5(host_bpb)
     if expected_mbr not in output or expected_bpb not in output:
@@ -285,7 +292,7 @@ async def async_main(args):
     try:
         process, log_task = await start_glasgow(args)
         shell = await connect_after_boot(
-            args.host, args.port, timeout=30,
+            args.host, args.port, username=args.username, timeout=45,
             serial_device=args.serial_device, serial_baud=args.serial_baud)
         if args.reboot:
             await shell.send(root("sync; /sbin/reboot"))
@@ -293,7 +300,7 @@ async def async_main(args):
             shell = None
             print(f"waiting up to {args.reboot_timeout:.0f} seconds for the Zaurus reboot")
             shell = await connect_after_boot(
-                args.host, args.port, timeout=args.reboot_timeout,
+                args.host, args.port, username=args.username, timeout=args.reboot_timeout,
                 serial_device=args.serial_device, serial_baud=args.serial_baud)
 
         mbr, bpb, marker = await verify(args, shell)
@@ -315,6 +322,8 @@ def make_parser():
         help="prepared FAT16 image containing HOST-FILE (default: generate a deterministic image)")
     parser.add_argument("--host", default="192.168.10.2", help="Zaurus telnet address")
     parser.add_argument("--port", type=int, default=23, help="Zaurus telnet port")
+    parser.add_argument("--username", default="zaurus",
+        help="Zaurus Telnet username exported with NEW-ENVIRON (default: zaurus)")
     parser.add_argument("--serial-device",
         help="use a directly attached serial console instead of Telnet")
     parser.add_argument("--serial-baud", type=int, default=115200,
@@ -332,6 +341,8 @@ def make_parser():
         help="seconds to wait for the console after reboot (default: 240)")
     parser.add_argument("--glasgow", default="glasgow", help="Glasgow executable")
     parser.add_argument("--glasgow-timeout", type=float, default=90)
+    parser.add_argument("--verbose-glasgow", action="store_true",
+        help="enable per-block Glasgow debug logging during the hardware test")
     parser.add_argument("--voltage", default="B=SB")
     parser.add_argument("--clk", default="B2")
     parser.add_argument("--cmd", default="B5")

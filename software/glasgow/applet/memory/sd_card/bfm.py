@@ -96,6 +96,23 @@ class SDHostBFM:
         for lane, pin in enumerate(self.dat):
             self.context.set(pin.i, (value >> lane) & 1)
 
+    async def send_data_block_1bit(self, block, *, valid_crc=True):
+        self.drive_data(0xf)
+        await self.cycle()
+        await self.cycle()
+        self.drive_data(0xe)
+        await self.cycle()
+        for octet in block:
+            for bitno in reversed(range(8)):
+                self.drive_data(0xe | ((octet >> bitno) & 1))
+                await self.cycle()
+        block_crc = crc16(block) ^ (1 if not valid_crc else 0)
+        for bitno in reversed(range(16)):
+            self.drive_data(0xe | ((block_crc >> bitno) & 1))
+            await self.cycle()
+        self.drive_data(0xf)
+        await self.cycle()
+
     async def send_data_block_4bit(self, block, *, valid_crc=True):
         lane_bits = [[] for _ in range(4)]
         self.drive_data(0xf)

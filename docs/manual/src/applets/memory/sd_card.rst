@@ -4,8 +4,10 @@
 ==================
 
 The ``memory-sd-card`` applet emulates an early, byte-addressed SDSC memory card. The card image
-remains on the host; Glasgow buffers one 512-byte block at a time and streams reads and writes over
-USB. Images must be no larger than 16 MiB and a multiple of 2 KiB so their capacity can be
+remains on the host; Glasgow uses two 512-byte ping-pong banks and streams reads and writes over
+USB. While one read bank is shifted onto DAT, the other is refilled from the host, avoiding an
+inter-block USB stall without retaining the image in FPGA memory. Images must be no larger than
+16 MiB and a multiple of 2 KiB so their capacity can be
 represented exactly by a version 1 CSD register. Add ``--read-only`` to open an image read-only
 and advertise the CSD temporary-write-protect bit.
 
@@ -27,9 +29,11 @@ Frames also carry a randomized session generation and a monotonically increasing
 replies from a previous applet run or target-power cycle are discarded and counted. Backend
 failures, malformed frames, and stale replies are included in the applet's exit statistics.
 
-File reads, writes, erases, and synchronization run on one dedicated worker thread. At most one
-operation may wait behind the operation in progress, and operations remain strictly ordered, so a
-slow ``fsync`` cannot block power monitoring or unboundedly queue later writes.
+File reads, writes, erases, and synchronization run on one dedicated worker thread. A bounded
+128 KiB host-memory read-ahead window collapses sequential file reads; writes and erases invalidate
+it before reaching the backend. At most one operation may wait behind the operation in progress,
+and operations remain strictly ordered, so a slow ``fsync`` cannot block power monitoring or
+unboundedly queue later writes.
 
 Zaurus SL-C860
 --------------
@@ -63,8 +67,8 @@ The Zaurus driver probes the card lazily and ``/sbin/sdmgr`` keeps the module bu
 ``/dev/sd_slotstat``. For a deterministic reprobe, first start the applet on the host, then stop the
 daemon and reload the driver over the Zaurus console::
 
-    SDMGR_PID=$(cat /var/run/sdmgr.pid 2>/dev/null)
-    test -n "$SDMGR_PID" && su -c "kill $SDMGR_PID"
+    su -c "/usr/bin/killall sdmgr 2>/dev/null || true"
+    su -c "rm -f /var/run/sdmgr.pid"
     sleep 2
     su -c "/sbin/rmmod sharp_mmcsd_m"
     sleep 2
@@ -88,6 +92,7 @@ Once ``/dev/mmcda1`` is available, the usual Cacko mount point is ``/usr/mnt.rom
 Unmount and synchronize the image before stopping the applet, then restore the daemon::
 
     su -c "umount /usr/mnt.rom/card"
+    su -c "/usr/bin/killall sdmgr 2>/dev/null || true"
     su -c "rm -f /var/run/sdmgr.pid; /sbin/sdmgr"
 
 Zaurus-specific gotchas
@@ -105,10 +110,13 @@ Zaurus-specific gotchas
   applet itself should remain running. ``--no-power-monitor`` restores the manual behavior.
 * A failed probe can leave the Linux 2.4 block driver with stale device state. Reloading the module
   is more reliable than repeatedly opening ``/dev/mmcda``. If ``rmmod`` reports that the module is
-  busy, ``sdmgr`` is usually still running.
+  busy, check for every ``sdmgr`` process rather than trusting only ``/var/run/sdmgr.pid``; an
+  interrupted test can leave an older daemon that the current PID file does not name.
 * Run with ``-v`` while bringing up new wiring. Block addresses logged by the applet confirm that
   the command and host-streaming paths are active. CMD55/ACMD41 timeouts with no logged commands
-  usually mean that the applet was not reset or that CLK/CMD wiring is wrong.
+  usually mean that the applet was not reset or that CLK/CMD wiring is wrong. The E2E harness uses
+  normal logging to avoid timing-sensitive per-block output; add ``--verbose-glasgow`` only when
+  those addresses are needed.
 * ``FAT: bogus logical sector size 0`` means that the Zaurus received a zero or stale partition
   boot sector. With current gateware, first reload both the applet and driver; with older builds it
   can also be caused by a stale CMD18 prefetch surviving CMD12.
@@ -133,10 +141,11 @@ To test a prepared image instead::
 
     python -m glasgow.applet.memory.sd_card.e2e_zaurus card.img
 
-The harness includes its own asyncio Telnet implementation and assumes that ``su -c`` on the
-Zaurus does not prompt for a password. A directly attached console can be used instead with
-``--serial-device /dev/tty... --serial-baud 115200``. It restores ``sdmgr`` and runs
-``glasgow safe`` during cleanup, including after a failed check.
+The harness includes its own asyncio Telnet implementation, exports ``USER=zaurus`` through Telnet
+NEW-ENVIRON negotiation (override it with ``--username``), and assumes that ``su -c`` does not
+prompt for a password. A directly attached console can be used instead with ``--serial-device
+/dev/tty... --serial-baud 115200``. It restores ``sdmgr`` and runs ``glasgow safe`` during cleanup,
+including after a failed check.
 
 CLI reference
 -------------
