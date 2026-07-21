@@ -3,6 +3,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import os
+import time
 
 from ._protocol import BLOCK_SIZE, BackendStatus
 
@@ -18,6 +19,16 @@ class BackendError(Exception):
 
 class BlockBackend(metaclass=ABCMeta):
     """Random-access storage used by the host side of the SD emulator."""
+
+    @property
+    def preferred_read_ahead_blocks(self) -> int:
+        """Efficient contiguous read size advertised to :class:`BackendWorker`.
+
+        Generic backends are deliberately conservative. Backends that can fetch a contiguous
+        run substantially more efficiently than repeated single-block calls may opt in by
+        overriding this property.
+        """
+        return 1
 
     @property
     @abstractmethod
@@ -70,7 +81,9 @@ class BackendWorker:
     modifying operation invalidates that window before it reaches the backend.
     """
 
-    def __init__(self, backend: BlockBackend, *, read_ahead_blocks=256):
+    def __init__(self, backend: BlockBackend, *, read_ahead_blocks=None):
+        if read_ahead_blocks is None:
+            read_ahead_blocks = backend.preferred_read_ahead_blocks
         if read_ahead_blocks < 1:
             raise ValueError("read_ahead_blocks must be positive")
         self.backend = backend
@@ -82,12 +95,28 @@ class BackendWorker:
         self._read_cache = b""
         self._closing = False
         self._closed = False
+        self._service_count = 0
+        self._max_service_latency = 0.0
+
+    @property
+    def read_ahead_blocks(self) -> int:
+        return self._read_ahead_blocks
+
+    @property
+    def service_count(self) -> int:
+        return self._service_count
+
+    @property
+    def max_service_latency(self) -> float:
+        """Longest blocking backend call observed, in seconds."""
+        return self._max_service_latency
 
     def _invalidate_read_cache(self):
         self._read_cache = b""
 
     async def _run(self, function, *args):
         loop = asyncio.get_running_loop()
+        started_at = time.monotonic()
         future = loop.run_in_executor(self._executor, partial(function, *args))
         try:
             return await asyncio.shield(future)
@@ -96,6 +125,10 @@ class BackendWorker:
             # finishes so a following read cannot overtake a cancelled write or erase.
             await asyncio.shield(future)
             raise
+        finally:
+            latency = time.monotonic() - started_at
+            self._service_count += 1
+            self._max_service_latency = max(self._max_service_latency, latency)
 
     async def _execute(self, function, *args, _allow_closing=False, _invalidate_cache=False):
         if self._closed or (self._closing and not _allow_closing):
@@ -177,6 +210,11 @@ class FileBlockBackend(BlockBackend):
     @property
     def read_only(self):
         return self._read_only
+
+    @property
+    def preferred_read_ahead_blocks(self):
+        # One pread amortizes the worker handoff and retains a bounded 128 KiB host cache.
+        return 256
 
     def _check_block(self, address: int):
         if address % BLOCK_SIZE or address < 0 or address > self.size - BLOCK_SIZE:

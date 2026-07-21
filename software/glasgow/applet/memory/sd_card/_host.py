@@ -39,6 +39,7 @@ class HostBlockEngine(wiring.Component):
     protocol_errors: Out(16)
     backend_errors: Out(16)
     stale_replies: Out(16)
+    max_host_service_latency: Out(32)
 
     def elaborate(self, platform):
         m = Module()
@@ -82,6 +83,10 @@ def _elaborate_host_block_engine(
         "end_address": 32,
         "bank": 1,
     }))
+    service_latency = Signal(32)
+    completed_service_latency = Signal(32)
+    m.d.comb += completed_service_latency.eq(
+        Mux(service_latency.all(), service_latency, service_latency + 1))
 
     reply_header = Signal(REPLY_GATEWARE_SCHEMA.layout)
     reply_header_count = Signal(range(REPLY_SCHEMA.size))
@@ -223,12 +228,15 @@ def _elaborate_host_block_engine(
                         m.d.sd += self.stale_replies.eq(self.stale_replies + 1)
                     with m.Else():
                         m.d.sd += transaction.phase.eq(TransactionPhase.Idle)
+                        with m.If(completed_service_latency > self.max_host_service_latency):
+                            m.d.sd += self.max_host_service_latency.eq(
+                                completed_service_latency)
                         with m.If(transaction.event == HostEvent.Read):
+                            m.d.sd += storage.read_reply_bank.eq(transaction.bank)
                             with m.If(reply_header.status == BackendStatus.OK):
                                 m.d.sd += [
                                     read_buffer_ready.eq(1),
                                     read_buffer_address.eq(transaction.address),
-                                    storage.read_buffer_bank.eq(transaction.bank),
                                 ]
                             with m.Else():
                                 m.d.sd += [
@@ -259,6 +267,11 @@ def _elaborate_host_block_engine(
     event_count = Signal(range(BLOCK_SIZE + 1))
     event_read_address = Signal(range(BLOCK_SIZE))
     event_read_advance = Signal()
+
+    with m.If(transaction.phase == TransactionPhase.Idle):
+        m.d.sd += service_latency.eq(0)
+    with m.Elif(~service_latency.all()):
+        m.d.sd += service_latency.eq(service_latency + 1)
 
     with m.If(read_request & (transaction.phase == TransactionPhase.Idle)):
         m.d.sd += [
