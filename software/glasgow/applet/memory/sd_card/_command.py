@@ -6,12 +6,12 @@ from ._response import ResponseEngine
 
 def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
     self = component
-    card_state = Signal(CardState, init=CardState.Idle)
-    data_mode = Signal(DataMode, init=DataMode.Idle)
-    bus_width_4 = Signal()
-    current_address = Signal(32)
-    erase_start = Signal(32)
-    erase_end = Signal(32)
+    card_state = core.card_state
+    data_mode = core.data_mode
+    bus_width_4 = core.bus_width_4
+    current_address = core.current_address
+    erase_start = core.erase_start
+    erase_end = core.erase_end
     erase_start_valid = Signal()
     erase_end_valid = Signal()
     app_command = Signal()
@@ -53,13 +53,14 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
     def load_r6(status):
         response.load_r6(m, status)
 
-    read_request = Signal()
-    write_request = Signal()
-    erase_request = Signal()
-    stop_requested = Signal()
-    request_sent = Signal()
+    erase_request = core.erase_request
+    stop_requested = core.stop_requested
+    request_sent = core.request_sent
 
     response.elaborate(m)
+    m.d.comb += core.response_active.eq(response_active)
+    with m.If(core.erase_request_accepted):
+        m.d.sd += erase_request.eq(0)
 
     with m.If(~enabled_sd):
         m.d.sd += [
@@ -69,6 +70,7 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
             card_state.eq(CardState.Idle),
             data_mode.eq(DataMode.Idle),
             app_command.eq(0),
+            erase_request.eq(0),
         ]
     with m.Elif(~response_active):
         with m.If(cmd_bits == 0):
@@ -90,9 +92,6 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
                     cmd_bits.eq(0),
                     self.last_command.eq(cmd_index),
                     self.command_count.eq(self.command_count + 1),
-                    read_request.eq(0),
-                    write_request.eq(0),
-                    erase_request.eq(0),
                     stop_requested.eq(0),
                 ]
 
@@ -276,17 +275,3 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
                                 m.d.sd += app_command.eq(1)
                             with m.Default():
                                 load_r1(cmd_index, status_value(extra=1 << 22))
-
-
-    core.card_state = card_state
-    core.data_mode = data_mode
-    core.bus_width_4 = bus_width_4
-    core.current_address = current_address
-    core.erase_start = erase_start
-    core.erase_end = erase_end
-    core.response_active = response_active
-    core.read_request = read_request
-    core.write_request = write_request
-    core.erase_request = erase_request
-    core.stop_requested = stop_requested
-    core.request_sent = request_sent

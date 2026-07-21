@@ -28,6 +28,12 @@ def elaborate_data_transfer_engine(
     event_count = core.event_count
     event_read_address = core.event_read_address
     event_read_advance = core.event_read_advance
+    with m.If(core.read_request_accepted | stop_requested |
+              (data_mode == DataMode.Idle)):
+        m.d.sd += read_request.eq(0)
+    with m.If(core.write_request_accepted | stop_requested |
+              (data_mode == DataMode.Idle)):
+        m.d.sd += write_request.eq(0)
     # Data transfer engine. It never depends on a full image being resident on the FPGA: one
     # block is refilled or drained for each SD data packet.
     data_byte = Signal(range(BLOCK_SIZE))

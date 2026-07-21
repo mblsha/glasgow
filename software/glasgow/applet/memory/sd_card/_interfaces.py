@@ -1,0 +1,51 @@
+from amaranth.lib import wiring
+from amaranth.lib.wiring import Out
+
+from ._gateware_support import BLOCK_SIZE, CardState, DataMode
+from ._protocol import HostEvent
+
+
+__all__ = ["SDCardEngineSignature"]
+
+
+class SDCardEngineSignature(wiring.Signature):
+    """Typed channels shared by the command, data, and host block engines.
+
+    Request channels use ``*_request``/``*_accepted`` handshakes. Result channels use
+    ``*_valid``/``*_consume`` handshakes. Keeping these signals in a real Amaranth interface
+    prevents engines from dynamically adding ad-hoc attributes during elaboration.
+    """
+
+    def __init__(self):
+        super().__init__({
+            "card_state": Out(CardState, init=CardState.Idle),
+            "data_mode": Out(DataMode, init=DataMode.Idle),
+            "bus_width_4": Out(1),
+            "current_address": Out(32),
+            "erase_start": Out(32),
+            "erase_end": Out(32),
+            "response_active": Out(1),
+
+            "read_request": Out(1),
+            "read_request_accepted": Out(1),
+            "write_request": Out(1),
+            "write_request_accepted": Out(1),
+            "erase_request": Out(1),
+            "erase_request_accepted": Out(1),
+            "stop_requested": Out(1),
+            "request_sent": Out(1),
+
+            "read_buffer_ready": Out(1),
+            "read_buffer_address": Out(32),
+            "read_buffer_consume": Out(1),
+            "read_reply_error": Out(1),
+            "host_ack_valid": Out(1),
+            "host_ack_status": Out(8),
+            "host_ack_consume": Out(1),
+
+            "event_pending": Out(1),
+            "event_kind": Out(HostEvent, init=HostEvent.Read),
+            "event_count": Out(range(BLOCK_SIZE + 1)),
+            "event_read_address": Out(range(BLOCK_SIZE)),
+            "event_read_advance": Out(1),
+        })

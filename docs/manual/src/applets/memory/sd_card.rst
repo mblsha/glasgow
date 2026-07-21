@@ -21,9 +21,15 @@ written to the image. By default a write or erase remains busy until the host ha
 ``--volatile-writes`` provides lower latency at the cost of acknowledging data that may still only
 be in the host page cache.
 
-Each host request and reply carries a randomized session generation and a monotonically increasing
-request ID. Replies from a previous applet run or target-power cycle are discarded and counted.
-Backend failures and stale replies are included in the applet's exit statistics.
+Each host request and reply is a versioned, length-delimited COBS frame protected by CRC16. A NUL
+delimiter lets either endpoint recover at the next frame after truncated or corrupted USB data.
+Frames also carry a randomized session generation and a monotonically increasing request ID;
+replies from a previous applet run or target-power cycle are discarded and counted. Backend
+failures, malformed frames, and stale replies are included in the applet's exit statistics.
+
+File reads, writes, erases, and synchronization run on one dedicated worker thread. At most one
+operation may wait behind the operation in progress, and operations remain strictly ordered, so a
+slow ``fsync`` cannot block power monitoring or unboundedly queue later writes.
 
 Zaurus SL-C860
 --------------
@@ -112,14 +118,19 @@ Automated end-to-end check
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 An opt-in hardware harness performs the driver reload, raw MBR and BPB digest comparison, FAT16
-mount, target read, target write, unmount, and verification that the written marker reached the
-host image. The image must already contain ``HOST.TXT`` with text matching ``--host-marker``. Add
-``--reboot`` to exercise automatic SD-rail power-cycle recovery; the harness allows 240 seconds by
-default and rejects reboot timeouts below two minutes::
+mount, target read, target write, unmount, and structural verification of the written file through
+the FAT cluster chain. With no image argument it creates a deterministic, partitioned 16 MiB
+FAT16 image containing ``HOST.TXT``. An existing image may still be supplied as the final argument.
+Add ``--reboot`` to exercise automatic SD-rail power-cycle recovery; the harness allows 240 seconds
+by default and rejects reboot timeouts below two minutes::
 
     python -m glasgow.applet.memory.sd_card.e2e_zaurus \
         --glasgow software/.venv/bin/glasgow \
-        --host-marker glasgow-host-marker --reboot card.img
+        --host-marker glasgow-host-marker --reboot
+
+To test a prepared image instead::
+
+    python -m glasgow.applet.memory.sd_card.e2e_zaurus card.img
 
 The harness requires the system ``telnet`` client and assumes that ``su -c`` on the Zaurus does
 not prompt for a password. It restores ``sdmgr`` and runs ``glasgow safe`` during cleanup,
@@ -142,3 +153,9 @@ API reference
 .. autoclass:: BlockBackend
 
 .. autoclass:: FileBlockBackend
+
+.. autoclass:: BackendWorker
+
+.. autoclass:: FAT16Image
+
+.. autofunction:: create_fat16_image

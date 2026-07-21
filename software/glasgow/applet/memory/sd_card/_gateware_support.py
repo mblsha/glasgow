@@ -40,3 +40,9 @@ def crc7_value(crc: Value, bit: Value) -> Value:
 def crc16_value(crc: Value, bit: Value) -> Value:
     feedback = bit ^ crc[15]
     return Cat(C(0, 1), crc[:15]) ^ Mux(feedback, C(0x1021, 16), C(0, 16))
+
+
+def crc16_byte_value(crc: Value, octet: Value) -> Value:
+    for bitno in reversed(range(8)):
+        crc = crc16_value(crc, octet[bitno])
+    return crc

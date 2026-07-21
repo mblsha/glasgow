@@ -10,23 +10,32 @@ from amaranth.lib.wiring import In, Out
 
 from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
+from glasgow.gateware import cobs as gateware_cobs
 from glasgow.gateware.stream import AsyncQueue
+from glasgow.support.target_power import TargetPowerLifecycle
 
-from ._backend import BackendError, BlockBackend, FileBlockBackend
+from ._backend import BackendError, BackendWorker, BlockBackend, FileBlockBackend
 from ._command import elaborate_command_engine
 from ._data import elaborate_data_transfer_engine
+from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 from ._gateware_support import (
     BLOCK_SIZE, IMAGE_SIZE_GRANULARITY, MAX_IMAGE_SIZE,
 )
 from ._host import elaborate_host_block_engine
-from ._protocol import BackendStatus, HostEvent, HostReply, RequestHeader, ReplyHeader
+from ._interfaces import SDCardEngineSignature
+from ._protocol import (
+    BackendStatus, FrameError, HostEvent, HostReply, ReplyFrame, ReplyHeader,
+    RequestFrame, RequestHeader,
+)
 
 
 __all__ = [
-    "BackendError", "BackendStatus", "BlockBackend", "FileBlockBackend",
-    "HostEvent", "HostReply", "RequestHeader", "ReplyHeader",
+    "BackendError", "BackendStatus", "BackendWorker", "BlockBackend", "FileBlockBackend",
+    "FAT16Error", "FAT16Image", "FrameError", "HostEvent", "HostReply",
+    "RequestFrame", "RequestHeader",
+    "ReplyFrame", "ReplyHeader",
     "SDCardError", "SDCardComponent", "SDCardInterface", "SDCardApplet",
-    "crc7", "crc16", "build_cid", "build_csd", "build_scr",
+    "crc7", "crc16", "build_cid", "build_csd", "build_scr", "create_fat16_image",
 ]
 
 
@@ -150,20 +159,6 @@ def build_scr() -> int:
     return scr
 
 
-class _SDCardCore:
-    """Namespace for signals shared by the independently maintained gateware engines."""
-
-    __slots__ = (
-        "card_state", "data_mode", "bus_width_4", "current_address",
-        "erase_start", "erase_end", "response_active",
-        "read_request", "write_request", "erase_request", "stop_requested", "request_sent",
-        "read_buffer_ready", "read_buffer_address", "read_buffer_consume", "read_reply_error",
-        "host_ack_valid", "host_ack_status", "host_ack_consume",
-        "event_pending", "event_kind", "event_count", "event_read_address",
-        "event_read_advance",
-    )
-
-
 class SDCardComponent(wiring.Component):
     i_stream: In(stream.Signature(8))
     o_stream: Out(stream.Signature(8))
@@ -217,21 +212,24 @@ class SDCardComponent(wiring.Component):
         enabled_sd = Signal()
         m.submodules.enabled_sync = cdc.FFSynchronizer(self.enabled, enabled_sd, o_domain="sd")
 
-        host_to_sd = AsyncQueue(shape=8, depth=1024, i_domain="sync", o_domain="sd")
+        m.submodules.host_decoder = host_decoder = gateware_cobs.Decoder(recover=True)
+        wiring.connect(m, host_decoder.i, wiring.flipped(self.i_stream))
+
+        host_to_sd = AsyncQueue(
+            shape=data.StructLayout({"data": 8, "end": 1}),
+            depth=1024, i_domain="sync", o_domain="sd")
         sd_to_host = AsyncQueue(
             shape=data.StructLayout({"data": 8, "end": 1}),
-            depth=1024, i_domain="sd", o_domain="sync")
+            depth=64, i_domain="sd", o_domain="sync")
         m.submodules.host_to_sd = host_to_sd
         m.submodules.sd_to_host = sd_to_host
+        wiring.connect(m, host_to_sd.i, host_decoder.o)
 
-        wiring.connect(m, host_to_sd.i, wiring.flipped(self.i_stream))
-        m.d.comb += [
-            self.o_stream.payload.eq(sd_to_host.o.p.data),
-            self.o_stream.valid.eq(sd_to_host.o.valid),
-            sd_to_host.o.ready.eq(self.o_stream.ready),
-        ]
+        m.submodules.host_encoder = host_encoder = gateware_cobs.Encoder(fifo_depth=1024)
+        wiring.connect(m, host_encoder.i, sd_to_host.o)
+        wiring.connect(m, wiring.flipped(self.o_stream), host_encoder.o)
         m.d.sync += self.o_flush.eq(0)
-        with m.If(self.o_stream.valid & self.o_stream.ready & sd_to_host.o.p.end):
+        with m.If(self.o_stream.valid & self.o_stream.ready & (self.o_stream.payload == 0)):
             m.d.sync += self.o_flush.eq(1)
 
         block_memory = memory.Memory(shape=8, depth=BLOCK_SIZE, init=[])
@@ -254,7 +252,7 @@ class SDCardComponent(wiring.Component):
                 buffer.oe.eq(dat_oe_latched[index]),
             ]
 
-        core = _SDCardCore()
+        core = SDCardEngineSignature().create(path=("core",))
         elaborate_command_engine(m, self, cmd_buffer, enabled_sd, core)
         elaborate_host_block_engine(
             m, self, host_to_sd, sd_to_host, block_write, block_read, core)
@@ -301,6 +299,7 @@ class SDCardInterface:
         self.stale_replies = assembly.add_ro_register(component.stale_replies)
 
         self._backend = None
+        self._worker = None
         self._generation = 0
         self._sync_writes = True
         self._active = False
@@ -327,6 +326,7 @@ class SDCardInterface:
             raise ValueError("exactly one of image_path or backend must be provided")
         if backend is None:
             backend = FileBlockBackend(image_path, read_only=read_only)
+        worker = BackendWorker(backend)
         try:
             size = backend.size
             csd = build_csd(size, read_only=backend.read_only)
@@ -344,12 +344,13 @@ class SDCardInterface:
             await self._enabled.set(1)
             self._active = True
         except BaseException:
-            backend.close()
+            await worker.close()
             raise
 
-        if self._backend is not None:
-            self._backend.close()
+        if self._worker is not None:
+            await self._worker.close()
         self._backend = backend
+        self._worker = worker
         self._sync_writes = sync_writes
         access = "read-only" if backend.read_only else "writable"
         durability = "synchronous" if sync_writes else "write-back"
@@ -378,40 +379,31 @@ class SDCardInterface:
 
     async def monitor_power(self, device, port, *, off_threshold: float = 1.0,
             on_threshold: float = 1.8, interval: float = 0.25, debounce_samples: int = 3):
-        if not 0 <= off_threshold < on_threshold:
-            raise SDCardError("power thresholds must satisfy 0 <= off < on")
-        if interval <= 0 or debounce_samples < 1:
-            raise SDCardError("power polling interval and debounce count must be positive")
-
-        below_count = above_count = 0
-        self._logger.info(
-            "monitoring port %s target power (off below %.2f V, on above %.2f V)",
-            port, off_threshold, on_threshold)
-        while True:
+        async def before_suspend():
             try:
-                voltage = await device.measure_voltage(str(port))
-            except Exception as error:
-                self._logger.warning("cannot sample port %s target power: %s", port, error)
-                await asyncio.sleep(interval)
-                continue
+                await self.flush()
+            except BackendError as error:
+                self._record_backend_error("power-loss flush", error)
 
-            if self._active:
-                below_count = below_count + 1 if voltage < off_threshold else 0
-                above_count = 0
-                if below_count >= debounce_samples:
-                    try:
-                        await self.flush()
-                    except BackendError as error:
-                        self._record_backend_error("power-loss flush", error)
-                    await self.suspend(reason=f"target rail fell to {voltage:.2f} V")
-                    below_count = 0
-            else:
-                above_count = above_count + 1 if voltage > on_threshold else 0
-                below_count = 0
-                if above_count >= debounce_samples:
-                    await self.resume(reason=f"target rail rose to {voltage:.2f} V")
-                    above_count = 0
-            await asyncio.sleep(interval)
+        try:
+            monitor = TargetPowerLifecycle(
+                self._logger,
+                sample_voltage=lambda: device.measure_voltage(str(port)),
+                is_active=lambda: self._active,
+                before_suspend=before_suspend,
+                suspend=lambda voltage: self.suspend(
+                    reason=f"target rail fell to {voltage:.2f} V"),
+                resume=lambda voltage: self.resume(
+                    reason=f"target rail rose to {voltage:.2f} V"),
+                off_threshold=off_threshold,
+                on_threshold=on_threshold,
+                interval=interval,
+                debounce_samples=debounce_samples,
+                description=f"port {port} target power",
+            )
+            await monitor.run()
+        except ValueError as error:
+            raise SDCardError(str(error)) from error
 
     async def close(self):
         statistics = None
@@ -432,10 +424,11 @@ class SDCardInterface:
                 *statistics, self._host_backend_errors, self._flush_count)
         if self._backend is not None:
             try:
-                self._backend.flush()
+                await self._worker.flush()
             except BackendError as error:
                 self._record_backend_error("close flush", error)
-            self._backend.close()
+            await self._worker.close()
+            self._worker = None
             self._backend = None
 
     def _record_backend_error(self, operation: str, error: BackendError):
@@ -444,33 +437,65 @@ class SDCardInterface:
             operation, error.status.name, error)
 
     async def flush(self):
-        if self._backend is None:
+        if self._worker is None:
             raise SDCardError("no image is configured")
-        self._backend.flush()
+        await self._worker.flush()
         self._flush_count += 1
 
     async def _reply(self, opcode: HostReply, generation: int, request_id: int,
             status: BackendStatus = BackendStatus.OK, payload=b""):
-        header = ReplyHeader(opcode, generation, request_id, status)
-        await self._pipe.send(header.encode() + bytes(payload))
+        packet = ReplyFrame.create(
+            opcode, generation, request_id, status, payload).encode_packet()
+        await self._pipe.send(packet)
         await self._pipe.flush()
 
     async def serve_once(self):
         if self._backend is None:
             raise SDCardError("no image is configured")
 
-        header = RequestHeader.decode(bytes(await self._pipe.recv(RequestHeader.size)))
+        while True:
+            packet = await self._pipe.recv_until(b"\0")
+            try:
+                request = RequestFrame.decode_packet(packet)
+            except FrameError as error:
+                self._logger.warning("discarding malformed SD backend frame: %s", error)
+                continue
+            break
+
+        header = request.header
+        payload = request.payload
+        if header.generation != self._generation:
+            self._logger.debug(
+                "discarding stale %s request %#06x/%#06x",
+                header.opcode.name.lower(), header.generation, header.request_id)
+            return
+        expected_length = {
+            HostEvent.Read: 4,
+            HostEvent.Write: 4 + BLOCK_SIZE,
+            HostEvent.Erase: 8,
+        }[header.opcode]
+        if len(payload) != expected_length:
+            self._logger.warning(
+                "invalid %s request length %d (expected %d)",
+                header.opcode.name.lower(), len(payload), expected_length)
+            reply_opcode = {
+                HostEvent.Read: HostReply.ReadData,
+                HostEvent.Write: HostReply.WriteAck,
+                HostEvent.Erase: HostReply.EraseAck,
+            }[header.opcode]
+            reply_payload = bytes([0xff]) * BLOCK_SIZE \
+                if header.opcode == HostEvent.Read else b""
+            await self._reply(
+                reply_opcode, header.generation, header.request_id,
+                BackendStatus.Invalid, reply_payload)
+            return
+
         if header.opcode == HostEvent.Read:
-            address, = struct.unpack("<I", await self._pipe.recv(4))
-            if header.generation != self._generation:
-                self._logger.debug(
-                    "discarding stale read request %#06x/%#06x", header.generation,
-                    header.request_id)
-                return
+            address, = struct.unpack("<I", payload)
             self._logger.log(self._level, "read block at %#x", address)
             status = BackendStatus.OK
             try:
-                block = self._backend.read_block(address)
+                block = await self._worker.read_block(address)
             except BackendError as error:
                 self._record_backend_error("read", error)
                 status = error.status
@@ -479,17 +504,12 @@ class SDCardInterface:
                 HostReply.ReadData, header.generation, header.request_id, status, block)
 
         elif header.opcode == HostEvent.Write:
-            address, = struct.unpack("<I", await self._pipe.recv(4))
-            block = bytes(await self._pipe.recv(BLOCK_SIZE))
-            if header.generation != self._generation:
-                self._logger.debug(
-                    "discarding stale write request %#06x/%#06x", header.generation,
-                    header.request_id)
-                return
+            address, = struct.unpack("<I", payload[:4])
+            block = payload[4:]
             self._logger.log(self._level, "write block at %#x", address)
             status = BackendStatus.OK
             try:
-                self._backend.write_block(address, block)
+                await self._worker.write_block(address, block)
                 if self._sync_writes:
                     await self.flush()
             except BackendError as error:
@@ -499,16 +519,11 @@ class SDCardInterface:
                 HostReply.WriteAck, header.generation, header.request_id, status)
 
         elif header.opcode == HostEvent.Erase:
-            start, end = struct.unpack("<II", await self._pipe.recv(8))
-            if header.generation != self._generation:
-                self._logger.debug(
-                    "discarding stale erase request %#06x/%#06x", header.generation,
-                    header.request_id)
-                return
+            start, end = struct.unpack("<II", payload)
             self._logger.log(self._level, "erase blocks at %#x..%#x", start, end)
             status = BackendStatus.OK
             try:
-                self._backend.erase(start, end)
+                await self._worker.erase(start, end)
                 if self._sync_writes:
                     await self.flush()
             except BackendError as error:
