@@ -1,5 +1,5 @@
 from amaranth import C, Cat, Const, Mux, Value
-from amaranth.lib import enum
+from amaranth.lib import crc, enum
 
 from ._protocol import BLOCK_SIZE
 
@@ -9,6 +9,10 @@ IMAGE_SIZE_GRANULARITY = 2048
 
 RCA = 0x1234
 OCR = 0x80ff_8000
+
+FRAME_CRC16 = crc.Algorithm(
+    crc_width=16, polynomial=0x1021, initial_crc=0,
+    reflect_input=False, reflect_output=False, xor_output=0)
 
 
 class CardState(enum.Enum, shape=4):
@@ -41,12 +45,6 @@ def crc7_value(crc: Value, bit: Value) -> Value:
 def crc16_value(crc: Value, bit: Value) -> Value:
     feedback = bit ^ crc[15]
     return Cat(C(0, 1), crc[:15]) ^ Mux(feedback, C(0x1021, 16), C(0, 16))
-
-
-def crc16_byte_value(crc: Value, octet: Value) -> Value:
-    for bitno in reversed(range(8)):
-        crc = crc16_value(crc, octet[bitno])
-    return crc
 
 
 def frame_header_bytes(schema, values):

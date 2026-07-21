@@ -19,7 +19,7 @@ class ResponseEngine:
         self.driving = (self.bits != 0) | (self.crc_bits != 0) | self.end
         self.active = self.driving | (self.pending != 0)
 
-    def connect(self, m, cmd_buffer, enabled):
+    def connect(self, m, cmd_o, cmd_oe, enabled):
         output_next = Mux(
             self.bits != 0, self.shift[135],
             Mux(self.crc_bits != 0, self.crc[6], 1))
@@ -30,8 +30,8 @@ class ResponseEngine:
             output_enable.eq(self.driving & enabled),
         ]
         m.d.comb += [
-            cmd_buffer.o.eq(output),
-            cmd_buffer.oe.eq(output_enable),
+            cmd_o.eq(output),
+            cmd_oe.eq(output_enable),
         ]
 
     def load_r1(self, m, command, status):

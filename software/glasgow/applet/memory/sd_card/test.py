@@ -139,7 +139,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 await send_command(17, BLOCK_SIZE)
                 assert_r1(await receive_response(48), 17)
 
-                while not applet.sd_card_iface._pipe.contains(b"\0"):
+                while not applet.sd_card_iface._pipe.flush_readable:
                     await cycle()
                 await applet.sd_card_iface.serve_once()
                 await receive_data_block(payload[BLOCK_SIZE:BLOCK_SIZE * 2])
@@ -149,20 +149,20 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 # own address rather than consuming the stale prefetch.
                 await send_command(18, 0)
                 assert_r1(await receive_response(48), 18)
-                while not applet.sd_card_iface._pipe.contains(b"\0"):
+                while not applet.sd_card_iface._pipe.flush_readable:
                     await cycle()
                 await applet.sd_card_iface.serve_once()
                 await receive_data_block(payload[:BLOCK_SIZE])
 
                 await send_command(12)
                 assert_r1(await receive_response(48), 12)
-                while not applet.sd_card_iface._pipe.contains(b"\0"):
+                while not applet.sd_card_iface._pipe.flush_readable:
                     await cycle()
                 await applet.sd_card_iface.serve_once()  # stale block-one prefetch
                 read_address = BLOCK_SIZE * 3
                 await send_command(17, read_address)
                 assert_r1(await receive_response(48), 17)
-                while not applet.sd_card_iface._pipe.contains(b"\0"):
+                while not applet.sd_card_iface._pipe.flush_readable:
                     await cycle()
                 await applet.sd_card_iface.serve_once()
                 await receive_data_block(payload[read_address:read_address + BLOCK_SIZE])
@@ -186,7 +186,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                     _, _, data_sample = await cycle()
                     if data_sample[0] == (1, 0):
                         saw_busy = True
-                    if applet.sd_card_iface._pipe.contains(b"\0"):
+                    if applet.sd_card_iface._pipe.flush_readable:
                         await applet.sd_card_iface.serve_once()
                     if saw_busy and data_sample[0][0] == 0:
                         break
@@ -211,7 +211,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                 self.assertEqual(await bfm.receive_data_response(), [0, 1, 0, 1, 1])
                 for _ in range(32):
                     await cycle()
-                self.assertFalse(applet.sd_card_iface._pipe.contains(b"\0"))
+                self.assertFalse(applet.sd_card_iface._pipe.flush_readable)
                 self.assertEqual(await applet.sd_card_iface.write_count, writes_before)
                 self.assertEqual(
                     os.pread(image.fileno(), BLOCK_SIZE, rejected_address), original_block)
@@ -232,7 +232,7 @@ class SDCardAppletTestCase(GlasgowAppletV2TestCase, applet=SDCardApplet):
                     _, _, data_sample = await cycle()
                     if data_sample[0] == (1, 0):
                         saw_busy = True
-                    if applet.sd_card_iface._pipe.contains(b"\0"):
+                    if applet.sd_card_iface._pipe.flush_readable:
                         await applet.sd_card_iface.serve_once()
                     if saw_busy and data_sample[0][0] == 0:
                         break

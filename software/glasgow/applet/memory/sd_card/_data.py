@@ -1,11 +1,40 @@
 from amaranth import *
+from amaranth.lib import wiring
+from amaranth.lib.wiring import In, Out
 
+from ._buffer import BlockBufferPortSignature
 from ._gateware_support import BLOCK_SIZE, CardState, DataMode, crc16_value as _crc16_value
-from ._protocol import BackendStatus, HostEvent
+from ._interfaces import CommandDataSignature, DataHostSignature
 
 
-def elaborate_data_transfer_engine(
-        m, component, block_write, block_read, dat_i, dat_o, dat_oe, control, storage):
+__all__ = ["DataEngine"]
+
+
+class DataEngine(wiring.Component):
+    dat_i: In(4)
+    dat_o: Out(4, init=0xf)
+    dat_oe: Out(4)
+    scr: In(64)
+    image_size: In(25)
+
+    control: In(CommandDataSignature())
+    storage: Out(DataHostSignature())
+    buffer: Out(BlockBufferPortSignature())
+
+    read_count: Out(32)
+    write_count: Out(32)
+    protocol_errors: Out(16)
+
+    def elaborate(self, platform):
+        m = Module()
+        _elaborate_data_transfer_engine(
+            m, self, self.buffer, self.dat_i, self.dat_o, self.dat_oe,
+            self.control, self.storage)
+        return m
+
+
+def _elaborate_data_transfer_engine(
+        m, component, block_buffer, dat_i, dat_o, dat_oe, control, storage):
     self = component
     data_mode = control.data_mode
     bus_width_4 = control.bus_width_4
@@ -23,11 +52,6 @@ def elaborate_data_transfer_engine(
     host_ack_valid = storage.host_ack_valid
     host_ack_status = storage.host_ack_status
     host_ack_consume = storage.host_ack_consume
-    event_pending = storage.event_pending
-    event_kind = storage.event_kind
-    event_count = storage.event_count
-    event_read_address = storage.event_read_address
-    event_read_advance = storage.event_read_advance
 
     m.d.comb += [
         control.state_update_valid.eq(0),
@@ -71,20 +95,17 @@ def elaborate_data_transfer_engine(
     write_accepted = Signal()
     read_advance = Signal()
 
-    # The single block RAM read port is shared by card-to-host writes and host-to-card reads;
-    # those operations are mutually exclusive by construction.
-    with m.If(event_pending & (event_kind == HostEvent.Write)):
-        m.d.comb += block_read.addr.eq(
-            Mux(event_read_advance, event_count + 1, event_read_address))
-    with m.Else():
-        m.d.comb += block_read.addr.eq(Mux(read_advance, data_byte + 1, data_byte))
-
     m.d.comb += [
         dat_o.eq(0xf),
         dat_oe.eq(0),
         read_buffer_consume.eq(0),
         host_ack_consume.eq(0),
         read_advance.eq(0),
+        block_buffer.write_en.eq(0),
+        block_buffer.write_address.eq(0),
+        block_buffer.write_data.eq(0),
+        block_buffer.read_active.eq(1),
+        block_buffer.read_address.eq(Mux(read_advance, data_byte + 1, data_byte)),
     ]
 
     with m.FSM(domain="sd", name="data_transfer"):
@@ -144,7 +165,7 @@ def elaborate_data_transfer_engine(
             source_byte = Mux(
                 data_mode == DataMode.ReadSCR,
                 self.scr.word_select(data_byte[:3] ^ 0b111, 8),
-                block_read.data)
+                block_buffer.read_data)
             with m.If(bus_width_4):
                 nibble = Mux(data_bit == 0, source_byte[4:8], source_byte[0:4])
                 m.d.comb += [dat_o.eq(nibble), dat_oe.eq(0xf)]
@@ -242,9 +263,9 @@ def elaborate_data_transfer_engine(
                     ]
                 with m.Else():
                     m.d.comb += [
-                        block_write.en.eq(1),
-                        block_write.addr.eq(data_byte),
-                        block_write.data.eq(Cat(dat_i, high_nibble)),
+                        block_buffer.write_en.eq(1),
+                        block_buffer.write_address.eq(data_byte),
+                        block_buffer.write_data.eq(Cat(dat_i, high_nibble)),
                     ]
                     m.d.sd += data_bit.eq(0)
                     with m.If(data_byte == BLOCK_SIZE - 1):
@@ -260,9 +281,9 @@ def elaborate_data_transfer_engine(
                 ]
                 with m.If(data_bit == 7):
                     m.d.comb += [
-                        block_write.en.eq(1),
-                        block_write.addr.eq(data_byte),
-                        block_write.data.eq(next_octet),
+                        block_buffer.write_en.eq(1),
+                        block_buffer.write_address.eq(data_byte),
+                        block_buffer.write_data.eq(next_octet),
                     ]
                     m.d.sd += data_bit.eq(0)
                     with m.If(data_byte == BLOCK_SIZE - 1):

@@ -20,28 +20,35 @@ logger = logging.getLogger(__name__)
 
 
 class SimulationPipe(AbstractInOutPipe):
-    def __init__(self, parent, *, i_buffer, o_buffer):
-        self._parent   = parent
-        self._i_buffer = i_buffer
-        self._o_buffer = o_buffer
+    def __init__(self, parent, *, i_buffer, i_flush_offsets, o_buffer):
+        self._parent          = parent
+        self._i_buffer        = i_buffer
+        self._i_flush_offsets = i_flush_offsets
+        self._o_buffer        = o_buffer
 
     @property
     def readable(self) -> int | None:
         return len(self._i_buffer)
 
-    def contains(self, delimiter: bytes) -> bool:
-        """Return whether received simulation data contains *delimiter* without consuming it."""
-        assert self._i_buffer is not None, "contains() called on an out pipe"
-        return delimiter in self._i_buffer
+    @property
+    def flush_readable(self) -> bool:
+        """Return whether data through an asserted gateware flush boundary is readable."""
+        assert self._i_flush_offsets is not None, "flush_readable called on an out pipe"
+        return bool(self._i_flush_offsets)
+
+    def _consume(self, length):
+        data = self._i_buffer[:length]
+        del self._i_buffer[:length]
+        self._i_flush_offsets[:] = [
+            offset - length for offset in self._i_flush_offsets if offset > length]
+        return data
 
     async def recv(self, length) -> memoryview:
         assert self._i_buffer is not None, "recv() called on an out pipe"
         while len(self._i_buffer) < length:
             _clk_hit, rst_hit = await self._parent._context.tick()
             assert not rst_hit
-        data = self._i_buffer[:length]
-        del self._i_buffer[:length]
-        return memoryview(data)
+        return memoryview(self._consume(length))
 
     async def recv_until(self, delimiter: bytes) -> bytes:
         assert self._i_buffer is not None, "recv_until() called on an out pipe"
@@ -50,9 +57,15 @@ class SimulationPipe(AbstractInOutPipe):
             _clk_hit, rst_hit = await self._parent._context.tick()
             assert not rst_hit
         length = self._i_buffer.index(delimiter) + len(delimiter)
-        data = self._i_buffer[:length]
-        del self._i_buffer[:length]
-        return bytes(data)
+        return bytes(self._consume(length))
+
+    async def recv_flush(self) -> bytes:
+        """Receive through the next boundary explicitly marked by gateware ``in_flush``."""
+        assert self._i_flush_offsets is not None, "recv_flush() called on an out pipe"
+        while not self._i_flush_offsets:
+            _clk_hit, rst_hit = await self._parent._context.tick()
+            assert not rst_hit
+        return bytes(self._consume(self._i_flush_offsets[0]))
 
     @property
     def writable(self) -> int | None:
@@ -69,8 +82,11 @@ class SimulationPipe(AbstractInOutPipe):
             assert not rst_hit
 
     async def reset(self):
-        self._i_buffer.clear()
-        self._o_buffer.clear()
+        if self._i_buffer is not None:
+            self._i_buffer.clear()
+            self._i_flush_offsets.clear()
+        if self._o_buffer is not None:
+            self._o_buffer.clear()
 
     async def detach(self) -> tuple[int, int]:
         raise NotImplementedError
@@ -145,11 +161,14 @@ class SimulationAssembly(AbstractAssembly):
                        out_fifo_depth=None, out_buffer_size=None) -> AbstractInOutPipe:
         if in_stream is None:
             i_buffer = None
+            i_flush_offsets = None
         else:
             i_buffer = bytearray()
+            i_flush_offsets = []
             async def i_testbench(ctx):
-                nonlocal i_buffer
+                nonlocal i_buffer, i_flush_offsets
                 assert i_buffer is not None
+                assert i_flush_offsets is not None
                 timer = 0
                 packet = bytearray()
                 ctx.set(in_stream.ready, 1)
@@ -164,6 +183,8 @@ class SimulationAssembly(AbstractAssembly):
                         if len(packet) >= 512 or flush_smp or timer >= 100:
                             i_buffer += packet
                             packet.clear()
+                            if flush_smp:
+                                i_flush_offsets.append(len(i_buffer))
                         elif len(packet) > 0:
                             timer += 1
             self._benches.append((i_testbench, True))
@@ -183,7 +204,8 @@ class SimulationAssembly(AbstractAssembly):
                         del o_buffer[0]
             self._benches.append((o_testbench, True))
 
-        return SimulationPipe(self, i_buffer=i_buffer, o_buffer=o_buffer)
+        return SimulationPipe(
+            self, i_buffer=i_buffer, i_flush_offsets=i_flush_offsets, o_buffer=o_buffer)
 
     def add_ro_register(self, signal) -> AbstractRORegister:
         return SimulationRORegister(self, signal)

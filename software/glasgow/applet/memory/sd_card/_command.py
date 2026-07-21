@@ -1,10 +1,41 @@
 from amaranth import *
+from amaranth.lib import wiring
+from amaranth.lib.wiring import In, Out
 
 from ._gateware_support import CardState, DataMode, BLOCK_SIZE, RCA, crc7_value as _crc7_value
+from ._interfaces import CommandDataSignature
 from ._response import ResponseEngine
 
 
-def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, control):
+__all__ = ["CommandEngine"]
+
+
+class CommandEngine(wiring.Component):
+    cmd_i: In(1)
+    cmd_o: Out(1, init=1)
+    cmd_oe: Out(1)
+    enabled: In(1)
+    read_only: In(1)
+    image_size: In(25)
+    cid: In(128)
+    csd: In(128)
+
+    control: Out(CommandDataSignature())
+
+    last_command: Out(6)
+    clock_count: Out(32)
+    command_low_count: Out(32)
+    command_count: Out(32)
+    protocol_errors: Out(16)
+
+    def elaborate(self, platform):
+        m = Module()
+        _elaborate_command_engine(
+            m, self, self.cmd_i, self.cmd_o, self.cmd_oe, self.enabled, self.control)
+        return m
+
+
+def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, control):
     self = component
     card_state = control.card_state
     data_mode = control.data_mode
@@ -22,7 +53,7 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, control):
     response = ResponseEngine()
     response_active = response.active
 
-    cmd_word = Cat(cmd_buffer.i, cmd_shift[:47])
+    cmd_word = Cat(cmd_i, cmd_shift[:47])
     cmd_index = cmd_word[40:46]
     cmd_argument = cmd_word[8:40]
     cmd_crc = cmd_word[1:8]
@@ -32,10 +63,10 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, control):
     # problem from a malformed command frame without buffering a full logic trace.
     with m.If(enabled_sd):
         m.d.sd += self.clock_count.eq(self.clock_count + 1)
-        with m.If(~cmd_buffer.i):
+        with m.If(~cmd_i):
             m.d.sd += self.command_low_count.eq(self.command_low_count + 1)
 
-    response.connect(m, cmd_buffer, enabled_sd)
+    response.connect(m, cmd_o, cmd_oe, enabled_sd)
 
     def status_value(*, extra=0, app=False):
         return (card_state.as_value() << 9) | (C(1, 32) << 8) | C(extra, 32) | \
@@ -76,7 +107,7 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, control):
         ]
     with m.Elif(~response_active):
         with m.If(cmd_bits == 0):
-            with m.If(cmd_buffer.i == 0):
+            with m.If(cmd_i == 0):
                 m.d.sd += [
                     cmd_shift.eq(0),
                     cmd_bits.eq(1),
@@ -88,7 +119,7 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, control):
                 cmd_bits.eq(cmd_bits + 1),
             ]
             with m.If(cmd_bits < 40):
-                m.d.sd += cmd_crc_calc.eq(_crc7_value(cmd_crc_calc, cmd_buffer.i))
+                m.d.sd += cmd_crc_calc.eq(_crc7_value(cmd_crc_calc, cmd_i))
             with m.If(cmd_bits == 47):
                 m.d.sd += [
                     cmd_bits.eq(0),

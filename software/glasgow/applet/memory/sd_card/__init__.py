@@ -5,24 +5,25 @@ import secrets
 import struct
 
 from amaranth import *
-from amaranth.lib import cdc, data, io, memory, stream, wiring
+from amaranth.lib import cdc, data, io, stream, wiring
 from amaranth.lib.wiring import In, Out
 
 from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 from glasgow.gateware import cobs as gateware_cobs
+from glasgow.gateware.crc import FrameChecksumAppender, FrameChecksumVerifier
 from glasgow.gateware.stream import AsyncQueue
 from glasgow.support.target_power import TargetPowerLifecycle
 
 from ._backend import BackendError, BackendWorker, BlockBackend, FileBlockBackend
-from ._command import elaborate_command_engine
-from ._data import elaborate_data_transfer_engine
+from ._buffer import BlockBuffer
+from ._command import CommandEngine
+from ._data import DataEngine
 from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 from ._gateware_support import (
-    BLOCK_SIZE, IMAGE_SIZE_GRANULARITY, MAX_IMAGE_SIZE,
+    BLOCK_SIZE, FRAME_CRC16, IMAGE_SIZE_GRANULARITY, MAX_IMAGE_SIZE,
 )
-from ._host import elaborate_host_block_engine
-from ._interfaces import CommandDataSignature, DataHostSignature
+from ._host import HostBlockEngine
 from ._protocol import (
     HOST_EVENT_PAYLOAD_LENGTH, HOST_REPLY_FOR_EVENT, BackendStatus, FrameError,
     HostEvent, HostReply, ReplyFrame, ReplyHeader, RequestFrame, RequestHeader,
@@ -215,57 +216,88 @@ class SDCardComponent(wiring.Component):
         m.submodules.host_decoder = host_decoder = gateware_cobs.Decoder(recover=True)
         wiring.connect(m, host_decoder.i, wiring.flipped(self.i_stream))
 
+        m.submodules.host_checksum = host_checksum = FrameChecksumVerifier(FRAME_CRC16)
+        wiring.connect(m, host_checksum.i, host_decoder.o)
+        host_decode_error = Signal()
+        m.d.sync += host_decode_error.eq(host_decoder.error)
+        m.d.comb += host_checksum.abort.eq(host_decode_error)
+
         host_to_sd = AsyncQueue(
-            shape=data.StructLayout({"data": 8, "end": 1}),
+            shape=data.StructLayout({"data": 8, "end": 1, "error": 1}),
             depth=1024, i_domain="sync", o_domain="sd")
         sd_to_host = AsyncQueue(
             shape=data.StructLayout({"data": 8, "end": 1}),
             depth=64, i_domain="sd", o_domain="sync")
         m.submodules.host_to_sd = host_to_sd
         m.submodules.sd_to_host = sd_to_host
-        wiring.connect(m, host_to_sd.i, host_decoder.o)
+        wiring.connect(m, host_to_sd.i, host_checksum.o)
 
+        m.submodules.event_checksum = event_checksum = FrameChecksumAppender(FRAME_CRC16)
+        wiring.connect(m, event_checksum.i, sd_to_host.o)
         m.submodules.host_encoder = host_encoder = gateware_cobs.Encoder(fifo_depth=1024)
-        wiring.connect(m, host_encoder.i, sd_to_host.o)
+        wiring.connect(m, host_encoder.i, event_checksum.o)
         wiring.connect(m, wiring.flipped(self.o_stream), host_encoder.o)
         m.d.sync += self.o_flush.eq(0)
         with m.If(self.o_stream.valid & self.o_stream.ready & (self.o_stream.payload == 0)):
             m.d.sync += self.o_flush.eq(1)
 
-        block_memory = memory.Memory(shape=8, depth=BLOCK_SIZE, init=[])
-        m.submodules.block_memory = block_memory
-        block_write = block_memory.write_port(domain="sd")
-        block_read = block_memory.read_port(domain="sd")
+        m.submodules.block_buffer = block_buffer = BlockBuffer()
 
         dat_i = Cat(*(buffer.i for buffer in dat_buffers))
-        dat_o = Signal(4, init=0xf)
-        dat_oe = Signal(4)
+        m.submodules.command_engine = command_engine = CommandEngine()
+        m.submodules.data_engine = data_engine = DataEngine()
+        m.submodules.host_engine = host_engine = HostBlockEngine()
+
+        wiring.connect(m, command_engine.control, data_engine.control)
+        wiring.connect(m, data_engine.storage, host_engine.storage)
+        wiring.connect(m, host_engine.buffer, block_buffer.host)
+        wiring.connect(m, data_engine.buffer, block_buffer.data)
+        wiring.connect(m, host_engine.i_stream, host_to_sd.o)
+        wiring.connect(m, sd_to_host.i, host_engine.o_stream)
+
+        m.d.comb += [
+            command_engine.cmd_i.eq(cmd_buffer.i),
+            cmd_buffer.o.eq(command_engine.cmd_o),
+            cmd_buffer.oe.eq(command_engine.cmd_oe),
+            command_engine.enabled.eq(enabled_sd),
+            command_engine.read_only.eq(self.read_only),
+            command_engine.image_size.eq(self.image_size),
+            command_engine.cid.eq(self.cid),
+            command_engine.csd.eq(self.csd),
+
+            data_engine.dat_i.eq(dat_i),
+            data_engine.scr.eq(self.scr),
+            data_engine.image_size.eq(self.image_size),
+
+            host_engine.generation.eq(self.generation),
+            host_engine.current_address.eq(command_engine.control.current_address),
+            host_engine.erase_start.eq(command_engine.control.erase_start),
+            host_engine.erase_end.eq(command_engine.control.erase_end),
+
+            self.last_command.eq(command_engine.last_command),
+            self.clock_count.eq(command_engine.clock_count),
+            self.command_low_count.eq(command_engine.command_low_count),
+            self.command_count.eq(command_engine.command_count),
+            self.read_count.eq(data_engine.read_count),
+            self.write_count.eq(data_engine.write_count),
+            self.protocol_errors.eq(
+                command_engine.protocol_errors + data_engine.protocol_errors +
+                host_engine.protocol_errors),
+            self.backend_errors.eq(host_engine.backend_errors),
+            self.stale_replies.eq(host_engine.stale_replies),
+        ]
+
         dat_o_latched = Signal(4, init=0xf)
         dat_oe_latched = Signal(4)
         m.d.sd_fall += [
-            dat_o_latched.eq(dat_o),
-            dat_oe_latched.eq(Mux(enabled_sd, dat_oe, 0)),
+            dat_o_latched.eq(data_engine.dat_o),
+            dat_oe_latched.eq(Mux(enabled_sd, data_engine.dat_oe, 0)),
         ]
         for index, buffer in enumerate(dat_buffers):
             m.d.comb += [
                 buffer.o.eq(dat_o_latched[index]),
                 buffer.oe.eq(dat_oe_latched[index]),
             ]
-
-        command_data = CommandDataSignature().create(path=("command_data",))
-        data_host = DataHostSignature().create(path=("data_host",))
-        elaborate_command_engine(m, self, cmd_buffer, enabled_sd, command_data)
-        elaborate_host_block_engine(
-            m, self, host_to_sd, sd_to_host, block_write, block_read,
-            wiring.flipped(data_host), wiring.flipped(command_data))
-        elaborate_data_transfer_engine(
-            m, self, block_write, block_read, dat_i, dat_o, dat_oe,
-            wiring.flipped(command_data), data_host)
-
-        # Disabling the applet always releases the shared card bus, even if it happens halfway
-        # through a transfer. The command engine clears its state on the following SD clock.
-        with m.If(~enabled_sd):
-            m.d.comb += dat_oe.eq(0)
 
         return m
 

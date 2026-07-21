@@ -1,8 +1,7 @@
 from amaranth.lib import wiring
 from amaranth.lib.wiring import In, Out
 
-from ._gateware_support import BLOCK_SIZE, CardState, DataMode
-from ._protocol import HostEvent
+from ._gateware_support import CardState, DataMode
 
 
 __all__ = ["CommandDataSignature", "DataHostSignature"]
@@ -52,11 +51,4 @@ class DataHostSignature(wiring.Signature):
             "host_ack_valid": In(1),
             "host_ack_status": In(8),
             "host_ack_consume": Out(1),
-
-            # Host ownership of the shared block-memory read port during write events.
-            "event_pending": In(1),
-            "event_kind": In(HostEvent, init=HostEvent.Read),
-            "event_count": In(range(BLOCK_SIZE + 1)),
-            "event_read_address": In(range(BLOCK_SIZE)),
-            "event_read_advance": Out(1),
         })
