@@ -1,14 +1,46 @@
 from amaranth import *
+from amaranth.lib import data, stream, wiring
+from amaranth.lib.wiring import In, Out
 
-from ._gateware_support import BLOCK_SIZE, crc16_byte_value, frame_header_bytes
+from ._buffer import BlockBufferPortSignature
+from ._gateware_support import BLOCK_SIZE, frame_header_bytes
+from ._interfaces import DataHostSignature
 from ._protocol import (
     FRAME_VERSION, HOST_EVENT_PAYLOAD_LENGTH, HOST_REPLY_PAYLOAD_LENGTH,
     REQUEST_SCHEMA, REPLY_SCHEMA, BackendStatus, HostEvent, HostReply,
 )
 
 
-def elaborate_host_block_engine(
-        m, component, host_to_sd, sd_to_host, block_write, block_read, storage, control):
+__all__ = ["HostBlockEngine"]
+
+
+class HostBlockEngine(wiring.Component):
+    i_stream: In(stream.Signature(data.StructLayout({"data": 8, "end": 1, "error": 1})))
+    o_stream: Out(stream.Signature(data.StructLayout({"data": 8, "end": 1})))
+
+    generation: In(16)
+    current_address: In(32)
+    erase_start: In(32)
+    erase_end: In(32)
+
+    storage: In(DataHostSignature())
+    buffer: Out(BlockBufferPortSignature())
+
+    protocol_errors: Out(16)
+    backend_errors: Out(16)
+    stale_replies: Out(16)
+
+    def elaborate(self, platform):
+        m = Module()
+        _elaborate_host_block_engine(
+            m, self, self.i_stream, self.o_stream, self.buffer, self.storage,
+            self.current_address, self.erase_start, self.erase_end)
+        return m
+
+
+def _elaborate_host_block_engine(
+        m, component, i_stream, o_stream, block_buffer, storage,
+        current_address, erase_start, erase_end):
     """Bridge block requests to framed, CRC-protected host messages.
 
     COBS encoding is applied outside this engine. The streams here contain decoded data tokens
@@ -17,9 +49,6 @@ def elaborate_host_block_engine(
     """
 
     self = component
-    current_address = control.current_address
-    erase_start = control.erase_start
-    erase_end = control.erase_end
     read_request = storage.read_request
     write_request = storage.write_request
     erase_request = storage.erase_request
@@ -49,12 +78,11 @@ def elaborate_host_block_engine(
     reply_length = Signal(16)
     reply_header_count = Signal(range(REPLY_SCHEMA.size))
     reply_count = Signal(range(BLOCK_SIZE + 1))
-    reply_crc = Signal(16)
-    reply_received_crc = Signal(16)
 
-    reply_data = host_to_sd.o.p.data
-    reply_end = host_to_sd.o.p.end
-    reply_fire = host_to_sd.o.valid & host_to_sd.o.ready
+    reply_data = i_stream.p.data
+    reply_end = i_stream.p.end
+    reply_error = i_stream.p.error
+    reply_fire = i_stream.valid & i_stream.ready
 
     m.d.sd += [
         read_reply_error.eq(0),
@@ -68,10 +96,10 @@ def elaborate_host_block_engine(
         m.d.sd += host_ack_valid.eq(0)
 
     m.d.comb += [
-        host_to_sd.o.ready.eq(0),
-        block_write.en.eq(0),
-        block_write.addr.eq(0),
-        block_write.data.eq(0),
+        i_stream.ready.eq(0),
+        block_buffer.write_en.eq(0),
+        block_buffer.write_address.eq(0),
+        block_buffer.write_data.eq(0),
     ]
 
     def discard_reply():
@@ -81,19 +109,17 @@ def elaborate_host_block_engine(
     def reject_ended_reply():
         m.d.sd += [
             self.protocol_errors.eq(self.protocol_errors + 1),
-            reply_crc.eq(0),
             reply_header_count.eq(0),
         ]
         m.next = "Header"
 
     with m.FSM(domain="sd", name="host_reply"):
         with m.State("Header"):
-            m.d.comb += host_to_sd.o.ready.eq(1)
+            m.d.comb += i_stream.ready.eq(1)
             with m.If(reply_fire):
                 with m.If(reply_end):
                     reject_ended_reply()
                 with m.Else():
-                    m.d.sd += reply_crc.eq(crc16_byte_value(reply_crc, reply_data))
                     reply_fields = {
                         "version": reply_version,
                         "opcode": reply_opcode,
@@ -117,7 +143,7 @@ def elaborate_host_block_engine(
                         with m.If(complete_length > BLOCK_SIZE):
                             discard_reply()
                         with m.Elif(complete_length == 0):
-                            m.next = "CRC-Low"
+                            m.next = "End"
                         with m.Else():
                             m.next = "Payload"
                     with m.Else():
@@ -125,53 +151,33 @@ def elaborate_host_block_engine(
 
         with m.State("Payload"):
             m.d.comb += [
-                host_to_sd.o.ready.eq(1),
-                block_write.en.eq(reply_fire & ~reply_end &
+                i_stream.ready.eq(1),
+                block_buffer.write_en.eq(reply_fire & ~reply_end &
                     (reply_opcode == HostReply.ReadData) &
                     (reply_status == BackendStatus.OK) &
                     (reply_length == BLOCK_SIZE) &
                     read_in_flight &
                     (reply_generation == self.generation) &
                     (reply_request == read_in_flight_request)),
-                block_write.addr.eq(reply_count),
-                block_write.data.eq(reply_data),
+                block_buffer.write_address.eq(reply_count),
+                block_buffer.write_data.eq(reply_data),
             ]
             with m.If(reply_fire):
                 with m.If(reply_end):
                     reject_ended_reply()
                 with m.Else():
-                    m.d.sd += reply_crc.eq(crc16_byte_value(reply_crc, reply_data))
                     with m.If(reply_count == reply_length - 1):
-                        m.next = "CRC-Low"
+                        m.next = "End"
                     with m.Else():
                         m.d.sd += reply_count.eq(reply_count + 1)
 
-        with m.State("CRC-Low"):
-            m.d.comb += host_to_sd.o.ready.eq(1)
-            with m.If(reply_fire):
-                with m.If(reply_end):
-                    reject_ended_reply()
-                with m.Else():
-                    m.d.sd += reply_received_crc[:8].eq(reply_data)
-                    m.next = "CRC-High"
-
-        with m.State("CRC-High"):
-            m.d.comb += host_to_sd.o.ready.eq(1)
-            with m.If(reply_fire):
-                with m.If(reply_end):
-                    reject_ended_reply()
-                with m.Else():
-                    m.d.sd += reply_received_crc[8:].eq(reply_data)
-                    m.next = "End"
-
         with m.State("End"):
-            m.d.comb += host_to_sd.o.ready.eq(1)
+            m.d.comb += i_stream.ready.eq(1)
             with m.If(reply_fire):
                 with m.If(~reply_end):
                     discard_reply()
                 with m.Else():
-                    crc_matches = reply_received_crc == reply_crc
-                    common_valid = (reply_version == FRAME_VERSION) & crc_matches
+                    common_valid = (reply_version == FRAME_VERSION) & ~reply_error
                     with m.If(~common_valid):
                         m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
                     with m.Elif(reply_opcode == HostReply.ReadData):
@@ -215,16 +221,14 @@ def elaborate_host_block_engine(
                     with m.Else():
                         m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
                     m.d.sd += [
-                        reply_crc.eq(0),
                         reply_header_count.eq(0),
                     ]
                     m.next = "Header"
 
         with m.State("Discard"):
-            m.d.comb += host_to_sd.o.ready.eq(1)
+            m.d.comb += i_stream.ready.eq(1)
             with m.If(reply_fire & reply_end):
                 m.d.sd += [
-                    reply_crc.eq(0),
                     reply_header_count.eq(0),
                 ]
                 m.next = "Header"
@@ -232,12 +236,11 @@ def elaborate_host_block_engine(
     event_address = Signal(32)
     event_request = Signal(16)
     next_request = Signal(16, init=1)
-    event_count = storage.event_count
-    event_read_address = storage.event_read_address
-    event_read_advance = storage.event_read_advance
-    event_kind = storage.event_kind
-    event_pending = storage.event_pending
-    event_crc = Signal(16)
+    event_count = Signal(range(BLOCK_SIZE + 1))
+    event_read_address = Signal(range(BLOCK_SIZE))
+    event_read_advance = Signal()
+    event_kind = Signal(HostEvent, init=HostEvent.Read)
+    event_pending = Signal()
 
     with m.If(read_request & ~event_pending & ~read_in_flight):
         m.d.sd += [
@@ -289,32 +292,31 @@ def elaborate_host_block_engine(
     }))
 
     m.d.comb += [
-        sd_to_host.i.valid.eq(0),
-        sd_to_host.i.p.data.eq(0),
-        sd_to_host.i.p.end.eq(0),
+        o_stream.valid.eq(0),
+        o_stream.p.data.eq(0),
+        o_stream.p.end.eq(0),
         event_read_advance.eq(0),
+        block_buffer.read_active.eq(event_pending & (event_kind == HostEvent.Write)),
+        block_buffer.read_address.eq(
+            Mux(event_read_advance, event_count + 1, event_read_address)),
     ]
-    event_fire = sd_to_host.i.valid & sd_to_host.i.ready
+    event_fire = o_stream.valid & o_stream.ready
 
     def send_event_byte(value):
         m.d.comb += [
-            sd_to_host.i.valid.eq(1),
-            sd_to_host.i.p.data.eq(value),
+            o_stream.valid.eq(1),
+            o_stream.p.data.eq(value),
         ]
-
-    def advance_event_crc(value):
-        m.d.sd += event_crc.eq(crc16_byte_value(event_crc, value))
 
     with m.FSM(domain="sd", name="host_event"):
         with m.State("Idle"):
             with m.If(event_pending):
-                m.d.sd += [event_count.eq(0), event_crc.eq(0)]
+                m.d.sd += event_count.eq(0)
                 m.next = "Header"
 
         with m.State("Header"):
             send_event_byte(event_header[event_count])
             with m.If(event_fire):
-                advance_event_crc(event_header[event_count])
                 with m.If(event_count == REQUEST_SCHEMA.size - 1):
                     m.d.sd += event_count.eq(0)
                     m.next = "Address"
@@ -324,12 +326,11 @@ def elaborate_host_block_engine(
         with m.State("Address"):
             send_event_byte(event_address.word_select(event_count, 8))
             with m.If(event_fire):
-                advance_event_crc(event_address.word_select(event_count, 8))
                 with m.If(event_count == 3):
                     m.d.sd += event_count.eq(0)
                     with m.Switch(event_kind):
                         with m.Case(HostEvent.Read):
-                            m.next = "CRC-Low"
+                            m.next = "End"
                         with m.Case(HostEvent.Write):
                             m.d.sd += event_read_address.eq(0)
                             m.next = "Write-Prefetch"
@@ -342,11 +343,10 @@ def elaborate_host_block_engine(
             m.next = "Write-Data"
 
         with m.State("Write-Data"):
-            send_event_byte(block_read.data)
+            send_event_byte(block_buffer.read_data)
             with m.If(event_fire):
-                advance_event_crc(block_read.data)
                 with m.If(event_count == BLOCK_SIZE - 1):
-                    m.next = "CRC-Low"
+                    m.next = "End"
                 with m.Else():
                     m.d.comb += event_read_advance.eq(1)
                     m.d.sd += [
@@ -357,26 +357,15 @@ def elaborate_host_block_engine(
         with m.State("Erase-End"):
             send_event_byte(erase_end.word_select(event_count, 8))
             with m.If(event_fire):
-                advance_event_crc(erase_end.word_select(event_count, 8))
                 with m.If(event_count == 3):
-                    m.next = "CRC-Low"
+                    m.next = "End"
                 with m.Else():
                     m.d.sd += event_count.eq(event_count + 1)
 
-        with m.State("CRC-Low"):
-            send_event_byte(event_crc[:8])
-            with m.If(event_fire):
-                m.next = "CRC-High"
-
-        with m.State("CRC-High"):
-            send_event_byte(event_crc[8:])
-            with m.If(event_fire):
-                m.next = "End"
-
         with m.State("End"):
             m.d.comb += [
-                sd_to_host.i.valid.eq(1),
-                sd_to_host.i.p.end.eq(1),
+                o_stream.valid.eq(1),
+                o_stream.p.end.eq(1),
             ]
             with m.If(event_fire):
                 m.d.sd += event_pending.eq(0)
