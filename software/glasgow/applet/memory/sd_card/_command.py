@@ -4,14 +4,14 @@ from ._gateware_support import CardState, DataMode, BLOCK_SIZE, RCA, crc7_value 
 from ._response import ResponseEngine
 
 
-def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
+def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, control):
     self = component
-    card_state = core.card_state
-    data_mode = core.data_mode
-    bus_width_4 = core.bus_width_4
-    current_address = core.current_address
-    erase_start = core.erase_start
-    erase_end = core.erase_end
+    card_state = control.card_state
+    data_mode = control.data_mode
+    bus_width_4 = control.bus_width_4
+    current_address = control.current_address
+    erase_start = control.erase_start
+    erase_end = control.erase_end
     erase_start_valid = Signal()
     erase_end_valid = Signal()
     app_command = Signal()
@@ -53,14 +53,17 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
     def load_r6(status):
         response.load_r6(m, status)
 
-    erase_request = core.erase_request
-    stop_requested = core.stop_requested
-    request_sent = core.request_sent
+    stop_requested = control.stop_requested
 
     response.elaborate(m)
-    m.d.comb += core.response_active.eq(response_active)
-    with m.If(core.erase_request_accepted):
-        m.d.sd += erase_request.eq(0)
+    m.d.comb += control.response_active.eq(response_active)
+
+    with m.If(control.state_update_valid):
+        m.d.sd += card_state.eq(control.state_update)
+    with m.If(control.mode_update_valid):
+        m.d.sd += data_mode.eq(control.mode_update)
+    with m.If(control.address_update_valid):
+        m.d.sd += current_address.eq(control.address_update)
 
     with m.If(~enabled_sd):
         m.d.sd += [
@@ -70,7 +73,6 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
             card_state.eq(CardState.Idle),
             data_mode.eq(DataMode.Idle),
             app_command.eq(0),
-            erase_request.eq(0),
         ]
     with m.Elif(~response_active):
         with m.If(cmd_bits == 0):
@@ -211,15 +213,9 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
                                     m.d.sd += current_address.eq(cmd_argument)
                                     with m.Switch(cmd_index):
                                         with m.Case(17):
-                                            m.d.sd += [
-                                                data_mode.eq(DataMode.ReadSingle),
-                                                request_sent.eq(0),
-                                            ]
+                                            m.d.sd += data_mode.eq(DataMode.ReadSingle)
                                         with m.Case(18):
-                                            m.d.sd += [
-                                                data_mode.eq(DataMode.ReadMulti),
-                                                request_sent.eq(0),
-                                            ]
+                                            m.d.sd += data_mode.eq(DataMode.ReadMulti)
                                         with m.Case(24):
                                             m.d.sd += data_mode.eq(DataMode.WriteSingle)
                                         with m.Case(25):
@@ -264,7 +260,6 @@ def elaborate_command_engine(m, component, cmd_buffer, enabled_sd, core):
                                     m.d.sd += [
                                         data_mode.eq(DataMode.Erase),
                                         card_state.eq(CardState.Prg),
-                                        erase_request.eq(1),
                                         erase_start_valid.eq(0),
                                         erase_end_valid.eq(0),
                                     ]

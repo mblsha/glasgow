@@ -1,13 +1,14 @@
 from amaranth import *
 
-from ._gateware_support import BLOCK_SIZE, crc16_byte_value
+from ._gateware_support import BLOCK_SIZE, crc16_byte_value, frame_header_bytes
 from ._protocol import (
-    FRAME_VERSION, BackendStatus, HostEvent, HostReply, ReplyHeader, RequestHeader,
+    FRAME_VERSION, HOST_EVENT_PAYLOAD_LENGTH, HOST_REPLY_PAYLOAD_LENGTH,
+    REQUEST_SCHEMA, REPLY_SCHEMA, BackendStatus, HostEvent, HostReply,
 )
 
 
 def elaborate_host_block_engine(
-        m, component, host_to_sd, sd_to_host, block_write, block_read, core):
+        m, component, host_to_sd, sd_to_host, block_write, block_read, storage, control):
     """Bridge block requests to framed, CRC-protected host messages.
 
     COBS encoding is applied outside this engine. The streams here contain decoded data tokens
@@ -16,26 +17,26 @@ def elaborate_host_block_engine(
     """
 
     self = component
-    current_address = core.current_address
-    erase_start = core.erase_start
-    erase_end = core.erase_end
-    read_request = core.read_request
-    write_request = core.write_request
-    erase_request = core.erase_request
+    current_address = control.current_address
+    erase_start = control.erase_start
+    erase_end = control.erase_end
+    read_request = storage.read_request
+    write_request = storage.write_request
+    erase_request = storage.erase_request
 
     # Host replies carry both a session generation and a request ID. This permits the SD clock
     # domains and USB pipes to be reset independently without ever accepting a reply left over
     # from the previous target-power cycle.
-    read_buffer_ready = core.read_buffer_ready
-    read_buffer_address = core.read_buffer_address
-    read_buffer_consume = core.read_buffer_consume
+    read_buffer_ready = storage.read_buffer_ready
+    read_buffer_address = storage.read_buffer_address
+    read_buffer_consume = storage.read_buffer_consume
     read_in_flight = Signal()
     read_in_flight_address = Signal(32)
     read_in_flight_request = Signal(16)
-    read_reply_error = core.read_reply_error
-    host_ack_valid = core.host_ack_valid
-    host_ack_status = core.host_ack_status
-    host_ack_consume = core.host_ack_consume
+    read_reply_error = storage.read_reply_error
+    host_ack_valid = storage.host_ack_valid
+    host_ack_status = storage.host_ack_status
+    host_ack_consume = storage.host_ack_consume
     ack_in_flight = Signal()
     ack_in_flight_opcode = Signal(8)
     ack_in_flight_request = Signal(16)
@@ -46,7 +47,7 @@ def elaborate_host_block_engine(
     reply_request = Signal(16)
     reply_status = Signal(8)
     reply_length = Signal(16)
-    reply_header_count = Signal(range(ReplyHeader.size))
+    reply_header_count = Signal(range(REPLY_SCHEMA.size))
     reply_count = Signal(range(BLOCK_SIZE + 1))
     reply_crc = Signal(16)
     reply_received_crc = Signal(16)
@@ -57,9 +58,9 @@ def elaborate_host_block_engine(
 
     m.d.sd += [
         read_reply_error.eq(0),
-        core.read_request_accepted.eq(0),
-        core.write_request_accepted.eq(0),
-        core.erase_request_accepted.eq(0),
+        storage.read_request_accepted.eq(0),
+        storage.write_request_accepted.eq(0),
+        storage.erase_request_accepted.eq(0),
     ]
     with m.If(read_buffer_consume):
         m.d.sd += read_buffer_ready.eq(0)
@@ -93,27 +94,21 @@ def elaborate_host_block_engine(
                     reject_ended_reply()
                 with m.Else():
                     m.d.sd += reply_crc.eq(crc16_byte_value(reply_crc, reply_data))
+                    reply_fields = {
+                        "version": reply_version,
+                        "opcode": reply_opcode,
+                        "generation": reply_generation,
+                        "request_id": reply_request,
+                        "status": reply_status,
+                        "payload_length": reply_length,
+                    }
                     with m.Switch(reply_header_count):
-                        with m.Case(0):
-                            m.d.sd += reply_version.eq(reply_data)
-                        with m.Case(1):
-                            m.d.sd += reply_opcode.eq(reply_data)
-                        with m.Case(2):
-                            m.d.sd += reply_generation[:8].eq(reply_data)
-                        with m.Case(3):
-                            m.d.sd += reply_generation[8:].eq(reply_data)
-                        with m.Case(4):
-                            m.d.sd += reply_request[:8].eq(reply_data)
-                        with m.Case(5):
-                            m.d.sd += reply_request[8:].eq(reply_data)
-                        with m.Case(6):
-                            m.d.sd += reply_status.eq(reply_data)
-                        with m.Case(7):
-                            m.d.sd += reply_length[:8].eq(reply_data)
-                        with m.Case(8):
-                            m.d.sd += reply_length[8:].eq(reply_data)
+                        for offset, (field, byte_index) in enumerate(REPLY_SCHEMA.byte_fields):
+                            with m.Case(offset):
+                                m.d.sd += reply_fields[field.name].word_select(
+                                    byte_index, 8).eq(reply_data)
 
-                    with m.If(reply_header_count == ReplyHeader.size - 1):
+                    with m.If(reply_header_count == REPLY_SCHEMA.size - 1):
                         complete_length = Cat(reply_length[:8], reply_data)
                         m.d.sd += [
                             reply_header_count.eq(0),
@@ -183,7 +178,7 @@ def elaborate_host_block_engine(
                         read_matches = read_in_flight & \
                             (reply_generation == self.generation) & \
                             (reply_request == read_in_flight_request)
-                        with m.If(reply_length != BLOCK_SIZE):
+                        with m.If(reply_length != HOST_REPLY_PAYLOAD_LENGTH[HostReply.ReadData]):
                             m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
                         with m.Elif(read_matches):
                             m.d.sd += read_in_flight.eq(0)
@@ -237,11 +232,11 @@ def elaborate_host_block_engine(
     event_address = Signal(32)
     event_request = Signal(16)
     next_request = Signal(16, init=1)
-    event_count = core.event_count
-    event_read_address = core.event_read_address
-    event_read_advance = core.event_read_advance
-    event_kind = core.event_kind
-    event_pending = core.event_pending
+    event_count = storage.event_count
+    event_read_address = storage.event_read_address
+    event_read_advance = storage.event_read_advance
+    event_kind = storage.event_kind
+    event_pending = storage.event_pending
     event_crc = Signal(16)
 
     with m.If(read_request & ~event_pending & ~read_in_flight):
@@ -253,7 +248,7 @@ def elaborate_host_block_engine(
             read_in_flight_address.eq(current_address),
             read_in_flight_request.eq(next_request),
             event_pending.eq(1),
-            core.read_request_accepted.eq(1),
+            storage.read_request_accepted.eq(1),
         ]
     with m.Elif(write_request & ~event_pending & ~ack_in_flight):
         m.d.sd += [
@@ -265,7 +260,7 @@ def elaborate_host_block_engine(
             ack_in_flight_opcode.eq(HostReply.WriteAck),
             ack_in_flight_request.eq(next_request),
             event_pending.eq(1),
-            core.write_request_accepted.eq(1),
+            storage.write_request_accepted.eq(1),
         ]
     with m.Elif(erase_request & ~event_pending & ~ack_in_flight):
         m.d.sd += [
@@ -277,25 +272,21 @@ def elaborate_host_block_engine(
             ack_in_flight_opcode.eq(HostReply.EraseAck),
             ack_in_flight_request.eq(next_request),
             event_pending.eq(1),
-            core.erase_request_accepted.eq(1),
+            storage.erase_request_accepted.eq(1),
         ]
 
     event_payload_length = Signal(16)
     with m.Switch(event_kind):
-        with m.Case(HostEvent.Read):
-            m.d.comb += event_payload_length.eq(4)
-        with m.Case(HostEvent.Write):
-            m.d.comb += event_payload_length.eq(4 + BLOCK_SIZE)
-        with m.Case(HostEvent.Erase):
-            m.d.comb += event_payload_length.eq(8)
+        for opcode, payload_length in HOST_EVENT_PAYLOAD_LENGTH.items():
+            with m.Case(opcode):
+                m.d.comb += event_payload_length.eq(payload_length)
 
-    event_header = Array([
-        Const(FRAME_VERSION, 8),
-        Cat(event_kind, C(0, 8 - len(event_kind))),
-        self.generation[:8], self.generation[8:],
-        event_request[:8], event_request[8:],
-        event_payload_length[:8], event_payload_length[8:],
-    ])
+    event_header = Array(frame_header_bytes(REQUEST_SCHEMA, {
+        "opcode": Cat(event_kind, C(0, 8 - len(event_kind))),
+        "generation": self.generation,
+        "request_id": event_request,
+        "payload_length": event_payload_length,
+    }))
 
     m.d.comb += [
         sd_to_host.i.valid.eq(0),
@@ -324,7 +315,7 @@ def elaborate_host_block_engine(
             send_event_byte(event_header[event_count])
             with m.If(event_fire):
                 advance_event_crc(event_header[event_count])
-                with m.If(event_count == RequestHeader.size - 1):
+                with m.If(event_count == REQUEST_SCHEMA.size - 1):
                     m.d.sd += event_count.eq(0)
                     m.next = "Address"
                 with m.Else():

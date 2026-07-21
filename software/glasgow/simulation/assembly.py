@@ -29,6 +29,11 @@ class SimulationPipe(AbstractInOutPipe):
     def readable(self) -> int | None:
         return len(self._i_buffer)
 
+    def contains(self, delimiter: bytes) -> bool:
+        """Return whether received simulation data contains *delimiter* without consuming it."""
+        assert self._i_buffer is not None, "contains() called on an out pipe"
+        return delimiter in self._i_buffer
+
     async def recv(self, length) -> memoryview:
         assert self._i_buffer is not None, "recv() called on an out pipe"
         while len(self._i_buffer) < length:

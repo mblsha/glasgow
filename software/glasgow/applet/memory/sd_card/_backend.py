@@ -4,13 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import os
 
-from ._protocol import BackendStatus
+from ._protocol import BLOCK_SIZE, BackendStatus
 
 
 __all__ = ["BlockBackend", "BackendError", "BackendWorker", "FileBlockBackend"]
-
-
-BLOCK_SIZE = 512
 
 
 class BackendError(Exception):
@@ -79,13 +76,7 @@ class BackendWorker:
         async with self._slots:
             if self._closed or (self._closing and not _allow_closing):
                 raise RuntimeError("backend worker is closed")
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # Amaranth's coroutine simulator implements async/await without an asyncio event
-                # loop. Keep its deterministic test backend inline; real applet execution always
-                # has a running loop and therefore uses the dedicated worker.
-                return function(*args)
+            loop = asyncio.get_running_loop()
             future = loop.run_in_executor(self._executor, partial(function, *args))
             try:
                 return await asyncio.shield(future)

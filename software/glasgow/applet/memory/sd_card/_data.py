@@ -5,35 +5,59 @@ from ._protocol import BackendStatus, HostEvent
 
 
 def elaborate_data_transfer_engine(
-        m, component, block_write, block_read, dat_i, dat_o, dat_oe, core):
+        m, component, block_write, block_read, dat_i, dat_o, dat_oe, control, storage):
     self = component
-    card_state = core.card_state
-    data_mode = core.data_mode
-    bus_width_4 = core.bus_width_4
-    current_address = core.current_address
-    response_active = core.response_active
-    read_request = core.read_request
-    write_request = core.write_request
-    stop_requested = core.stop_requested
-    request_sent = core.request_sent
-    read_buffer_ready = core.read_buffer_ready
-    read_buffer_address = core.read_buffer_address
-    read_buffer_consume = core.read_buffer_consume
-    read_reply_error = core.read_reply_error
-    host_ack_valid = core.host_ack_valid
-    host_ack_status = core.host_ack_status
-    host_ack_consume = core.host_ack_consume
-    event_pending = core.event_pending
-    event_kind = core.event_kind
-    event_count = core.event_count
-    event_read_address = core.event_read_address
-    event_read_advance = core.event_read_advance
-    with m.If(core.read_request_accepted | stop_requested |
+    data_mode = control.data_mode
+    bus_width_4 = control.bus_width_4
+    current_address = control.current_address
+    response_active = control.response_active
+    stop_requested = control.stop_requested
+    read_request = storage.read_request
+    write_request = storage.write_request
+    erase_request = storage.erase_request
+    request_sent = Signal()
+    read_buffer_ready = storage.read_buffer_ready
+    read_buffer_address = storage.read_buffer_address
+    read_buffer_consume = storage.read_buffer_consume
+    read_reply_error = storage.read_reply_error
+    host_ack_valid = storage.host_ack_valid
+    host_ack_status = storage.host_ack_status
+    host_ack_consume = storage.host_ack_consume
+    event_pending = storage.event_pending
+    event_kind = storage.event_kind
+    event_count = storage.event_count
+    event_read_address = storage.event_read_address
+    event_read_advance = storage.event_read_advance
+
+    m.d.comb += [
+        control.state_update_valid.eq(0),
+        control.state_update.eq(CardState.Idle),
+        control.mode_update_valid.eq(0),
+        control.mode_update.eq(DataMode.Idle),
+        control.address_update_valid.eq(0),
+        control.address_update.eq(0),
+    ]
+
+    def update_state(value):
+        m.d.comb += [control.state_update_valid.eq(1), control.state_update.eq(value)]
+
+    def update_mode(value):
+        m.d.comb += [control.mode_update_valid.eq(1), control.mode_update.eq(value)]
+
+    def update_address(value):
+        m.d.comb += [
+            control.address_update_valid.eq(1),
+            control.address_update.eq(value),
+        ]
+
+    with m.If(storage.read_request_accepted | stop_requested |
               (data_mode == DataMode.Idle)):
         m.d.sd += read_request.eq(0)
-    with m.If(core.write_request_accepted | stop_requested |
+    with m.If(storage.write_request_accepted | stop_requested |
               (data_mode == DataMode.Idle)):
         m.d.sd += write_request.eq(0)
+    with m.If(storage.erase_request_accepted):
+        m.d.sd += erase_request.eq(0)
     # Data transfer engine. It never depends on a full image being resident on the FPGA: one
     # block is refilled or drained for each SD data packet.
     data_byte = Signal(range(BLOCK_SIZE))
@@ -68,10 +92,10 @@ def elaborate_data_transfer_engine(
             with m.If(read_reply_error):
                 m.d.sd += [
                     request_sent.eq(0),
-                    data_mode.eq(DataMode.Idle),
-                    card_state.eq(CardState.Tran),
                     self.protocol_errors.eq(self.protocol_errors + 1),
                 ]
+                update_mode(DataMode.Idle)
+                update_state(CardState.Tran)
             with m.Else():
                 with m.Switch(data_mode):
                     with m.Case(DataMode.ReadSingle, DataMode.ReadMulti):
@@ -104,6 +128,7 @@ def elaborate_data_transfer_engine(
                             m.next = "Write-Wait-Start"
                     with m.Case(DataMode.Erase):
                         with m.If(~response_active):
+                            m.d.sd += erase_request.eq(1)
                             m.next = "Busy"
                     with m.Default():
                         m.d.sd += request_sent.eq(0)
@@ -176,21 +201,15 @@ def elaborate_data_transfer_engine(
             m.d.sd += self.read_count.eq(self.read_count + 1)
             with m.If(data_mode == DataMode.ReadMulti):
                 with m.If(current_address <= self.image_size - (2 * BLOCK_SIZE)):
-                    m.d.sd += [
-                        current_address.eq(current_address + BLOCK_SIZE),
-                        request_sent.eq(0),
-                    ]
+                    m.d.sd += request_sent.eq(0)
+                    update_address(current_address + BLOCK_SIZE)
                 with m.Else():
-                    m.d.sd += [
-                        data_mode.eq(DataMode.Idle),
-                        card_state.eq(CardState.Tran),
-                        self.protocol_errors.eq(self.protocol_errors + 1),
-                    ]
+                    m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
+                    update_mode(DataMode.Idle)
+                    update_state(CardState.Tran)
             with m.Else():
-                m.d.sd += [
-                    data_mode.eq(DataMode.Idle),
-                    card_state.eq(CardState.Tran),
-                ]
+                update_mode(DataMode.Idle)
+                update_state(CardState.Tran)
             m.next = "Idle"
 
         with m.State("Write-Wait-Start"):
@@ -291,16 +310,12 @@ def elaborate_data_transfer_engine(
             with m.If(data_response_bits == 1):
                 m.d.sd += data_response_bits.eq(0)
                 with m.If(write_accepted):
-                    m.d.sd += [
-                        write_request.eq(1),
-                        card_state.eq(CardState.Prg),
-                    ]
+                    m.d.sd += write_request.eq(1)
+                    update_state(CardState.Prg)
                     m.next = "Busy"
                 with m.Else():
-                    m.d.sd += [
-                        data_mode.eq(DataMode.Idle),
-                        card_state.eq(CardState.Tran),
-                    ]
+                    update_mode(DataMode.Idle)
+                    update_state(CardState.Tran)
                     m.next = "Idle"
             with m.Else():
                 m.d.sd += data_response_bits.eq(data_response_bits - 1)
@@ -313,17 +328,13 @@ def elaborate_data_transfer_engine(
                           (data_mode == DataMode.WriteMulti)):
                     m.d.sd += self.write_count.eq(self.write_count + 1)
                     with m.If(current_address <= self.image_size - (2 * BLOCK_SIZE)):
-                        m.d.sd += [
-                            current_address.eq(current_address + BLOCK_SIZE),
-                            card_state.eq(CardState.Rcv),
-                        ]
+                        update_address(current_address + BLOCK_SIZE)
+                        update_state(CardState.Rcv)
                         m.next = "Write-Wait-Start"
                     with m.Else():
-                        m.d.sd += [
-                            data_mode.eq(DataMode.Idle),
-                            card_state.eq(CardState.Tran),
-                            self.protocol_errors.eq(self.protocol_errors + 1),
-                        ]
+                        m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
+                        update_mode(DataMode.Idle)
+                        update_state(CardState.Tran)
                         m.next = "Idle"
                 with m.Else():
                     with m.If((host_ack_status == 0) &
@@ -331,8 +342,6 @@ def elaborate_data_transfer_engine(
                         m.d.sd += self.write_count.eq(self.write_count + 1)
                     with m.If(host_ack_status != 0):
                         m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
-                    m.d.sd += [
-                        data_mode.eq(DataMode.Idle),
-                        card_state.eq(CardState.Tran),
-                    ]
+                    update_mode(DataMode.Idle)
+                    update_state(CardState.Tran)
                     m.next = "Idle"

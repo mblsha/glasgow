@@ -13,7 +13,7 @@ class TargetPowerLifecycle:
     """
 
     def __init__(self, logger, *, sample_voltage, is_active, suspend, resume,
-            before_suspend=None, off_threshold=1.0, on_threshold=1.8,
+            after_suspend=None, off_threshold=1.0, on_threshold=1.8,
             interval=0.25, debounce_samples=3, description="target power"):
         if not 0 <= off_threshold < on_threshold:
             raise ValueError("power thresholds must satisfy 0 <= off < on")
@@ -25,7 +25,7 @@ class TargetPowerLifecycle:
         self._is_active = is_active
         self._suspend = suspend
         self._resume = resume
-        self._before_suspend = before_suspend
+        self._after_suspend = after_suspend
         self._off_threshold = off_threshold
         self._on_threshold = on_threshold
         self._interval = interval
@@ -51,9 +51,9 @@ class TargetPowerLifecycle:
                 below_count = below_count + 1 if voltage < self._off_threshold else 0
                 above_count = 0
                 if below_count >= self._debounce_samples:
-                    if self._before_suspend is not None:
-                        await self._before_suspend()
                     await self._suspend(voltage)
+                    if self._after_suspend is not None:
+                        await self._after_suspend()
                     below_count = 0
             else:
                 above_count = above_count + 1 if voltage > self._on_threshold else 0

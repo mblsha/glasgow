@@ -1,23 +1,19 @@
 from amaranth.lib import wiring
-from amaranth.lib.wiring import Out
+from amaranth.lib.wiring import In, Out
 
 from ._gateware_support import BLOCK_SIZE, CardState, DataMode
 from ._protocol import HostEvent
 
 
-__all__ = ["SDCardEngineSignature"]
+__all__ = ["CommandDataSignature", "DataHostSignature"]
 
 
-class SDCardEngineSignature(wiring.Signature):
-    """Typed channels shared by the command, data, and host block engines.
-
-    Request channels use ``*_request``/``*_accepted`` handshakes. Result channels use
-    ``*_valid``/``*_consume`` handshakes. Keeping these signals in a real Amaranth interface
-    prevents engines from dynamically adding ad-hoc attributes during elaboration.
-    """
+class CommandDataSignature(wiring.Signature):
+    """Control/status channel, oriented from the command engine toward the data engine."""
 
     def __init__(self):
         super().__init__({
+            # Command-owned transfer state consumed by the data engine.
             "card_state": Out(CardState, init=CardState.Idle),
             "data_mode": Out(DataMode, init=DataMode.Idle),
             "bus_width_4": Out(1),
@@ -25,27 +21,42 @@ class SDCardEngineSignature(wiring.Signature):
             "erase_start": Out(32),
             "erase_end": Out(32),
             "response_active": Out(1),
-
-            "read_request": Out(1),
-            "read_request_accepted": Out(1),
-            "write_request": Out(1),
-            "write_request_accepted": Out(1),
-            "erase_request": Out(1),
-            "erase_request_accepted": Out(1),
             "stop_requested": Out(1),
-            "request_sent": Out(1),
 
-            "read_buffer_ready": Out(1),
-            "read_buffer_address": Out(32),
+            # Data-engine state transitions captured by the command engine.
+            "state_update_valid": In(1),
+            "state_update": In(CardState),
+            "mode_update_valid": In(1),
+            "mode_update": In(DataMode),
+            "address_update_valid": In(1),
+            "address_update": In(32),
+        })
+
+
+class DataHostSignature(wiring.Signature):
+    """Block request/result channel, oriented from the data engine toward the host engine."""
+
+    def __init__(self):
+        super().__init__({
+            "read_request": Out(1),
+            "read_request_accepted": In(1),
+            "write_request": Out(1),
+            "write_request_accepted": In(1),
+            "erase_request": Out(1),
+            "erase_request_accepted": In(1),
+
+            "read_buffer_ready": In(1),
+            "read_buffer_address": In(32),
             "read_buffer_consume": Out(1),
-            "read_reply_error": Out(1),
-            "host_ack_valid": Out(1),
-            "host_ack_status": Out(8),
+            "read_reply_error": In(1),
+            "host_ack_valid": In(1),
+            "host_ack_status": In(8),
             "host_ack_consume": Out(1),
 
-            "event_pending": Out(1),
-            "event_kind": Out(HostEvent, init=HostEvent.Read),
-            "event_count": Out(range(BLOCK_SIZE + 1)),
-            "event_read_address": Out(range(BLOCK_SIZE)),
+            # Host ownership of the shared block-memory read port during write events.
+            "event_pending": In(1),
+            "event_kind": In(HostEvent, init=HostEvent.Read),
+            "event_count": In(range(BLOCK_SIZE + 1)),
+            "event_read_address": In(range(BLOCK_SIZE)),
             "event_read_advance": Out(1),
         })
