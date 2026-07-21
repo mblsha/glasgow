@@ -3,15 +3,19 @@ from amaranth.lib import data, stream, wiring
 from amaranth.lib.wiring import In, Out
 
 from ._buffer import BlockBufferPortSignature
-from ._gateware_support import BLOCK_SIZE, frame_header_bytes
+from ._gateware_support import BLOCK_SIZE, GatewareFrameSchema
 from ._interfaces import DataHostSignature
 from ._protocol import (
-    FRAME_VERSION, HOST_EVENT_PAYLOAD_LENGTH, HOST_REPLY_PAYLOAD_LENGTH,
+    HOST_EVENT_PAYLOAD_LENGTH, HOST_REPLY_PAYLOAD_LENGTH,
     REQUEST_SCHEMA, REPLY_SCHEMA, BackendStatus, HostEvent, HostReply,
 )
 
 
 __all__ = ["HostBlockEngine"]
+
+
+REQUEST_GATEWARE_SCHEMA = GatewareFrameSchema(REQUEST_SCHEMA)
+REPLY_GATEWARE_SCHEMA = GatewareFrameSchema(REPLY_SCHEMA)
 
 
 class HostBlockEngine(wiring.Component):
@@ -70,12 +74,7 @@ def _elaborate_host_block_engine(
     ack_in_flight_opcode = Signal(8)
     ack_in_flight_request = Signal(16)
 
-    reply_version = Signal(8)
-    reply_opcode = Signal(8)
-    reply_generation = Signal(16)
-    reply_request = Signal(16)
-    reply_status = Signal(8)
-    reply_length = Signal(16)
+    reply_header = Signal(REPLY_GATEWARE_SCHEMA.layout)
     reply_header_count = Signal(range(REPLY_SCHEMA.size))
     reply_count = Signal(range(BLOCK_SIZE + 1))
 
@@ -120,45 +119,36 @@ def _elaborate_host_block_engine(
                 with m.If(reply_end):
                     reject_ended_reply()
                 with m.Else():
-                    reply_fields = {
-                        "version": reply_version,
-                        "opcode": reply_opcode,
-                        "generation": reply_generation,
-                        "request_id": reply_request,
-                        "status": reply_status,
-                        "payload_length": reply_length,
-                    }
-                    with m.Switch(reply_header_count):
-                        for offset, (field, byte_index) in enumerate(REPLY_SCHEMA.byte_fields):
-                            with m.Case(offset):
-                                m.d.sd += reply_fields[field.name].word_select(
-                                    byte_index, 8).eq(reply_data)
+                    REPLY_GATEWARE_SCHEMA.load_byte(
+                        m, reply_header, reply_header_count, reply_data, domain="sd")
 
                     with m.If(reply_header_count == REPLY_SCHEMA.size - 1):
-                        complete_length = Cat(reply_length[:8], reply_data)
                         m.d.sd += [
                             reply_header_count.eq(0),
                             reply_count.eq(0),
                         ]
-                        with m.If(complete_length > BLOCK_SIZE):
-                            discard_reply()
-                        with m.Elif(complete_length == 0):
-                            m.next = "End"
-                        with m.Else():
-                            m.next = "Payload"
+                        m.next = "Header-Complete"
                     with m.Else():
                         m.d.sd += reply_header_count.eq(reply_header_count + 1)
+
+        with m.State("Header-Complete"):
+            with m.If(reply_header.payload_length > BLOCK_SIZE):
+                discard_reply()
+            with m.Elif(reply_header.payload_length == 0):
+                m.next = "End"
+            with m.Else():
+                m.next = "Payload"
 
         with m.State("Payload"):
             m.d.comb += [
                 i_stream.ready.eq(1),
                 block_buffer.write_en.eq(reply_fire & ~reply_end &
-                    (reply_opcode == HostReply.ReadData) &
-                    (reply_status == BackendStatus.OK) &
-                    (reply_length == BLOCK_SIZE) &
+                    (reply_header.opcode == HostReply.ReadData) &
+                    (reply_header.status == BackendStatus.OK) &
+                    (reply_header.payload_length == BLOCK_SIZE) &
                     read_in_flight &
-                    (reply_generation == self.generation) &
-                    (reply_request == read_in_flight_request)),
+                    (reply_header.generation == self.generation) &
+                    (reply_header.request_id == read_in_flight_request)),
                 block_buffer.write_address.eq(reply_count),
                 block_buffer.write_data.eq(reply_data),
             ]
@@ -166,7 +156,7 @@ def _elaborate_host_block_engine(
                 with m.If(reply_end):
                     reject_ended_reply()
                 with m.Else():
-                    with m.If(reply_count == reply_length - 1):
+                    with m.If(reply_count == reply_header.payload_length - 1):
                         m.next = "End"
                     with m.Else():
                         m.d.sd += reply_count.eq(reply_count + 1)
@@ -177,18 +167,19 @@ def _elaborate_host_block_engine(
                 with m.If(~reply_end):
                     discard_reply()
                 with m.Else():
-                    common_valid = (reply_version == FRAME_VERSION) & ~reply_error
+                    common_valid = REPLY_GATEWARE_SCHEMA.constants_valid(reply_header) & ~reply_error
                     with m.If(~common_valid):
                         m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
-                    with m.Elif(reply_opcode == HostReply.ReadData):
+                    with m.Elif(reply_header.opcode == HostReply.ReadData):
                         read_matches = read_in_flight & \
-                            (reply_generation == self.generation) & \
-                            (reply_request == read_in_flight_request)
-                        with m.If(reply_length != HOST_REPLY_PAYLOAD_LENGTH[HostReply.ReadData]):
+                            (reply_header.generation == self.generation) & \
+                            (reply_header.request_id == read_in_flight_request)
+                        with m.If(reply_header.payload_length !=
+                                  HOST_REPLY_PAYLOAD_LENGTH[HostReply.ReadData]):
                             m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
                         with m.Elif(read_matches):
                             m.d.sd += read_in_flight.eq(0)
-                            with m.If(reply_status == BackendStatus.OK):
+                            with m.If(reply_header.status == BackendStatus.OK):
                                 m.d.sd += [
                                     read_buffer_ready.eq(1),
                                     read_buffer_address.eq(read_in_flight_address),
@@ -200,21 +191,21 @@ def _elaborate_host_block_engine(
                                 ]
                         with m.Else():
                             m.d.sd += self.stale_replies.eq(self.stale_replies + 1)
-                    with m.Elif((reply_opcode == HostReply.WriteAck) |
-                                (reply_opcode == HostReply.EraseAck)):
+                    with m.Elif((reply_header.opcode == HostReply.WriteAck) |
+                                (reply_header.opcode == HostReply.EraseAck)):
                         ack_matches = ack_in_flight & \
-                            (reply_opcode == ack_in_flight_opcode) & \
-                            (reply_generation == self.generation) & \
-                            (reply_request == ack_in_flight_request)
-                        with m.If(reply_length != 0):
+                            (reply_header.opcode == ack_in_flight_opcode) & \
+                            (reply_header.generation == self.generation) & \
+                            (reply_header.request_id == ack_in_flight_request)
+                        with m.If(reply_header.payload_length != 0):
                             m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
                         with m.Elif(ack_matches):
                             m.d.sd += [
-                                host_ack_status.eq(reply_status),
+                                host_ack_status.eq(reply_header.status),
                                 host_ack_valid.eq(1),
                                 ack_in_flight.eq(0),
                             ]
-                            with m.If(reply_status != BackendStatus.OK):
+                            with m.If(reply_header.status != BackendStatus.OK):
                                 m.d.sd += self.backend_errors.eq(self.backend_errors + 1)
                         with m.Else():
                             m.d.sd += self.stale_replies.eq(self.stale_replies + 1)
@@ -284,12 +275,14 @@ def _elaborate_host_block_engine(
             with m.Case(opcode):
                 m.d.comb += event_payload_length.eq(payload_length)
 
-    event_header = Array(frame_header_bytes(REQUEST_SCHEMA, {
-        "opcode": Cat(event_kind, C(0, 8 - len(event_kind))),
-        "generation": self.generation,
-        "request_id": event_request,
-        "payload_length": event_payload_length,
-    }))
+    event_header_view = Signal(REQUEST_GATEWARE_SCHEMA.layout)
+    m.d.comb += [
+        event_header_view.opcode.eq(event_kind),
+        event_header_view.generation.eq(self.generation),
+        event_header_view.request_id.eq(event_request),
+        event_header_view.payload_length.eq(event_payload_length),
+    ]
+    event_header = Array(REQUEST_GATEWARE_SCHEMA.bytes(event_header_view))
 
     m.d.comb += [
         o_stream.valid.eq(0),
