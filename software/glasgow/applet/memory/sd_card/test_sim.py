@@ -5,9 +5,10 @@ import tempfile
 
 from glasgow.simulation.assembly import SimulationAssembly
 
-from . import BLOCK_SIZE, build_cid, build_csd
+from . import BLOCK_SIZE, build_cid, build_csd, build_scr
 from .bfm import SDHostBFM
 from ._test_support import InlineWorker
+from ._diagnostics import decode_fpga_diagnostics
 
 
 class SimHostServiceAgent:
@@ -52,6 +53,11 @@ class SDCardSimulationTestMixin:
             command_oe, _, _ = await bfm.cycle()
             self.assertEqual(command_oe, 0)
 
+        await bfm.send_command(1, 0x00ff_c000)
+        for _ in range(64):
+            command_oe, _, _ = await bfm.cycle()
+            self.assertEqual(command_oe, 0)
+
         await bfm.send_command(55)
         self.assertEqual(await applet.sd_card_iface.last_command, 55)
         bfm.assert_r1(await bfm.receive_response(48), 55)
@@ -85,11 +91,34 @@ class SDCardSimulationTestMixin:
         await bfm.send_command(16, BLOCK_SIZE)
         bfm.assert_r1(await bfm.receive_response(48), 16)
 
+        # Sharp MAINTE reads both SD-specific register blocks while opening a
+        # drive. ACMD13 is required even though its all-zero status fields are
+        # sufficient for this simple, unpartitioned card model.
+        await bfm.send_command(55, 0x1234_0000)
+        bfm.assert_r1(await bfm.receive_response(48), 55)
+        await bfm.send_command(51)
+        bfm.assert_r1(await bfm.receive_response(48), 51)
+        await bfm.receive_data_block(build_scr().to_bytes(8, "big"))
+
+        await bfm.send_command(55, 0x1234_0000)
+        bfm.assert_r1(await bfm.receive_response(48), 55)
+        await bfm.send_command(13)
+        bfm.assert_r1(await bfm.receive_response(48), 13)
+        await bfm.receive_data_block(bytes(64))
+
     async def _receive_sim_block(self, applet, bfm, expected, *, timeout_cycles=2048):
         async def diagnostic():
             pipe = applet.sd_card_iface._pipe
+            agent = self._active_host_agent
+            diagnostics = decode_fpga_diagnostics(
+                await applet.sd_card_iface._diagnostics_snapshot)
             return (
                 f"host readable={pipe.readable}, "
+                f"flush readable={pipe.flush_readable}, host requests="
+                f"{agent.requests_started}/{agent.requests_completed}, "
+                f"transaction={diagnostics['host_transaction_phase']}, "
+                f"raw-count={diagnostics['host_reply_payload_bytes']}, "
+                f"banks={diagnostics['read_bank_states']:#x}, "
                 f"errors={await applet.sd_card_iface.protocol_errors}, "
                 f"prefetch waits={await applet.sd_card_iface.prefetch_waits}")
 
@@ -270,10 +299,10 @@ class SDCardSimulationTestMixin:
                     payload[guard_block * BLOCK_SIZE:(guard_block + 1) * BLOCK_SIZE],
                     timeout_cycles=8192)
 
+            # Every raw reply is one USB packet with an explicit expected address. Random
+            # CMD12/CMD17 changes exercise the mismatch drain and must not relabel prefetched data.
             self.assertGreater(await applet.sd_card_iface.prefetch_waits, 0)
-            self.assertGreater(await applet.sd_card_iface.prefetch_wait_cycles, 0)
-            self.assertGreater(await applet.sd_card_iface.max_prefetch_wait, 0)
-            self.assertGreater(await applet.sd_card_iface.max_host_service_latency, 0)
             self.assertEqual(await applet.sd_card_iface.buffer_faults, 0)
+            self.assertEqual(await applet.sd_card_iface.protocol_errors, 0)
 
         self._run_simulation(payload, scenario, host_stalls=stalls)

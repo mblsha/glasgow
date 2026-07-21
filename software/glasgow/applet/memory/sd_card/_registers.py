@@ -187,12 +187,12 @@ def build_csd(size: int, *, read_only: bool = False,
     return _finish_register_crc(csd)
 
 
-def build_scr() -> int:
-    """Build an SD 1.01 SCR supporting both 1-bit and 4-bit buses."""
+def build_scr(*, support_4bit: bool = True) -> int:
+    """Build an SD 1.01 SCR supporting one-bit and optionally four-bit transfers."""
     scr = 0
     scr = _set_field(scr, 63, 60, 0)         # SCR_STRUCTURE v1
     scr = _set_field(scr, 59, 56, 0)         # SD_SPEC 1.0/1.01
     scr = _set_field(scr, 55, 55, 1)         # erased data reads as ones
     scr = _set_field(scr, 54, 52, 0)         # no security protocol
-    scr = _set_field(scr, 51, 48, 0b0101)    # 1-bit and 4-bit buses
+    scr = _set_field(scr, 51, 48, 0b0101 if support_4bit else 0b0001)
     return scr

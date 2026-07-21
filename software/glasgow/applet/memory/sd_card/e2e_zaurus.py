@@ -366,6 +366,8 @@ async def start_glasgow(args):
         command.append("--volatile-writes")
     if args.transfer_speed != DEFAULT_TRANSFER_SPEED:
         command += ["--transfer-speed", str(args.transfer_speed)]
+    if args.one_bit:
+        command.append("--one-bit")
     command.append(os.fspath(args.image))
     process = await asyncio.create_subprocess_exec(
         *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -444,7 +446,9 @@ async def verify(args, shell):
         f"{shlex.quote(args.mount_point + '/' + args.write_file)}; sync; "
         f"grep -F {shlex.quote(write_marker)} "
         f"{shlex.quote(args.mount_point + '/' + args.write_file)}; "
-        f"umount {shlex.quote(args.mount_point)}")
+        "sync; cd /; "
+        f"umount {shlex.quote(args.mount_point)} || "
+        f"{{ sleep 2; umount {shlex.quote(args.mount_point)}; }}")
     await shell.run(root(mount_command), timeout=60)
 
     try:
@@ -523,6 +527,8 @@ def make_parser():
     parser.add_argument("--transfer-speed", type=parse_transfer_speed,
         default=DEFAULT_TRANSFER_SPEED, metavar="RATE",
         help="make Glasgow advertise a CSD transfer speed such as 25m or 5m (default: 25m)")
+    parser.add_argument("--one-bit", action="store_true",
+        help="advertise only the 1-bit bus for timing-sensitive legacy hosts")
     return parser
 
 

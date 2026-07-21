@@ -5,11 +5,12 @@
 
 The ``memory-sd-card`` applet emulates an early, byte-addressed SDSC memory card. The card image
 remains on the host; Glasgow uses two 512-byte ping-pong banks and streams reads and writes over
-USB. While one read bank is shifted onto DAT, the other is refilled from the host, avoiding an
+USB. Read payloads use a dedicated raw pipe whose 512-byte packets map one-to-one to sectors.
+While one tagged read bank is shifted onto DAT, the other is refilled from the host, avoiding an
 inter-block USB stall without retaining the image in FPGA memory. Each bank follows an explicit
 ``empty`` → ``filling`` → ``ready`` → ``active`` ownership sequence. CMD12 moves an accepted fill
 to ``draining`` until its late host payload has been safely discarded, so it cannot be mistaken
-for the current block. Images must be no larger than 16 MiB and a multiple of 2 KiB so their
+for the current block. Images must be no larger than 1 GiB and a multiple of 2 KiB so their
 capacity can be represented exactly by a version 1 CSD register. Add
 ``--read-only`` to open an image read-only and advertise the CSD temporary-write-protect bit. The
 normal CSD advertises a 25 Mbit/s maximum transfer rate. ``--transfer-speed RATE`` accepts values
@@ -44,7 +45,7 @@ fields after the durable flush and backend worker close so those final operation
 
 Reads, writes, erases, and synchronization run on one dedicated worker thread. Backends advertise
 their efficient contiguous-read capability: generic backends default to one block, while the file
-backend opts into a bounded 128 KiB host-memory read-ahead window. Writes and erases invalidate
+backend opts into a bounded 4 MiB host-memory read-ahead window. Writes and erases invalidate
 that window before reaching the backend. At most one operation may wait behind the operation in
 progress, and operations remain strictly ordered, so a slow ``fsync`` cannot block power
 monitoring or unboundedly queue later writes.
@@ -76,6 +77,14 @@ Always use ``-V B=SB`` with this wiring. The Zaurus supplies the SD I/O rail, so
 Glasgow to source 3.3 V would connect two power supplies together. Before starting the applet,
 ``glasgow voltage`` should report about 3.3 V on port B ``Vsense``. Keep the applet running for the
 entire time that the filesystem is mounted.
+
+For the isolated unattended MAINTE SD-first breakout, Glasgow Vio is not connected to the Zaurus
+SD supply. The verified latency-safe configuration is::
+
+    glasgow run memory-sd-card -V B=SB \
+        --clk B2 --cmd B5 --dat B1,B0,B7,B6 \
+        --max-sd-clock 5m --transfer-speed 1m --one-bit \
+        --prime-first-read --no-power-monitor --diagnostics-interval 2 card.img
 
 The Zaurus driver probes the card lazily and ``/sbin/sdmgr`` keeps the module busy through
 ``/dev/sd_slotstat``. For a deterministic reprobe, first start the applet on the host, then stop the
@@ -122,6 +131,11 @@ Zaurus-specific gotchas
   generation, flushes the image after releasing the SD pins, and resumes when power returns.
   Reload ``sharp_mmcsd_m`` after reconnecting; the
   applet itself should remain running. ``--no-power-monitor`` restores the manual behavior.
+  For an unattended MAINTE SD-first boot, use ``--no-power-monitor``: it also widens the port
+  voltage alert so Glasgow's Vio regulator and the CMD transceiver remain active across the rail
+  outage, avoiding a host-side resume delay before the first boot command. This is safe only when
+  the Glasgow Vio output is isolated from the Zaurus SD supply, as it is on the verified breakout;
+  never connect two 3.3 V supply outputs together.
 * A failed probe can leave the Linux 2.4 block driver with stale device state. Reloading the module
   is more reliable than repeatedly opening ``/dev/mmcda``. If ``rmmod`` reports that the module is
   busy, check for every ``sdmgr`` process rather than trusting only ``/var/run/sdmgr.pid``; an
@@ -131,6 +145,11 @@ Zaurus-specific gotchas
   way to determine whether the driver's selected SD clock is the cause. Intermediate rates such as
   ``--transfer-speed 12.5m`` can narrow down the threshold. This is optional; 25 Mbit/s remains the
   default.
+* Sharp MAINTE probes MMC with CMD1 before its SD ACMD41 path. An SD card must remain silent to
+  CMD1; replying with an illegal-command R1 can prevent MAINTE from selecting the SD path.
+  MAINTE also requires ACMD13 plus its 64-byte SD Status data phase before it considers the drive
+  open. The emulator implements both behaviors; older bitstreams can initialize far enough to
+  read CID/CSD but still fail the final drive-open step.
 * Run with ``-v`` while bringing up new wiring. Block addresses logged by the applet confirm that
   the command and host-streaming paths are active. CMD55/ACMD41 timeouts with no logged commands
   usually mean that the applet was not reset or that CLK/CMD wiring is wrong. The E2E harness uses

@@ -76,11 +76,11 @@ class SDHostBFM:
             self.testcase.fail(f"timed out waiting for SD data start bit{diagnostic}")
 
         block = 0
-        for _ in range(BLOCK_SIZE * 8):
+        for _ in range(len(expected) * 8):
             _, _, data_sample = await self.cycle()
             self.testcase.assertEqual(data_sample[0][0], 1)
             block = (block << 1) | data_sample[0][1]
-        block = block.to_bytes(BLOCK_SIZE, "big")
+        block = block.to_bytes(len(expected), "big")
         self.testcase.assertEqual(block, expected)
 
         received_crc = 0

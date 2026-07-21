@@ -110,7 +110,8 @@ class HostOperation:
 HOST_OPERATIONS = (
     HostOperation(
         HostEvent.Read, HostReply.ReadData,
-        PayloadSchema("read", (PayloadField("address", 4),)),
+        PayloadSchema("read", (
+            PayloadField("address", 4), PayloadField("blocks", 1))),
         PayloadSchema("read_data", (PayloadField("data", BLOCK_SIZE, raw=True),))),
     HostOperation(
         HostEvent.Write, HostReply.WriteAck,

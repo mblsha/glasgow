@@ -151,10 +151,11 @@ class ReadBufferManagerTestCase(unittest.TestCase):
             ctx.set(dut.host.reply_bank, bank)
             await ctx.tick("sd")
             ctx.set(dut.host.reply_ready, 0)
-            self.assertEqual(ctx.get(dut.client.ready), 0)
+            ctx.set(dut.client.lookup_address, address)
+            self.assertEqual(ctx.get(dut.client.ready), 1)
             self.assertEqual(ctx.get(dut.client.reply_fault), 0)
             states = ctx.get(dut.client.bank_states)
-            self.assertEqual((states >> (bank * 3)) & 0x7, ReadBufferState.Empty.value)
+            self.assertEqual((states >> (bank * 3)) & 0x7, ReadBufferState.Ready.value)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6, domain="sd")
@@ -183,7 +184,7 @@ class ReadBufferManagerTestCase(unittest.TestCase):
             ctx.set(dut.host.reply_bank, bank)
             await ctx.tick("sd")
             states = ctx.get(dut.client.bank_states)
-            self.assertEqual((states >> (bank * 3)) & 0x7, ReadBufferState.Empty.value)
+            self.assertEqual((states >> (bank * 3)) & 0x7, ReadBufferState.Ready.value)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6, domain="sd")

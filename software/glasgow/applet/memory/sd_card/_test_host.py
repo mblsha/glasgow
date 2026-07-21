@@ -42,26 +42,20 @@ class SDCardInterfaceTestCase(unittest.TestCase):
     def test_host_read_event(self):
         image = bytes(index & 0xff for index in range(BLOCK_SIZE * 4))
         backend = _MemoryBackend(image)
-        request = self.request(HostEvent.Read, struct.pack("<I", BLOCK_SIZE))
+        request = self.request(HostEvent.Read, struct.pack("<IB", BLOCK_SIZE, 1))
         iface = self.make_iface(backend, request)
         asyncio.run(iface.serve_once())
-        header, payload = self.reply(iface._pipe)
-        self.assertEqual(header.opcode, HostReply.ReadData)
-        self.assertEqual(header.generation, GENERATION)
-        self.assertEqual(header.request_id, REQUEST_ID)
-        self.assertEqual(header.status, BackendStatus.OK)
-        self.assertEqual(payload, image[BLOCK_SIZE:BLOCK_SIZE * 2])
-        self.assertEqual(iface._pipe.flushes, 1)
+        self.assertEqual(
+            iface._read_pipe.replies, image[BLOCK_SIZE:BLOCK_SIZE * 2])
+        self.assertEqual(iface._read_pipe.flushes, 1)
+        self.assertEqual(iface._pipe.replies, b"")
 
     def test_host_read_error_is_reported(self):
         backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
-        request = self.request(HostEvent.Read, struct.pack("<I", 1))
+        request = self.request(HostEvent.Read, struct.pack("<IB", 1, 1))
         iface = self.make_iface(backend, request)
         asyncio.run(iface.serve_once())
-        header, payload = self.reply(iface._pipe)
-        self.assertEqual(header.opcode, HostReply.ReadData)
-        self.assertEqual(header.status, BackendStatus.Invalid)
-        self.assertEqual(payload, bytes([0xff]) * BLOCK_SIZE)
+        self.assertEqual(iface._read_pipe.replies, bytes([0xff]) * BLOCK_SIZE)
         self.assertEqual(iface._host_backend_errors, 1)
 
     def test_host_write_event(self):
@@ -131,14 +125,12 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
     def test_malformed_frame_is_discarded_before_next_request(self):
         backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
-        malformed = bytearray(self.request(HostEvent.Read, struct.pack("<I", 0)))
+        malformed = bytearray(self.request(HostEvent.Read, struct.pack("<IB", 0, 1)))
         malformed[2] ^= 0x40
-        valid = self.request(HostEvent.Read, struct.pack("<I", BLOCK_SIZE))
+        valid = self.request(HostEvent.Read, struct.pack("<IB", BLOCK_SIZE, 1))
         iface = self.make_iface(backend, bytes(malformed) + valid)
         asyncio.run(iface.serve_once())
-        header, payload = self.reply(iface._pipe)
-        self.assertEqual(header.status, BackendStatus.OK)
-        self.assertEqual(payload, bytes(BLOCK_SIZE))
+        self.assertEqual(iface._read_pipe.replies, bytes(BLOCK_SIZE))
 
     def test_semantically_invalid_request_length_is_rejected(self):
         backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
@@ -268,6 +260,21 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_configure_enables_gateware_boot_bank_priming(self):
+        async def scenario():
+            image = bytes(index & 0xff for index in range(BLOCK_SIZE * 4))
+            backend = _MemoryBackend(image)
+            iface = TestSDCardInterface()
+
+            await iface.configure(backend=backend, prime_first_read=True)
+
+            self.assertEqual(iface._prime_first_read_reg.value, 1)
+            self.assertEqual(iface._pipe.replies, b"")
+            self.assertEqual(iface._pipe.flushes, 0)
+            await iface.close()
+
+        asyncio.run(scenario())
+
     def test_reconfigure_failure_disables_and_closes_both_sessions(self):
         events = []
 
@@ -321,7 +328,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
         async def scenario():
             backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
-            request = self.request(HostEvent.Read, struct.pack("<I", 0))
+            request = self.request(HostEvent.Read, struct.pack("<IB", 0, 1))
             iface = TestSDCardInterface(
                 backend, request, worker_factory=BlockingWorker)
             service = asyncio.create_task(iface.serve_once())
@@ -377,6 +384,60 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_service_retains_backend_across_transport_reset_on_suspend(self):
+        class ResetPipe:
+            def __init__(self):
+                self.receiving = asyncio.Event()
+                self.receive = None
+                self.resets = 0
+
+            async def recv_until(self, delimiter):
+                self.receive = asyncio.get_running_loop().create_future()
+                self.receiving.set()
+                return await self.receive
+
+            async def reset(self):
+                self.resets += 1
+                if self.receive is not None and not self.receive.done():
+                    self.receive.set_exception(OSError("transport reset"))
+
+        async def scenario():
+            backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+            iface = self.make_iface(backend, b"")
+            pipe = ResetPipe()
+            iface._pipe = pipe
+
+            class DisableRegister(_ImmediateRegister):
+                async def set(self, value):
+                    if value == 0 and pipe.receive is not None and not pipe.receive.done():
+                        # Hardware pipe reset cancels the blocked receive future; it does not
+                        # cancel the long-running service task itself.
+                        pipe.receive.cancel()
+                        await asyncio.sleep(0)
+                    await super().set(value)
+
+            iface._enabled = DisableRegister(1)
+            service = asyncio.create_task(iface.serve())
+            await asyncio.wait_for(pipe.receiving.wait(), 1)
+
+            await iface.suspend(reason="test target-power loss")
+            await asyncio.sleep(0.1)
+            self.assertFalse(service.done())
+            self.assertIs(iface.backend, backend)
+            self.assertFalse(backend.closed)
+
+            pipe.receiving.clear()
+            await iface.resume(reason="test target-power return")
+            await asyncio.wait_for(pipe.receiving.wait(), 1)
+            self.assertFalse(service.done())
+
+            service.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await service
+            self.assertTrue(backend.closed)
+
+        asyncio.run(scenario())
+
 
 class SDCardProtocolTestCase(unittest.TestCase):
     def test_operation_schema_is_the_payload_source_of_truth(self):
@@ -387,8 +448,11 @@ class SDCardProtocolTestCase(unittest.TestCase):
 
         read = HOST_OPERATION_FOR_EVENT[HostEvent.Read]
         self.assertEqual(read.reply, HostReply.ReadData)
-        encoded = read.request_payload.encode(address=0x1234_5600)
-        self.assertEqual(read.request_payload.decode(encoded), {"address": 0x1234_5600})
+        encoded = read.request_payload.encode(address=0x1234_5600, blocks=2)
+        self.assertEqual(read.request_payload.decode(encoded), {
+            "address": 0x1234_5600,
+            "blocks": 2,
+        })
 
         write = HOST_OPERATION_FOR_EVENT[HostEvent.Write]
         block = bytes(range(256)) * 2
@@ -422,7 +486,7 @@ class SDCardProtocolTestCase(unittest.TestCase):
 
     def test_frame_crc_rejects_corruption(self):
         packet = bytearray(RequestFrame.create(
-            HostEvent.Read, GENERATION, REQUEST_ID, struct.pack("<I", 0)).encode_packet())
+            HostEvent.Read, GENERATION, REQUEST_ID, struct.pack("<IB", 0, 1)).encode_packet())
         packet[3] ^= 1
         with self.assertRaises(FrameError):
             RequestFrame.decode_packet(packet)
@@ -491,7 +555,7 @@ class BackendWorkerTestCase(unittest.TestCase):
                 image_file.truncate(BLOCK_SIZE * 8)
                 file_backend = FileBlockBackend(image_file.name)
                 file_worker = BackendWorker(file_backend)
-                self.assertEqual(file_worker.read_ahead_blocks, 256)
+                self.assertEqual(file_worker.read_ahead_blocks, 8192)
                 await file_worker.close()
 
         asyncio.run(scenario())
