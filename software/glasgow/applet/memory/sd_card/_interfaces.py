@@ -7,13 +7,14 @@ from ._gateware_support import CardState, DataMode
 __all__ = ["CommandDataSignature", "DataHostSignature", "ReadBufferState"]
 
 
-class ReadBufferState(enum.Enum, shape=2):
+class ReadBufferState(enum.Enum, shape=3):
     """Ownership state for each bank of the read ping-pong buffer."""
 
     Empty = 0
     Filling = 1
     Ready = 2
     Active = 3
+    Draining = 4
 
 
 class CommandDataSignature(wiring.Signature):

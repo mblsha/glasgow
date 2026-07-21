@@ -22,7 +22,7 @@ class DataEngine(wiring.Component):
     control: In(CommandDataSignature())
     storage: Out(DataHostSignature())
     buffer: Out(BlockBufferPortSignature())
-    read_bank_states: Out(4)
+    read_bank_states: Out(6)
 
     read_count: Out(32)
     write_count: Out(32)
@@ -34,21 +34,23 @@ class DataEngine(wiring.Component):
     def elaborate(self, platform):
         m = Module()
         m.submodules.read_buffers = read_buffers = ReadBufferManager()
+        buffer_client = read_buffers.client
+        buffer_host = read_buffers.host
         m.d.comb += [
-            self.storage.read_request.eq(read_buffers.host_request),
-            self.storage.read_request_address.eq(read_buffers.host_request_address),
-            self.storage.read_request_bank.eq(read_buffers.host_request_bank),
-            read_buffers.host_request_accepted.eq(self.storage.read_request_accepted),
-            read_buffers.host_reply_ready.eq(self.storage.read_buffer_ready),
-            read_buffers.host_reply_address.eq(self.storage.read_buffer_address),
-            read_buffers.host_reply_bank.eq(self.storage.read_reply_bank),
-            read_buffers.host_reply_error.eq(self.storage.read_reply_error),
-            self.storage.read_buffer_consume.eq(read_buffers.host_reply_consume),
-            self.read_bank_states.eq(read_buffers.bank_states),
+            self.storage.read_request.eq(buffer_host.request),
+            self.storage.read_request_address.eq(buffer_host.request_address),
+            self.storage.read_request_bank.eq(buffer_host.request_bank),
+            buffer_host.request_accepted.eq(self.storage.read_request_accepted),
+            buffer_host.reply_ready.eq(self.storage.read_buffer_ready),
+            buffer_host.reply_address.eq(self.storage.read_buffer_address),
+            buffer_host.reply_bank.eq(self.storage.read_reply_bank),
+            buffer_host.reply_error.eq(self.storage.read_reply_error),
+            self.storage.read_buffer_consume.eq(buffer_host.reply_consume),
+            self.read_bank_states.eq(buffer_client.bank_states),
         ]
         _elaborate_data_transfer_engine(
             m, self, self.buffer, self.dat_i, self.dat_o, self.dat_oe,
-            self.control, self.storage, read_buffers)
+            self.control, self.storage, buffer_client)
         return m
 
 

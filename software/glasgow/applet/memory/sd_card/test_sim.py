@@ -42,10 +42,11 @@ class SimHostServiceAgent:
         self.requests_started = 0
         self.requests_completed = 0
 
-    async def run(self, ctx):
-        self.interface._pipe.bind_simulation_context(ctx)
-        while True:
+    async def run(self, ctx, *, stopped):
+        while not stopped():
             await ctx.posedge(self.sd_clock.i)
+            if stopped():
+                break
             if not self.interface._pipe.flush_readable:
                 continue
             if self._stall_remaining is None:
@@ -125,7 +126,7 @@ class SDCardSimulationTestMixin:
             if saw_busy and data_sample[0][0] == 0:
                 return
         pipe = applet.sd_card_iface._pipe
-        agent = applet._sim_host_agent
+        agent = self._active_host_agent
         self.fail(
             f"timed out waiting for {description} (host readable={pipe.readable}, "
             f"flush readable={pipe.flush_readable}, host requests="
@@ -148,23 +149,39 @@ class SDCardSimulationTestMixin:
             dat = [assembly.get_pin(name) for name in ("A1", "A0", "A7", "A6")]
             host_agent = SimHostServiceAgent(
                 applet.sd_card_iface, clk, stalls=host_stalls)
-            applet._sim_host_agent = host_agent
-            assembly.add_testbench(host_agent.run, background=True)
+            self._active_host_agent = host_agent
+            state = {"ready": False, "done": False, "error": None}
 
             async def card_host(ctx):
+                while not state["ready"]:
+                    await ctx.tick()
                 bfm = SDHostBFM(ctx, self, clk=clk, cmd=cmd, dat=dat)
-                await self._initialize_sim_card(
-                    applet, bfm, image, payload, transfer_speed=args.transfer_speed)
                 try:
+                    await self._initialize_sim_card(
+                        applet, bfm, image, payload, transfer_speed=args.transfer_speed)
                     await scenario(applet, bfm, image)
+                except BaseException as error:
+                    state["error"] = error
                 finally:
-                    await applet.sd_card_iface.close()
+                    state["done"] = True
+                    # Wake the foreground host agent if the scenario ended between requests.
+                    await bfm.cycle()
 
             async def main(ctx):
                 await applet.setup(args)
-                await card_host(ctx)
+                state["ready"] = True
+                try:
+                    await host_agent.run(ctx, stopped=lambda: state["done"])
+                finally:
+                    await applet.sd_card_iface.close()
+                if state["error"] is not None:
+                    raise state["error"]
 
-            assembly.run(main)
+            assembly.add_testbench(card_host, background=True)
+            try:
+                assembly.run(main)
+            finally:
+                del self._active_host_agent
 
     def test_sim_initialization_and_single_block_read(self):
         payload = bytes(

@@ -19,7 +19,7 @@ from . import (
     decode_csd_transfer_speed, encode_csd_transfer_speed, parse_transfer_speed,
 )
 from ._console import SerialTransport, TelnetTransport
-from .e2e_zaurus import ZaurusMountState, ZaurusSDController
+from .e2e_zaurus import E2EError, ZaurusMountState, ZaurusSDController
 from ._buffer import BlockBuffer
 from ._fat16 import FAT16Image, create_fat16_image
 from ._interfaces import ReadBufferState
@@ -33,6 +33,19 @@ from .test_sim import SDCardSimulationTestMixin
 
 GENERATION = 0x4321
 REQUEST_ID = 0x1234
+
+
+class _ImmediateRegister:
+    def __init__(self, value=0):
+        self.value = value
+
+    async def set(self, value):
+        self.value = value
+
+    def __await__(self):
+        async def get():
+            return self.value
+        return get().__await__()
 
 
 class SDCardAppletTestCase(
@@ -317,15 +330,6 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         self.assertEqual(payload, b"")
 
     def test_named_diagnostics_snapshot(self):
-        class ImmediateValue:
-            def __init__(self, value):
-                self.value = value
-
-            def __await__(self):
-                async def get():
-                    return self.value
-                return get().__await__()
-
         class Worker:
             service_count = 91
             max_service_latency = 0.125
@@ -338,7 +342,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         )
         iface = object.__new__(SDCardInterface)
         for value, name in enumerate(register_names, 1):
-            setattr(iface, name, ImmediateValue(value))
+            setattr(iface, name, _ImmediateRegister(value))
         iface._worker = Worker()
         iface._host_backend_errors = 14
         iface._flush_count = 15
@@ -353,6 +357,35 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         self.assertEqual(diagnostics.durable_flushes, 15)
         self.assertEqual(diagnostics.backend_calls, 91)
         self.assertEqual(diagnostics.max_backend_call_seconds, 0.125)
+
+    def test_close_flushes_before_final_diagnostics(self):
+        backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+        iface = self.make_iface(backend, b"")
+        iface._enabled = _ImmediateRegister(1)
+        iface._active = True
+        register_names = (
+            "clock_count", "command_low_count", "command_count", "read_count",
+            "write_count", "protocol_errors", "backend_errors", "stale_replies",
+            "buffer_faults", "prefetch_waits", "prefetch_wait_cycles",
+            "max_prefetch_wait", "max_host_service_latency",
+        )
+        for value, name in enumerate(register_names, 1):
+            setattr(iface, name, _ImmediateRegister(value))
+        diagnostics = []
+        iface._log_diagnostics = diagnostics.append
+
+        asyncio.run(iface.close())
+
+        self.assertEqual(iface._enabled.value, 0)
+        self.assertFalse(iface._active)
+        self.assertEqual(backend.flushes, 1)
+        self.assertTrue(backend.closed)
+        self.assertIsNone(iface._worker)
+        self.assertIsNone(iface._backend)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0].sd_clocks, 1)
+        self.assertEqual(diagnostics[0].max_host_service_latency_cycles, 13)
+        self.assertEqual(diagnostics[0].durable_flushes, 1)
 
     def test_power_monitor_suspends_and_resumes(self):
         class Device:
@@ -501,8 +534,14 @@ class BlockBufferTestCase(unittest.TestCase):
         m.submodules.dut = dut = BlockBuffer()
 
         async def testbench(ctx):
+            ctx.set(dut.bank_states, ReadBufferState.Draining.value)
             ctx.set(dut.host.write_en, 1)
             ctx.set(dut.host.write_address, 0)
+            self.assertEqual(ctx.get(dut.ownership_violation), 0)
+            await ctx.tick("sd")
+            self.assertEqual(ctx.get(dut.fault), 0)
+
+            ctx.set(dut.bank_states, ReadBufferState.Empty.value)
             self.assertEqual(ctx.get(dut.ownership_violation), 1)
             await ctx.tick("sd")
             self.assertEqual(ctx.get(dut.fault), 1)
@@ -522,38 +561,38 @@ class ReadBufferManagerTestCase(unittest.TestCase):
 
         async def testbench(ctx):
             address = BLOCK_SIZE * 3
-            ctx.set(dut.lookup_address, address)
-            ctx.set(dut.reserve_address, address)
-            self.assertEqual(ctx.get(dut.reserve_ready), 1)
-            ctx.set(dut.reserve, 1)
+            ctx.set(dut.client.lookup_address, address)
+            ctx.set(dut.client.reserve_address, address)
+            self.assertEqual(ctx.get(dut.client.reserve_ready), 1)
+            ctx.set(dut.client.reserve, 1)
             await ctx.tick("sd")
-            ctx.set(dut.reserve, 0)
-            self.assertEqual(ctx.get(dut.filling), 1)
-            self.assertEqual(ctx.get(dut.host_request), 1)
-            bank = ctx.get(dut.host_request_bank)
-            ctx.set(dut.host_request_accepted, 1)
+            ctx.set(dut.client.reserve, 0)
+            self.assertEqual(ctx.get(dut.client.filling), 1)
+            self.assertEqual(ctx.get(dut.host.request), 1)
+            bank = ctx.get(dut.host.request_bank)
+            ctx.set(dut.host.request_accepted, 1)
             await ctx.tick("sd")
-            ctx.set(dut.host_request_accepted, 0)
+            ctx.set(dut.host.request_accepted, 0)
 
-            ctx.set(dut.host_reply_ready, 1)
-            ctx.set(dut.host_reply_address, address)
-            ctx.set(dut.host_reply_bank, bank)
+            ctx.set(dut.host.reply_ready, 1)
+            ctx.set(dut.host.reply_address, address)
+            ctx.set(dut.host.reply_bank, bank)
             await ctx.tick("sd")
-            ctx.set(dut.host_reply_ready, 0)
-            self.assertEqual(ctx.get(dut.ready), 1)
+            ctx.set(dut.host.reply_ready, 0)
+            self.assertEqual(ctx.get(dut.client.ready), 1)
 
-            ctx.set(dut.activate, 1)
+            ctx.set(dut.client.activate, 1)
             await ctx.tick("sd")
-            ctx.set(dut.activate, 0)
-            self.assertEqual(ctx.get(dut.active), 1)
-            states = ctx.get(dut.bank_states)
-            self.assertEqual((states >> (bank * 2)) & 0x3, ReadBufferState.Active.value)
+            ctx.set(dut.client.activate, 0)
+            self.assertEqual(ctx.get(dut.client.active), 1)
+            states = ctx.get(dut.client.bank_states)
+            self.assertEqual((states >> (bank * 3)) & 0x7, ReadBufferState.Active.value)
 
-            ctx.set(dut.release, 1)
+            ctx.set(dut.client.release, 1)
             await ctx.tick("sd")
-            ctx.set(dut.release, 0)
-            self.assertEqual(ctx.get(dut.active), 0)
-            self.assertEqual(ctx.get(dut.reserve_ready), 1)
+            ctx.set(dut.client.release, 0)
+            self.assertEqual(ctx.get(dut.client.active), 0)
+            self.assertEqual(ctx.get(dut.client.reserve_ready), 1)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6, domain="sd")
@@ -567,31 +606,60 @@ class ReadBufferManagerTestCase(unittest.TestCase):
 
         async def testbench(ctx):
             address = BLOCK_SIZE * 5
-            ctx.set(dut.lookup_address, address)
-            ctx.set(dut.reserve_address, address)
-            ctx.set(dut.reserve, 1)
+            ctx.set(dut.client.lookup_address, address)
+            ctx.set(dut.client.reserve_address, address)
+            ctx.set(dut.client.reserve, 1)
             await ctx.tick("sd")
-            ctx.set(dut.reserve, 0)
-            bank = ctx.get(dut.host_request_bank)
-            ctx.set(dut.host_request_accepted, 1)
+            ctx.set(dut.client.reserve, 0)
+            bank = ctx.get(dut.host.request_bank)
+            ctx.set(dut.host.request_accepted, 1)
             await ctx.tick("sd")
-            ctx.set(dut.host_request_accepted, 0)
+            ctx.set(dut.host.request_accepted, 0)
 
-            ctx.set(dut.reset, 1)
+            ctx.set(dut.client.reset, 1)
             await ctx.tick("sd")
-            ctx.set(dut.reset, 0)
-            states = ctx.get(dut.bank_states)
-            self.assertEqual((states >> (bank * 2)) & 0x3, ReadBufferState.Filling.value)
+            ctx.set(dut.client.reset, 0)
+            states = ctx.get(dut.client.bank_states)
+            self.assertEqual((states >> (bank * 3)) & 0x7, ReadBufferState.Draining.value)
 
-            ctx.set(dut.host_reply_ready, 1)
-            ctx.set(dut.host_reply_address, address)
-            ctx.set(dut.host_reply_bank, bank)
+            ctx.set(dut.host.reply_ready, 1)
+            ctx.set(dut.host.reply_address, address)
+            ctx.set(dut.host.reply_bank, bank)
             await ctx.tick("sd")
-            ctx.set(dut.host_reply_ready, 0)
-            self.assertEqual(ctx.get(dut.ready), 0)
-            self.assertEqual(ctx.get(dut.reply_fault), 0)
-            states = ctx.get(dut.bank_states)
-            self.assertEqual((states >> (bank * 2)) & 0x3, ReadBufferState.Empty.value)
+            ctx.set(dut.host.reply_ready, 0)
+            self.assertEqual(ctx.get(dut.client.ready), 0)
+            self.assertEqual(ctx.get(dut.client.reply_fault), 0)
+            states = ctx.get(dut.client.bank_states)
+            self.assertEqual((states >> (bank * 3)) & 0x7, ReadBufferState.Empty.value)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6, domain="sd")
+        simulator.add_testbench(testbench)
+        simulator.run()
+
+    def test_reply_completing_during_reset_becomes_empty(self):
+        m = Module()
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = ReadBufferManager()
+
+        async def testbench(ctx):
+            address = BLOCK_SIZE * 7
+            ctx.set(dut.client.reserve_address, address)
+            ctx.set(dut.client.reserve, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.client.reserve, 0)
+            bank = ctx.get(dut.host.request_bank)
+            ctx.set(dut.host.request_accepted, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.host.request_accepted, 0)
+
+            ctx.set(dut.client.reset, 1)
+            ctx.set(dut.host.reply_ready, 1)
+            ctx.set(dut.host.reply_address, address)
+            ctx.set(dut.host.reply_bank, bank)
+            await ctx.tick("sd")
+            states = ctx.get(dut.client.bank_states)
+            self.assertEqual((states >> (bank * 3)) & 0x7, ReadBufferState.Empty.value)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6, domain="sd")
@@ -805,6 +873,45 @@ class ZaurusSDControllerTestCase(unittest.TestCase):
             self.assertTrue(any("rmmod sharp_mmcsd_m" in command for command in restored))
             self.assertFalse(any("/sbin/sdmgr;" in command for command in restored))
             self.assertFalse(any("mount -t" in command for command in restored))
+
+        asyncio.run(scenario())
+
+    def test_restore_verifies_remote_state(self):
+        class FakeShell:
+            def __init__(self):
+                self.captures = 0
+
+            async def run(self, command, *, check=True, timeout=None):
+                if "__GLASGOW_SD_" in command:
+                    self.captures += 1
+                    if self.captures == 1:
+                        return 0, "__GLASGOW_SD_STATE__\t1\t0\t\n"
+                    return 0, "__GLASGOW_SD_STATE__\t0\t0\t\n"
+                return 0, ""
+
+        async def scenario():
+            controller = ZaurusSDController(
+                FakeShell(), "/usr/mnt.rom/card", settle_delay=0)
+            await controller.prepare()
+            with self.assertRaisesRegex(E2EError, "did not converge"):
+                await controller.restore()
+            self.assertTrue(controller._restore_needed)
+
+        asyncio.run(scenario())
+
+    def test_context_preserves_primary_and_restore_failures(self):
+        async def scenario():
+            controller = ZaurusSDController(None, "/usr/mnt.rom/card", settle_delay=0)
+            primary = ValueError("test failed")
+            restore = E2EError("restore failed")
+
+            async def fail_restore():
+                raise restore
+
+            controller.restore = fail_restore
+            with self.assertRaises(BaseExceptionGroup) as context:
+                await controller.__aexit__(ValueError, primary, primary.__traceback__)
+            self.assertEqual(context.exception.exceptions, (primary, restore))
 
         asyncio.run(scenario())
 

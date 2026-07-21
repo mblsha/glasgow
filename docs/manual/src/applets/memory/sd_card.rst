@@ -7,9 +7,10 @@ The ``memory-sd-card`` applet emulates an early, byte-addressed SDSC memory card
 remains on the host; Glasgow uses two 512-byte ping-pong banks and streams reads and writes over
 USB. While one read bank is shifted onto DAT, the other is refilled from the host, avoiding an
 inter-block USB stall without retaining the image in FPGA memory. Each bank follows an explicit
-``empty`` → ``filling`` → ``ready`` → ``active`` ownership sequence, so a late prefetch cannot be
-mistaken for the current block after CMD12. Images must be no larger than 16 MiB and a multiple of
-2 KiB so their capacity can be represented exactly by a version 1 CSD register. Add
+``empty`` → ``filling`` → ``ready`` → ``active`` ownership sequence. CMD12 moves an accepted fill
+to ``draining`` until its late host payload has been safely discarded, so it cannot be mistaken
+for the current block. Images must be no larger than 16 MiB and a multiple of 2 KiB so their
+capacity can be represented exactly by a version 1 CSD register. Add
 ``--read-only`` to open an image read-only and advertise the CSD temporary-write-protect bit. The
 normal CSD advertises a 25 Mbit/s maximum transfer rate. ``--transfer-speed RATE`` accepts values
 such as ``12.5m`` or ``5m`` for compatibility experiments with hosts that select an unreliable
@@ -37,7 +38,9 @@ failures, malformed frames, and stale replies are included in the applet's exit 
 The named diagnostics snapshot and exit statistics report buffer-ownership faults, the number of
 multi-block prefetch waits, their total and maximum duration, and the maximum host request/reply
 service latency, all measured in SD clock cycles. Host backend errors, durable flushes, backend
-call count, and the longest blocking backend call are tracked separately.
+call count, and the longest blocking backend call are tracked separately. Close-time diagnostics
+sample FPGA counters immediately before their SD clock domain is disabled, then finalize the host
+fields after the durable flush and backend worker close so those final operations are included.
 
 Reads, writes, erases, and synchronization run on one dedicated worker thread. Backends advertise
 their efficient contiguous-read capability: generic backends default to one block, while the file
@@ -166,8 +169,9 @@ prompt for a password. A directly attached console can be used instead with ``--
 by one idempotent async context manager, so cleanup can safely be retried after a partial failure.
 Before taking over it snapshots whether the driver and ``sdmgr`` were running and records the
 mounted device, filesystem, and mount options. Cleanup restores that exact state rather than
-always starting the daemon or mounting the card. The harness also runs ``glasgow safe`` during
-cleanup, including after a failed check.
+always starting the daemon or mounting the card, then captures the state again to verify that the
+restoration converged. If both the hardware check and cleanup fail, both exceptions are retained.
+The harness also runs ``glasgow safe`` during cleanup, including after a failed check.
 
 CLI reference
 -------------
