@@ -1,0 +1,132 @@
+from abc import ABCMeta, abstractmethod
+import os
+
+from ._protocol import BackendStatus
+
+
+__all__ = ["BlockBackend", "BackendError", "FileBlockBackend"]
+
+
+BLOCK_SIZE = 512
+
+
+class BackendError(Exception):
+    def __init__(self, status: BackendStatus, message: str):
+        self.status = BackendStatus(status)
+        super().__init__(message)
+
+
+class BlockBackend(metaclass=ABCMeta):
+    """Random-access storage used by the host side of the SD emulator."""
+
+    @property
+    @abstractmethod
+    def size(self) -> int:
+        pass
+
+    @property
+    @abstractmethod
+    def read_only(self) -> bool:
+        pass
+
+    @property
+    @abstractmethod
+    def identity(self) -> int:
+        pass
+
+    @abstractmethod
+    def read_block(self, address: int) -> bytes:
+        pass
+
+    @abstractmethod
+    def write_block(self, address: int, block: bytes) -> None:
+        pass
+
+    @abstractmethod
+    def erase(self, start: int, end: int) -> None:
+        pass
+
+    @abstractmethod
+    def flush(self) -> None:
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        pass
+
+
+class FileBlockBackend(BlockBackend):
+    def __init__(self, path: str, *, read_only: bool = False):
+        self.path = os.fspath(path)
+        flags = os.O_RDONLY if read_only else os.O_RDWR
+        self._fd = os.open(self.path, flags)
+        stat = os.fstat(self._fd)
+        self._size = stat.st_size
+        self._identity = (stat.st_ino ^ stat.st_size) & 0xffff_ffff
+        self._read_only = read_only
+
+    @property
+    def size(self):
+        return self._size
+
+    @property
+    def identity(self):
+        return self._identity
+
+    @property
+    def read_only(self):
+        return self._read_only
+
+    def _check_block(self, address: int):
+        if address % BLOCK_SIZE or address < 0 or address > self.size - BLOCK_SIZE:
+            raise BackendError(
+                BackendStatus.Invalid, f"block address outside image: {address:#x}")
+
+    def read_block(self, address: int) -> bytes:
+        self._check_block(address)
+        try:
+            block = os.pread(self._fd, BLOCK_SIZE, address)
+        except OSError as error:
+            raise BackendError(BackendStatus.IOError, str(error)) from error
+        if len(block) != BLOCK_SIZE:
+            raise BackendError(BackendStatus.ShortIO, f"short image read at {address:#x}")
+        return block
+
+    def write_block(self, address: int, block: bytes) -> None:
+        self._check_block(address)
+        if self.read_only:
+            raise BackendError(BackendStatus.ReadOnly, "image is read-only")
+        if len(block) != BLOCK_SIZE:
+            raise BackendError(
+                BackendStatus.Invalid, f"block must contain exactly {BLOCK_SIZE} bytes")
+        try:
+            length = os.pwrite(self._fd, block, address)
+        except OSError as error:
+            raise BackendError(BackendStatus.IOError, str(error)) from error
+        if length != BLOCK_SIZE:
+            raise BackendError(BackendStatus.ShortIO, f"short image write at {address:#x}")
+
+    def erase(self, start: int, end: int) -> None:
+        self._check_block(start)
+        self._check_block(end)
+        if start > end:
+            raise BackendError(
+                BackendStatus.Invalid, f"invalid erase range {start:#x}..{end:#x}")
+        if self.read_only:
+            raise BackendError(BackendStatus.ReadOnly, "image is read-only")
+        erased = bytes([0xff]) * BLOCK_SIZE
+        for address in range(start, end + 1, BLOCK_SIZE):
+            self.write_block(address, erased)
+
+    def flush(self) -> None:
+        if self.read_only:
+            return
+        try:
+            os.fsync(self._fd)
+        except OSError as error:
+            raise BackendError(BackendStatus.IOError, str(error)) from error
+
+    def close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
