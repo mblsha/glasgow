@@ -275,6 +275,20 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_configure_can_leave_card_inactive_until_target_power_returns(self):
+        async def scenario():
+            backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+            iface = TestSDCardInterface()
+
+            await iface.configure(backend=backend, activate=False)
+
+            self.assertIs(iface.backend, backend)
+            self.assertEqual(iface._enabled.value, 0)
+            self.assertFalse(iface._active)
+            await iface.close()
+
+        asyncio.run(scenario())
+
     def test_reconfigure_failure_disables_and_closes_both_sessions(self):
         events = []
 
@@ -381,6 +395,57 @@ class SDCardInterfaceTestCase(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
             self.assertEqual(transitions, ["suspend", "flush", "resume"])
+
+        asyncio.run(scenario())
+
+    def test_power_monitor_removes_backpower_pulls_while_target_is_off(self):
+        class Device:
+            def __init__(self):
+                self.samples = iter((0.0, 0.0, 3.3, 3.3, 2.36, 2.36))
+                self.last = 2.36
+                self.transitions = []
+
+            async def measure_voltage(self, port):
+                self.last = next(self.samples, self.last)
+                return self.last
+
+            async def set_pulls(self, port, low=set(), high=set()):
+                self.transitions.append(
+                    ("pulls", port, frozenset(low), frozenset(high)))
+
+        async def scenario():
+            device = Device()
+            iface = TestSDCardInterface(_MemoryBackend(bytes(BLOCK_SIZE * 4)))
+            complete = asyncio.Event()
+
+            async def flush():
+                device.transitions.append(("flush",))
+                complete.set()
+
+            async def suspend(**kwargs):
+                self.fail("high-Z power monitoring must not reset the armed engine")
+
+            iface.flush = flush
+            iface.suspend = suspend
+            task = asyncio.create_task(iface.monitor_power(
+                device, "B", off_threshold=2.7, on_threshold=3.0,
+                interval=0.001, debounce_samples=2,
+                manage_signal_pulls=True, resume_settle=0))
+            await asyncio.wait_for(complete.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            self.assertEqual(
+                [transition[0] for transition in device.transitions],
+                ["pulls", "pulls", "flush"])
+            self.assertEqual(
+                device.transitions[0],
+                ("pulls", "B", frozenset({2}), frozenset({0, 1, 5, 6, 7})))
+            self.assertEqual(
+                device.transitions[1],
+                ("pulls", "B", frozenset({2}), frozenset()))
+            self.assertTrue(iface._active)
 
         asyncio.run(scenario())
 

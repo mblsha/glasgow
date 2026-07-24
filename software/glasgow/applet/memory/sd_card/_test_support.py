@@ -162,6 +162,8 @@ class TestSDCardInterface(SDCardInterface):
         self._session = None if backend is None else _BackendSession(
             backend, worker_factory(backend), sync_writes)
         self._worker_factory = worker_factory
+        self._clk_pin_number = 2
+        self._pull_pin_numbers = {0, 1, 5, 6, 7}
         self._lifecycle_lock = asyncio.Lock()
         self._operation_lock = asyncio.Lock()
         self._generation = generation

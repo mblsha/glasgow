@@ -310,12 +310,16 @@ class SDCardInterface:
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
             clk: GlasgowPin, cmd: GlasgowPin, dat: tuple[GlasgowPin, ...],
             max_sd_clock: int = DEFAULT_TRANSFER_SPEED,
+            static_pulls: bool = True,
             worker_factory=BackendWorker):
         self._logger = logger
         self._level = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
         ports = assembly.add_port_group(clk=clk, cmd=cmd, dat=dat)
-        assembly.use_pulls({cmd: "high", dat: "high"})
+        self._clk_pin_number = clk.number
+        self._pull_pin_numbers = {cmd.number, *(pin.number for pin in dat)}
+        if static_pulls:
+            assembly.use_pulls({cmd: "high", dat: "high"})
         component = assembly.add_submodule(
             SDCardComponent(ports, max_sd_clock=max_sd_clock))
         self._pipe = assembly.add_inout_pipe(
@@ -379,7 +383,7 @@ class SDCardInterface:
             sync_writes: bool = True,
             transfer_speed: int = DEFAULT_TRANSFER_SPEED,
             support_4bit: bool = True,
-            prime_first_read: bool = False):
+            prime_first_read: bool = False, activate: bool = True):
         if (image_path is None) == (backend is None):
             raise ValueError("exactly one of image_path or backend must be provided")
         if backend is None:
@@ -434,8 +438,8 @@ class SDCardInterface:
                     self._host_backend_errors = 0
                     self._session = new_session
                     adopted = True
-                    await self._enabled.set(1)
-                    self._active = True
+                    await self._enabled.set(int(activate))
+                    self._active = activate
                 except BaseException as primary_error:
                     cleanup_errors = []
                     try:
@@ -464,6 +468,16 @@ class SDCardInterface:
             ("" if advertised_transfer_speed == transfer_speed else
              f", requested {transfer_speed / 1_000_000:.3g} Mbit/s"))
 
+    async def set_signal_pulls(self, device, port, *, enabled: bool):
+        high = self._pull_pin_numbers if enabled else set()
+        # An armed engine must not see a floating clock while the target is unpowered: random
+        # crossings would advance and corrupt its SD state before the real host starts. A weak
+        # pull-down cannot back-power the target and the powered host actively overrides it.
+        await device.set_pulls(str(port), low={self._clk_pin_number}, high=high)
+        self._logger.info(
+            "port %s SD pulls set to CLK-low%s",
+            port, ", CMD/DAT-high" if enabled else "")
+
     async def _retire_session(self, session, *, operation):
         errors = []
         try:
@@ -483,7 +497,7 @@ class SDCardInterface:
             raise BaseExceptionGroup(
                 f"SD backend {operation} failed during flush and close", errors)
 
-    async def suspend(self, *, reason: str = "requested"):
+    async def suspend(self, *, reason: str = "requested", after_disable=None):
         async with self._lifecycle_lock:
             async with self._operation_lock:
                 if not self._active:
@@ -494,6 +508,8 @@ class SDCardInterface:
                 # exception belongs to a deliberate suspend and retain the backend for resume.
                 self._active = False
                 await self._enabled.set(0)
+                if after_disable is not None:
+                    await after_disable()
                 await self._generation_reg.set(self._next_generation())
                 await self._pipe.reset()
                 await self._read_pipe.reset()
@@ -512,23 +528,57 @@ class SDCardInterface:
                     "resumed SD card: %s (generation %#06x)", reason, self._generation)
 
     async def monitor_power(self, device, port, *, off_threshold: float = 1.0,
-            on_threshold: float = 1.8, interval: float = 0.25, debounce_samples: int = 3):
+            on_threshold: float = 1.8, interval: float = 0.25, debounce_samples: int = 3,
+            manage_signal_pulls: bool = False, resume_settle: float = 0.0):
         async def flush_after_suspend():
             try:
                 await self.flush()
             except BackendError as error:
                 self._record_backend_error("power-loss flush", error)
 
+        async def suspend_for_power_loss(voltage):
+            nonlocal target_power_active
+            target_power_active = False
+            if manage_signal_pulls:
+                # Do not reset or disable the card engine here. MAINTE probes too soon after the
+                # rising rail for host-side polling to reactivate it, and resetting also discards
+                # the prefetched boot sectors. At idle the engine releases CMD/DAT; removing their
+                # external pull-ups eliminates the measured back-power path. CLK remains an input
+                # with a weak pull-down, so the armed engine cannot consume phantom clocks.
+                await self.set_signal_pulls(device, port, enabled=False)
+                self._logger.info(
+                    "target rail fell to %.2f V; SD engine and prefetch remain armed", voltage)
+            else:
+                await self.suspend(reason=f"target rail fell to {voltage:.2f} V")
+
+        async def resume_after_power_restore(voltage):
+            nonlocal target_power_active
+            if manage_signal_pulls:
+                await self.set_signal_pulls(device, port, enabled=True)
+                if resume_settle > 0:
+                    await asyncio.sleep(resume_settle)
+                if not self._active:
+                    await self.resume(reason=f"target rail rose to {voltage:.2f} V")
+                target_power_active = True
+                self._logger.info(
+                    "target rail rose to %.2f V; SD card was already listening", voltage)
+            else:
+                try:
+                    await self.resume(reason=f"target rail rose to {voltage:.2f} V")
+                except BaseException:
+                    raise
+
+        target_power_active = False
         try:
             monitor = TargetPowerLifecycle(
                 self._logger,
                 sample_voltage=lambda: device.measure_voltage(str(port)),
-                is_active=lambda: self._active,
+                is_active=(
+                    (lambda: target_power_active) if manage_signal_pulls
+                    else (lambda: self._active)),
                 after_suspend=flush_after_suspend,
-                suspend=lambda voltage: self.suspend(
-                    reason=f"target rail fell to {voltage:.2f} V"),
-                resume=lambda voltage: self.resume(
-                    reason=f"target rail rose to {voltage:.2f} V"),
+                suspend=suspend_for_power_loss,
+                resume=resume_after_power_restore,
                 off_threshold=off_threshold,
                 on_threshold=on_threshold,
                 interval=interval,
@@ -809,10 +859,9 @@ class SDCardApplet(GlasgowAppletV2):
 
     The FPGA stores two tagged 512-byte data blocks and bounded transport FIFOs. Read blocks
     are fetched from the host during the card access delay, and write blocks keep DAT0 busy until
-    the host has written and synchronized them to the image. Target-power monitoring automatically
-    resets protocol and transport state when a device such as a Zaurus removes and restores its
-    SD rail. Images must be 2 KiB aligned and may be as large as 1 GiB, the maximum representable
-    by this CSD v1 profile.
+    the host has written and synchronized them to the image. Target-power monitoring handles
+    devices such as a Zaurus that remove and restore their SD rail. Images must be 2 KiB aligned
+    and may be as large as 1 GiB, the maximum representable by this CSD v1 profile.
 
     The default pins match the SD-to-Glasgow breakout on port A. For port B, use ``--clk B2
     --cmd B5 --dat B1,B0,B7,B6``. The DAT pins are specified in DAT0,DAT1,DAT2,DAT3 order.
@@ -831,13 +880,33 @@ class SDCardApplet(GlasgowAppletV2):
         parser.add_argument("--max-sd-clock", type=parse_transfer_speed,
             default=DEFAULT_TRANSFER_SPEED, metavar="RATE",
             help="constrain gateware for the maximum host clock (default: 25m)")
+        power_idle_group = parser.add_mutually_exclusive_group()
+        power_idle_group.add_argument(
+            "--power-idle-high-z", dest="power_idle_high_z", action="store_true",
+            default=None,
+            help="keep fixed Vio on but remove sourcing pulls while target SD power is absent "
+                 "(default with fixed nonzero Vio and power monitoring)")
+        power_idle_group.add_argument(
+            "--no-power-idle-high-z", dest="power_idle_high_z", action="store_false",
+            help="reset the card engine while target SD power is absent")
+
+    @staticmethod
+    def _resolve_power_idle_high_z(args):
+        if args.power_idle_high_z is not None:
+            return args.power_idle_high_z
+        if getattr(args, "no_power_monitor", False):
+            return False
+        vio = args.voltage.get(args.clk.port)
+        return vio is not None and vio.value is not None and vio.value > 0
 
     def build(self, args):
+        args.power_idle_high_z = self._resolve_power_idle_high_z(args)
         with self.assembly.add_applet(self):
             self.assembly.use_voltage(args.voltage)
             self.sd_card_iface = SDCardInterface(self.logger, self.assembly,
                 clk=args.clk, cmd=args.cmd, dat=args.dat,
-                max_sd_clock=args.max_sd_clock)
+                max_sd_clock=args.max_sd_clock,
+                static_pulls=not args.power_idle_high_z)
             self._sd_port = args.clk.port
 
     @classmethod
@@ -856,20 +925,30 @@ class SDCardApplet(GlasgowAppletV2):
         parser.add_argument("--prime-first-read", action="store_true",
             help="queue sectors 0 and 1 for a latency-sensitive initial two-block read")
         parser.add_argument("--no-power-monitor", action="store_true",
-            help="keep the card and port Vio active while the target rail changes")
-        parser.add_argument("--power-off-threshold", type=float, default=1.0, metavar="V",
-            help="treat the target rail as off below V (default: 1.0)")
-        parser.add_argument("--power-on-threshold", type=float, default=1.8, metavar="V",
-            help="treat the target rail as on above V (default: 1.8)")
-        parser.add_argument("--power-poll-interval", type=float, default=0.25, metavar="SECONDS",
-            help="target-power polling interval (default: 0.25)")
-        parser.add_argument("--power-debounce-samples", type=int, default=3, metavar="COUNT",
-            help="consecutive samples required for a power transition (default: 3)")
+            help="keep the card active while the target rail changes")
+        parser.add_argument("--power-off-threshold", type=float, default=None, metavar="V",
+            help="treat target rail as off below V (high-Z default: 2.7; normal: 1.0)")
+        parser.add_argument("--power-on-threshold", type=float, default=None, metavar="V",
+            help="treat target rail as on above V (high-Z default: 3.0; normal: 1.8)")
+        parser.add_argument("--power-poll-interval", type=float, default=None, metavar="SECONDS",
+            help="target-power polling interval (high-Z default: 0.01; normal: 0.25)")
+        parser.add_argument("--power-debounce-samples", type=int, default=None, metavar="COUNT",
+            help="samples required for a transition (high-Z default: 2; normal: 3)")
+        parser.add_argument("--power-resume-settle", type=float, default=0.005, metavar="SECONDS",
+            help="wait after restoring pulls before enabling the card (default: 0.005)")
         parser.add_argument("--diagnostics-interval", type=float, default=0.0,
             metavar="SECONDS",
             help="periodically log FPGA and backend diagnostics (default: disabled)")
 
     async def setup(self, args):
+        if args.power_idle_high_z and args.no_power_monitor:
+            raise SDCardError("--power-idle-high-z cannot be used with --no-power-monitor")
+        if args.power_idle_high_z:
+            vio = args.voltage.get(self._sd_port)
+            if vio is None or vio.value is None or vio.value == 0:
+                raise SDCardError(
+                    "--power-idle-high-z requires a fixed nonzero Vio, such as -V B=3.3")
+
         if args.no_power_monitor:
             # mirror_voltage() normally protects the target by installing a tight Vsense
             # alert. A Zaurus deliberately removes the SD rail during reboot; that alert
@@ -882,6 +961,20 @@ class SDCardApplet(GlasgowAppletV2):
             self.logger.warning(
                 "target-power protection disabled on port %s; keep Glasgow Vio isolated "
                 "from the target supply", self._sd_port)
+        elif args.power_idle_high_z:
+            # The SD breakout routes target VDD only to SENSE; Glasgow Vio powers the level
+            # translators and is isolated. Keep it enabled, widen any stale alert left by a
+            # sense-following run, remove every sourcing pull, and hold CLK weak-low before
+            # opening the image.
+            await self.device.reset_alert(str(self._sd_port))
+            await self.device.poll_alert()
+            await self.sd_card_iface.set_signal_pulls(
+                self.device, self._sd_port, enabled=False)
+            sense_voltage = await self.device.measure_voltage(str(self._sd_port))
+            self.logger.info(
+                "port %s armed in target-off state: Vio on, card listening, "
+                "CMD/DAT high-impedance, CLK weak-low, sense %.2f V",
+                self._sd_port, sense_voltage)
         try:
             await self.sd_card_iface.configure(
                 args.image, read_only=args.read_only, sync_writes=not args.volatile_writes,
@@ -897,20 +990,41 @@ class SDCardApplet(GlasgowAppletV2):
                 self.sd_card_iface._log_diagnostics(
                     await self.sd_card_iface.read_diagnostics())
 
-        if args.no_power_monitor and args.diagnostics_interval <= 0:
-            await self.sd_card_iface.serve()
-            return
-        async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(self.sd_card_iface.serve())
-            if not args.no_power_monitor:
-                tasks.create_task(self.sd_card_iface.monitor_power(
-                    self.device, self._sd_port,
-                    off_threshold=args.power_off_threshold,
-                    on_threshold=args.power_on_threshold,
-                    interval=args.power_poll_interval,
-                    debounce_samples=args.power_debounce_samples))
-            if args.diagnostics_interval > 0:
-                tasks.create_task(log_diagnostics())
+        high_z = args.power_idle_high_z
+        off_threshold = args.power_off_threshold
+        on_threshold = args.power_on_threshold
+        interval = args.power_poll_interval
+        debounce_samples = args.power_debounce_samples
+        if off_threshold is None:
+            off_threshold = 2.7 if high_z else 1.0
+        if on_threshold is None:
+            on_threshold = 3.0 if high_z else 1.8
+        if interval is None:
+            interval = 0.01 if high_z else 0.25
+        if debounce_samples is None:
+            debounce_samples = 2 if high_z else 3
+
+        try:
+            if args.no_power_monitor and args.diagnostics_interval <= 0:
+                await self.sd_card_iface.serve()
+                return
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self.sd_card_iface.serve())
+                if not args.no_power_monitor:
+                    tasks.create_task(self.sd_card_iface.monitor_power(
+                        self.device, self._sd_port,
+                        off_threshold=off_threshold,
+                        on_threshold=on_threshold,
+                        interval=interval,
+                        debounce_samples=debounce_samples,
+                        manage_signal_pulls=high_z,
+                        resume_settle=args.power_resume_settle))
+                if args.diagnostics_interval > 0:
+                    tasks.create_task(log_diagnostics())
+        finally:
+            if high_z:
+                await self.sd_card_iface.set_signal_pulls(
+                    self.device, self._sd_port, enabled=False)
 
     @classmethod
     def tests(cls):
