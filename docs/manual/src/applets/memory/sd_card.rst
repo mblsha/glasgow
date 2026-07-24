@@ -25,11 +25,25 @@ The applet supports 1-bit and 4-bit SD buses. Pin arguments list the data pins i
     glasgow run memory-sd-card -V B=SB \
         --clk B2 --cmd B5 --dat B1,B0,B7,B6 card.img
 
-The target supplies the I/O voltage through the port B sense pin in this configuration. Use a copy
-of any valuable card image: this applet is preview quality, and all accepted writes and erases are
-written to the image. By default a write or erase remains busy until the host has called ``fsync``;
+The target voltage is measured through the port B sense pin in this configuration; Glasgow's
+isolated Vio regulator supplies the level translators at the measured voltage. Use a copy of any
+valuable card image: this applet is preview quality, and all accepted writes and erases are written
+to the image. By default a write or erase remains busy until the host has called ``fsync``;
 ``--volatile-writes`` provides lower latency at the cost of acknowledging data that may still only
 be in the host page cache.
+
+Targets that remove SD power while Glasgow stays connected can be partially back-powered through
+idle-high signal pins or pull resistors. With a fixed nonzero Vio supply and power monitoring,
+Glasgow automatically uses the target-off high-impedance policy. While the sensed target rail is
+absent, CMD and DAT are released, CLK remains an input with a weak pull-down, and every CMD/DAT
+programmable pull is disabled. The CLK pull-down prevents the armed engine from counting noise as
+clocks, cannot source current into the unpowered target, and is overridden by the powered host. The
+card engine and its prefetched boot sectors remain active across the outage; its idle output
+enables remain inactive until it receives a command. When the sensed rail returns, the CMD/DAT
+pulls are restored without gating command reception on host-side voltage polling.
+``--power-idle-high-z`` selects this policy explicitly, and ``--no-power-idle-high-z`` disables
+it. It cannot be the default for a sense-following Vio setting because the level translators lose
+power with the target.
 
 Each host request and reply is a versioned, length-delimited COBS frame protected by CRC16. A NUL
 delimiter lets either endpoint recover at the next frame after truncated or corrupted USB data.
@@ -73,18 +87,25 @@ The following wiring was verified with a Sharp Zaurus SL-C860:
     * - DAT3
       - B6
 
-Always use ``-V B=SB`` with this wiring. The Zaurus supplies the SD I/O rail, so configuring
-Glasgow to source 3.3 V would connect two power supplies together. Before starting the applet,
-``glasgow voltage`` should report about 3.3 V on port B ``Vsense``. Keep the applet running for the
-entire time that the filesystem is mounted.
+When the Zaurus SD rail is already on, ``-V B=SB`` senses that rail and configures Glasgow's
+isolated level-translator supply to match it. Before starting in that mode, ``glasgow voltage``
+should report about 3.3 V on port B ``Vsense``. Keep the applet running for the entire time that
+the filesystem is mounted.
 
 For the isolated unattended MAINTE SD-first breakout, Glasgow Vio is not connected to the Zaurus
-SD supply. The verified latency-safe configuration is::
+SD supply. Use a fixed translator voltage and the target-off high-impedance state::
 
-    glasgow run memory-sd-card -V B=SB \
+    glasgow run memory-sd-card -V B=3.3 \
         --clk B2 --cmd B5 --dat B1,B0,B7,B6 \
         --max-sd-clock 5m --transfer-speed 1m --one-bit \
-        --prime-first-read --no-power-monitor --diagnostics-interval 2 card.img
+        --prime-first-read --diagnostics-interval 2 card.img
+
+The fixed Vio setting selects the high-impedance policy by default. This profile uses an off
+threshold of 2.7 V and an on threshold of 3.0 V, sampled every 10 ms with two consecutive samples
+required. Those thresholds deliberately bracket the 2.36 V back-power plateau measured on the
+physical SL-C860 breakout and the real approximately 3.3 V SD rail. Pull restoration has a 5 ms
+settling delay, but the card engine is already listening and may respond during that interval.
+Override the ``--power-*`` options only after measuring the target.
 
 The Zaurus driver probes the card lazily and ``/sbin/sdmgr`` keeps the module busy through
 ``/dev/sd_slotstat``. For a deterministic reprobe, first start the applet on the host, then stop the
@@ -127,15 +148,20 @@ Zaurus-specific gotchas
   another TCP connection without allocating it a working shell while an earlier console session
   is still present; close any manual or tmux telnet session first.
 * The Zaurus removes SD power during reboot, but Glasgow itself remains powered. The applet polls
-  the ``Vsense`` rail for the CLK pin's port and automatically suspends, resets, changes transport
-  generation, flushes the image after releasing the SD pins, and resumes when power returns.
-  Reload ``sharp_mmcsd_m`` after reconnecting; the
-  applet itself should remain running. ``--no-power-monitor`` restores the manual behavior.
-  For an unattended MAINTE SD-first boot, use ``--no-power-monitor``: it also widens the port
-  voltage alert so Glasgow's Vio regulator and the CMD transceiver remain active across the rail
-  outage, avoiding a host-side resume delay before the first boot command. This is safe only when
-  the Glasgow Vio output is isolated from the Zaurus SD supply, as it is on the verified breakout;
-  never connect two 3.3 V supply outputs together.
+  the ``Vsense`` rail for the CLK pin's port. In ordinary mode it suspends, resets, changes
+  transport generation, flushes the image, and resumes when power returns. In
+  ``--power-idle-high-z`` mode it instead removes only the external CMD/DAT pulls and flushes the
+  image, preserving both an immediately listening engine and the prefetched boot sectors. MAINTE
+  begins its probe too soon for a host-side USB voltage sample to activate or refill the emulator.
+  Reload ``sharp_mmcsd_m`` after reconnecting; the applet itself should remain running.
+  ``--no-power-monitor`` restores the old always-active behavior, disables the automatic
+  high-impedance default, and must not be used for unattended cold cycling.
+* The physical breakout routes SD VDD to SENSE and leaves Glasgow Vio isolated. With the old
+  always-active profile, idle-high SD signals and their pull-ups raised the unpowered Zaurus SD
+  rail to 2.36 V even when the lab PSU was off. Setting all six pins high-impedance and disabling
+  their pulls reduced SENSE to 0.00 V while Vio remained at 3.3 V. Driving the pins low did the
+  same, but is not used because it could contend with the Zaurus as power returns. The automatic
+  target-off state uses only a weak CLK pull-down; CMD and DAT remain undriven with no pulls.
 * A failed probe can leave the Linux 2.4 block driver with stale device state. Reloading the module
   is more reliable than repeatedly opening ``/dev/mmcda``. If ``rmmod`` reports that the module is
   busy, check for every ``sdmgr`` process rather than trusting only ``/var/run/sdmgr.pid``; an

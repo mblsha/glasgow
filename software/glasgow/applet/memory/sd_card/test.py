@@ -45,6 +45,28 @@ class SDCardAppletTestCase(
         self.assertEqual(self._parse_args(["--transfer-speed", "5m", "card.img"]).transfer_speed,
             5_000_000)
 
+    def test_power_idle_high_z_argument(self):
+        args = self._parse_args(["--power-idle-high-z", "-V", "B=3.3", "card.img"])
+        self.assertTrue(args.power_idle_high_z)
+        self.assertIsNone(args.power_off_threshold)
+        self.assertIsNone(args.power_on_threshold)
+        self.assertIsNone(args.power_poll_interval)
+        self.assertIsNone(args.power_debounce_samples)
+        self.assertEqual(args.power_resume_settle, 0.005)
+
+    def test_power_idle_high_z_default(self):
+        fixed = self._parse_args(["-V", "B=3.3", "--clk", "B2", "card.img"])
+        sensed = self._parse_args(["-V", "B=SB", "--clk", "B2", "card.img"])
+        legacy = self._parse_args(
+            ["-V", "B=3.3", "--clk", "B2", "--no-power-monitor", "card.img"])
+        explicit_off = self._parse_args(
+            ["-V", "B=3.3", "--clk", "B2", "--no-power-idle-high-z", "card.img"])
+        self.assertIsNone(fixed.power_idle_high_z)
+        self.assertTrue(SDCardApplet._resolve_power_idle_high_z(fixed))
+        self.assertFalse(SDCardApplet._resolve_power_idle_high_z(sensed))
+        self.assertFalse(SDCardApplet._resolve_power_idle_high_z(legacy))
+        self.assertFalse(SDCardApplet._resolve_power_idle_high_z(explicit_off))
+
     def test_csd_capacity_through_1_gib(self):
         for size in (2048, 1 << 20, 16 << 20, 512 << 20, 1024 << 20):
             csd = build_csd(size)
