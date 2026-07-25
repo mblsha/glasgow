@@ -32,14 +32,21 @@ class CommandEngine(wiring.Component):
     command_count: Out(32)
     protocol_errors: Out(16)
 
+    def __init__(self, *, capture_cmd17_wire=False):
+        self._capture_cmd17_wire = capture_cmd17_wire
+        super().__init__()
+
     def elaborate(self, platform):
         m = Module()
         _elaborate_command_engine(
-            m, self, self.cmd_i, self.cmd_o, self.cmd_oe, self.enabled, self.control)
+            m, self, self.cmd_i, self.cmd_o, self.cmd_oe, self.enabled, self.control,
+            capture_cmd17_wire=self._capture_cmd17_wire)
         return m
 
 
-def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, control):
+def _elaborate_command_engine(
+        m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, control, *,
+        capture_cmd17_wire=False):
     self = component
     card_state = control.card_state
     data_mode = control.data_mode
@@ -54,6 +61,7 @@ def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, co
     cmd_shift = Signal(48)
     cmd_bits = Signal(range(49))
     cmd_crc_calc = Signal(7)
+    cmd17_capture_bits = Signal(range(49))
     response = ResponseEngine()
     response_active = response.active
 
@@ -62,13 +70,43 @@ def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, co
     cmd_argument = cmd_word[8:40]
     cmd_crc = cmd_word[1:8]
 
-    # These counters are deliberately kept in the SD clock domain. Besides being useful
-    # diagnostics on a real host, they make it possible to distinguish a wiring or clocking
-    # problem from a malformed command frame without buffering a full logic trace.
-    with m.If(enabled_sd):
-        m.d.sd += self.clock_count.eq(self.clock_count + 1)
-        with m.If(~cmd_i):
-            m.d.sd += self.command_low_count.eq(self.command_low_count + 1)
+    if capture_cmd17_wire:
+        # Reuse the parser's existing 48-bit shift path while it is idle during a response. This
+        # captures the pad input—not the intended serializer value—without adding a new cmd_i
+        # sink that could perturb the timing being measured. Once all 48 bits are present, copy
+        # the stable shift register into the ordinary clock-counter storage. Keep the capture
+        # count independent of cmd_crc_calc: at the command end the latter contains CMD17's CRC7
+        # value (0x2a), and relying on an overlapping reset can publish a six-clock fragment of
+        # the original command instead of the complete response.
+        with m.If(enabled_sd & (self.last_command == 17) & cmd_oe):
+            with m.If((cmd17_capture_bits == 0) & ~cmd_i):
+                m.d.sd += [
+                    cmd_shift.eq(cmd_word),
+                    cmd17_capture_bits.eq(1),
+                ]
+            with m.Elif((cmd17_capture_bits != 0) & (cmd17_capture_bits < 48)):
+                with m.If(cmd17_capture_bits == 47):
+                    # Publish the complete response on its final sampled bit. The host may stop
+                    # SDCLK immediately after the end bit, so waiting for a 49th rising edge
+                    # would leave the capture stranded in the parser shift register.
+                    m.d.sd += [
+                        self.clock_count.eq(cmd_word[:32]),
+                        self.command_low_count.eq(cmd_word[32:48]),
+                        cmd17_capture_bits.eq(48),
+                    ]
+                with m.Else():
+                    m.d.sd += [
+                        cmd_shift.eq(cmd_word),
+                        cmd17_capture_bits.eq(cmd17_capture_bits + 1),
+                    ]
+    else:
+        # These counters are deliberately kept in the SD clock domain. Besides being useful
+        # diagnostics on a real host, they make it possible to distinguish a wiring or clocking
+        # problem from a malformed command frame without buffering a full logic trace.
+        with m.If(enabled_sd):
+            m.d.sd += self.clock_count.eq(self.clock_count + 1)
+            with m.If(~cmd_i):
+                m.d.sd += self.command_low_count.eq(self.command_low_count + 1)
 
     response.connect(m, cmd_o, cmd_oe, enabled_sd)
 
@@ -181,15 +219,15 @@ def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, co
                     with m.Else():
                         with m.Switch(cmd_index):
                             with m.Case(0):
-                                    m.d.sd += [
-                                        *response.reset(),
-                                        card_state.eq(CardState.Idle),
-                                        data_mode.eq(DataMode.Idle),
-                                        bus_width_4.eq(0),
-                                        erase_start_valid.eq(0),
-                                        erase_end_valid.eq(0),
-                                        control.card_reset.eq(1),
-                                    ]
+                                m.d.sd += [
+                                    *response.reset(),
+                                    card_state.eq(CardState.Idle),
+                                    data_mode.eq(DataMode.Idle),
+                                    bus_width_4.eq(0),
+                                    erase_start_valid.eq(0),
+                                    erase_end_valid.eq(0),
+                                    control.card_reset.eq(1),
+                                ]
                             with m.Case(1):
                                 # CMD1 is the MMC operating-condition probe. An SD card must not
                                 # respond; legacy hosts such as Sharp MAINTE use that timeout to
@@ -262,6 +300,13 @@ def _elaborate_command_engine(m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, co
                                     load_r1(cmd_index, status_value(extra=1 << 31))
                                 with m.Else():
                                     load_r1(cmd_index, status)
+                                    if capture_cmd17_wire:
+                                        with m.If(cmd_index == 17):
+                                            m.d.sd += [
+                                                self.clock_count.eq(0),
+                                                self.command_low_count.eq(0),
+                                                cmd17_capture_bits.eq(0),
+                                            ]
                                     m.d.sd += current_address.eq(cmd_argument)
                                     with m.Switch(cmd_index):
                                         with m.Case(17):

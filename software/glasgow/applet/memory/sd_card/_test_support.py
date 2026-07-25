@@ -159,6 +159,8 @@ class TestSDCardInterface(SDCardInterface):
         self._csd = ImmediateRegister(0)
         self._scr = ImmediateRegister(0)
         self._diagnostics_snapshot = ImmediateRegister(0)
+        self._boot_data = None
+        self._boot_addresses = None
         self._session = None if backend is None else _BackendSession(
             backend, worker_factory(backend), sync_writes)
         self._worker_factory = worker_factory
@@ -167,6 +169,7 @@ class TestSDCardInterface(SDCardInterface):
         self._lifecycle_lock = asyncio.Lock()
         self._operation_lock = asyncio.Lock()
         self._generation = generation
+        self._transport_epoch = 0
         self._active = backend is not None
         self._flush_count = 0
         self._host_backend_errors = 0

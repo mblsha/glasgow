@@ -4,12 +4,13 @@ import struct
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from glasgow.gateware import cobs as gateware_cobs
 
 from . import (
     BLOCK_SIZE, BackendError, BackendStatus, BackendWorker, FileBlockBackend,
-    HostEvent, HostReply, ReplyFrame, RequestFrame, SDCardDiagnostics,
+    HostEvent, HostReply, ReplyFrame, RequestFrame, SDCardDiagnostics, SDCardError,
 )
 from ._fat16 import FAT16Image, create_fat16_image
 from ._protocol import (
@@ -289,6 +290,23 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_configure_rejects_image_that_does_not_match_embedded_boot_prefix(self):
+        async def scenario():
+            backend = _MemoryBackend(bytes([0x55]) * BLOCK_SIZE * 4)
+            iface = TestSDCardInterface()
+            iface._boot_data = bytes([0xaa]) * BLOCK_SIZE * 2
+            iface._boot_addresses = (0, BLOCK_SIZE * 3)
+
+            with self.assertRaisesRegex(
+                    SDCardError, "do not match the data embedded"):
+                await iface.configure(backend=backend, prime_first_read=True)
+
+            self.assertTrue(backend.closed)
+            self.assertIsNone(iface.backend)
+            self.assertFalse(iface._active)
+
+        asyncio.run(scenario())
+
     def test_reconfigure_failure_disables_and_closes_both_sessions(self):
         events = []
 
@@ -398,15 +416,25 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_power_monitor_removes_backpower_pulls_while_target_is_off(self):
+    def test_power_monitor_rearms_before_on_and_suppresses_late_chatter(self):
         class Device:
             def __init__(self):
-                self.samples = iter((0.0, 0.0, 3.3, 3.3, 2.36, 2.36))
+                self.samples = iter((
+                    0.0, 0.0,
+                    3.3, 3.3,
+                    2.36, 2.36,
+                ))
                 self.last = 2.36
                 self.transitions = []
+                self.delayed_rise = False
 
             async def measure_voltage(self, port):
                 self.last = next(self.samples, self.last)
+                if self.last == 3.3 and not self.delayed_rise:
+                    self.delayed_rise = True
+                    # The card may remain off longer than the chatter cooldown before ON.
+                    # The subsequent rise must restart that cooldown.
+                    await asyncio.sleep(0.02)
                 return self.last
 
             async def set_pulls(self, port, low=set(), high=set()):
@@ -415,22 +443,31 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
         async def scenario():
             device = Device()
-            iface = TestSDCardInterface(_MemoryBackend(bytes(BLOCK_SIZE * 4)))
+            backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+            iface = TestSDCardInterface(backend)
             complete = asyncio.Event()
+            original_rearm = iface.rearm
 
             async def flush():
                 device.transitions.append(("flush",))
-                complete.set()
+                await iface._flush_session(iface._session)
+                if backend.flushes == 2:
+                    complete.set()
 
-            async def suspend(**kwargs):
-                self.fail("high-Z power monitoring must not reset the armed engine")
+            async def rearm(**kwargs):
+                device.transitions.append(("rearm",))
+                self.assertEqual(device.transitions[-2][0], "pulls")
+                self.assertEqual(device.transitions[-2][-1], frozenset())
+                await original_rearm(**kwargs)
 
             iface.flush = flush
-            iface.suspend = suspend
+            iface.rearm = rearm
+            generation = iface._generation
             task = asyncio.create_task(iface.monitor_power(
                 device, "B", off_threshold=2.7, on_threshold=3.0,
                 interval=0.001, debounce_samples=2,
-                manage_signal_pulls=True, resume_settle=0))
+                manage_signal_pulls=True, resume_settle=0,
+                rearm_min_interval=0.01, rearm_reset_hold=0))
             await asyncio.wait_for(complete.wait(), 1)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
@@ -438,18 +475,92 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
             self.assertEqual(
                 [transition[0] for transition in device.transitions],
-                ["pulls", "pulls", "flush"])
+                ["pulls", "rearm", "flush", "pulls", "pulls", "flush"])
             self.assertEqual(
                 device.transitions[0],
-                ("pulls", "B", frozenset({2}), frozenset({0, 1, 5, 6, 7})))
-            self.assertEqual(
-                device.transitions[1],
                 ("pulls", "B", frozenset({2}), frozenset()))
             self.assertTrue(iface._active)
+            self.assertIs(iface.backend, backend)
+            self.assertFalse(backend.closed)
+            self.assertEqual(backend.flushes, 2)
+            self.assertNotEqual(iface._generation, generation)
+            self.assertEqual(iface._enabled.writes, [0, 1])
+            self.assertEqual(iface._pipe.resets, 1)
+            self.assertEqual(iface._read_pipe.resets, 1)
 
         asyncio.run(scenario())
 
-    def test_service_retains_backend_across_transport_reset_on_suspend(self):
+    def test_rearm_holds_reset_while_external_sd_clock_is_stopped(self):
+        async def scenario():
+            backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+            iface = TestSDCardInterface(backend)
+            observed_holds = []
+
+            async def observe_sleep(delay):
+                observed_holds.append(delay)
+                self.assertFalse(iface._active)
+                self.assertEqual(iface._enabled.value, 0)
+
+            with mock.patch(
+                    "glasgow.applet.memory.sd_card.asyncio.sleep",
+                    side_effect=observe_sleep):
+                await iface.rearm(reason="clockless target-off regression", reset_hold=0.125)
+
+            self.assertEqual(observed_holds, [0.125])
+            self.assertEqual(iface._enabled.writes, [0, 1])
+            self.assertEqual(iface._enabled.value, 1)
+            self.assertTrue(iface._active)
+            self.assertIs(iface.backend, backend)
+            self.assertFalse(backend.closed)
+            self.assertEqual(iface._pipe.resets, 1)
+            self.assertEqual(iface._read_pipe.resets, 1)
+
+        asyncio.run(scenario())
+
+    def test_rearm_restores_configuration_cleared_by_hardware_pipe_reset(self):
+        async def scenario():
+            backend = _MemoryBackend(bytes(BLOCK_SIZE * 4))
+            iface = TestSDCardInterface()
+            await iface.configure(
+                backend=backend, prime_first_read=True, support_4bit=False,
+                transfer_speed=1_000_000)
+
+            configuration_registers = (
+                iface._generation_reg,
+                iface._read_only_reg,
+                iface._prime_first_read_reg,
+                iface._image_size,
+                iface._cid,
+                iface._csd,
+                iface._scr,
+            )
+            expected = tuple(register.value for register in configuration_registers)
+            original_reset_transport = iface._reset_transport
+
+            async def destructive_hardware_reset():
+                await original_reset_transport()
+                # HardwareAssembly associates the applet's RW registers with the same domain
+                # reset asserted by each pipe reset. Model that behavior rather than the lighter
+                # fake-pipe reset used by the other host lifecycle tests.
+                for register in configuration_registers:
+                    register.value = 0
+
+            iface._reset_transport = destructive_hardware_reset
+            old_generation = iface._generation
+            await iface.rearm(reason="destructive hardware reset", reset_hold=0)
+
+            actual = tuple(register.value for register in configuration_registers)
+            self.assertNotEqual(actual[0], expected[0])
+            self.assertNotEqual(iface._generation, old_generation)
+            self.assertEqual(actual[1:], expected[1:])
+            self.assertEqual(iface._image_size.value, backend.size)
+            self.assertEqual(iface._prime_first_read_reg.value, 1)
+            self.assertTrue(iface._active)
+            await iface.close()
+
+        asyncio.run(scenario())
+
+    def test_service_retains_backend_across_timed_transport_rearm(self):
         class ResetPipe:
             def __init__(self):
                 self.receiving = asyncio.Event()
@@ -485,16 +596,15 @@ class SDCardInterfaceTestCase(unittest.TestCase):
             service = asyncio.create_task(iface.serve())
             await asyncio.wait_for(pipe.receiving.wait(), 1)
 
-            await iface.suspend(reason="test target-power loss")
-            await asyncio.sleep(0.1)
+            pipe.receiving.clear()
+            await iface.rearm(reason="test target-power loss", reset_hold=0)
+            await asyncio.wait_for(pipe.receiving.wait(), 1)
             self.assertFalse(service.done())
             self.assertIs(iface.backend, backend)
             self.assertFalse(backend.closed)
-
-            pipe.receiving.clear()
-            await iface.resume(reason="test target-power return")
-            await asyncio.wait_for(pipe.receiving.wait(), 1)
-            self.assertFalse(service.done())
+            self.assertTrue(iface._active)
+            self.assertEqual(iface._enabled.value, 1)
+            self.assertGreaterEqual(pipe.resets, 1)
 
             service.cancel()
             with self.assertRaises(asyncio.CancelledError):

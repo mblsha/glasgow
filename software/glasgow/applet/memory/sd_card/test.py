@@ -1,3 +1,5 @@
+import asyncio
+
 from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
 
 from . import (
@@ -53,6 +55,60 @@ class SDCardAppletTestCase(
         self.assertIsNone(args.power_poll_interval)
         self.assertIsNone(args.power_debounce_samples)
         self.assertEqual(args.power_resume_settle, 0.005)
+        self.assertEqual(args.power_rearm_min_interval, 10.0)
+        self.assertEqual(args.power_rearm_reset_hold, 0.05)
+        self.assertFalse(args.trace_commands)
+        self.assertFalse(args.capture_cmd17_wire)
+        self.assertTrue(self._parse_args([
+            "--trace-commands", "--clk", "B2", "card.img",
+        ]).trace_commands)
+        self.assertTrue(self._parse_args([
+            "--capture-cmd17-wire", "--clk", "B2", "card.img",
+        ]).capture_cmd17_wire)
+
+    def test_high_z_setup_clears_voltage_alert_before_arming_signals(self):
+        events = []
+
+        class Device:
+            async def reset_alert(self, port):
+                events.append(("reset-alert", port))
+
+            async def poll_alert(self):
+                events.append(("poll-alert",))
+
+            async def measure_voltage(self, port):
+                events.append(("measure", port))
+                return 0.0
+
+        class Assembly:
+            device = Device()
+
+        class Interface:
+            async def set_signal_pulls(self, device, port, *, enabled):
+                events.append(("pulls", str(port), enabled))
+
+            async def configure(self, image, **kwargs):
+                events.append(("configure", image))
+
+        async def scenario():
+            args = self._parse_args([
+                "--power-idle-high-z", "-V", "B=3.3",
+                "--clk", "B2", "--cmd", "B5", "--dat", "B1,B0,B7,B6",
+                "card.img",
+            ])
+            applet = SDCardApplet(Assembly())
+            applet._sd_port = args.clk.port
+            applet.sd_card_iface = Interface()
+            await applet.setup(args)
+
+        asyncio.run(scenario())
+        self.assertEqual(events, [
+            ("reset-alert", "B"),
+            ("poll-alert",),
+            ("pulls", "B", False),
+            ("measure", "B"),
+            ("configure", "card.img"),
+        ])
 
     def test_power_idle_high_z_default(self):
         fixed = self._parse_args(["-V", "B=3.3", "--clk", "B2", "card.img"])

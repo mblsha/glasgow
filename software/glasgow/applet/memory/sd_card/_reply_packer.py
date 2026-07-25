@@ -19,7 +19,11 @@ HOST_REPLY_WORD_LAYOUT = data.StructLayout({
 })
 HOST_REPLY_WORD_STREAM_SIGNATURE = stream.Signature(HOST_REPLY_WORD_LAYOUT)
 
-RAW_BLOCK_WORD_LAYOUT = data.StructLayout({"data": 64})
+RAW_BLOCK_WORD_LAYOUT = data.StructLayout({
+    "data": 64,
+    "generation": 16,
+    "last": 1,
+})
 RAW_BLOCK_WORD_STREAM_SIGNATURE = stream.Signature(RAW_BLOCK_WORD_LAYOUT)
 
 
@@ -28,14 +32,18 @@ class RawBlockWordPacker(wiring.Component):
 
     i_stream: In(stream.Signature(8))
     o_stream: Out(RAW_BLOCK_WORD_STREAM_SIGNATURE)
+    generation: In(16)
 
     def elaborate(self, platform):
         m = Module()
 
         output_valid = Signal()
         output_data = Signal(64)
+        output_generation = Signal(16)
+        output_last = Signal()
         packed_data = Signal(64)
         packed_count = Signal(range(8))
+        word_count = Signal(range(64))
         output_fire = output_valid & self.o_stream.ready
         output_slot = ~output_valid | self.o_stream.ready
         input_fire = self.i_stream.valid & self.i_stream.ready
@@ -43,6 +51,8 @@ class RawBlockWordPacker(wiring.Component):
             self.i_stream.ready.eq(output_slot),
             self.o_stream.valid.eq(output_valid),
             self.o_stream.p.data.eq(output_data),
+            self.o_stream.p.generation.eq(output_generation),
+            self.o_stream.p.last.eq(output_last),
         ]
 
         with m.If(output_fire):
@@ -52,8 +62,11 @@ class RawBlockWordPacker(wiring.Component):
                 m.d.sync += [
                     output_valid.eq(1),
                     output_data.eq(packed_data | (self.i_stream.payload << 56)),
+                    output_generation.eq(self.generation),
+                    output_last.eq(word_count == 63),
                     packed_data.eq(0),
                     packed_count.eq(0),
+                    word_count.eq(Mux(word_count == 63, 0, word_count + 1)),
                 ]
             with m.Else():
                 m.d.sync += packed_count.eq(packed_count + 1)
