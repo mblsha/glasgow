@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass, replace
 import logging
+from pathlib import Path
 import secrets
 
 from amaranth import *
@@ -82,6 +83,45 @@ class _BackendSession:
     backend: BlockBackend
     worker: BackendWorker
     sync_writes: bool
+    read_only: bool = False
+    prime_first_read: bool = False
+    image_size: int = 0
+    cid: int = 0
+    csd: int = 0
+    scr: int = 0
+
+
+def _read_boot_blocks(image_path):
+    """Read the MBR and first partition boot block used by legacy loaders."""
+    try:
+        with image_path.open("rb") as image:
+            mbr = image.read(BLOCK_SIZE)
+            if len(mbr) != BLOCK_SIZE:
+                raise SDCardError(
+                    f"boot-prefix image must contain at least {BLOCK_SIZE * 2} bytes")
+
+            partition_lba = 1
+            if mbr[510:512] == b"\x55\xaa":
+                for index in range(4):
+                    entry = mbr[446 + index * 16:446 + (index + 1) * 16]
+                    candidate_lba = int.from_bytes(entry[8:12], "little")
+                    sector_count = int.from_bytes(entry[12:16], "little")
+                    if entry[4] != 0 and candidate_lba != 0 and sector_count != 0:
+                        partition_lba = candidate_lba
+                        break
+
+            boot_address = partition_lba * BLOCK_SIZE
+            image.seek(boot_address)
+            partition_boot = image.read(BLOCK_SIZE)
+            if len(partition_boot) != BLOCK_SIZE:
+                raise SDCardError(
+                    f"boot-prefix image does not contain partition boot sector "
+                    f"at LBA {partition_lba}")
+    except OSError as error:
+        raise SDCardError(
+            f"cannot read boot prefix {str(image_path)!r}: {error.strerror}") from error
+
+    return mbr + partition_boot, (0, boot_address)
 
 
 class SDCardComponent(wiring.Component):
@@ -115,9 +155,15 @@ class SDCardComponent(wiring.Component):
     max_host_service_latency: Out(32)
     diagnostics_snapshot: Out(FPGA_DIAGNOSTICS_LAYOUT.size)
 
-    def __init__(self, ports, *, max_sd_clock=25_000_000):
+    def __init__(self, ports, *, max_sd_clock=25_000_000, boot_data=None,
+            boot_addresses=None, capture_cmd17_wire=False):
         self._ports = ports
         self._max_sd_clock = max_sd_clock
+        self._boot_data = boot_data
+        self._capture_cmd17_wire = capture_cmd17_wire
+        self._boot_addresses = (
+            boot_addresses if boot_addresses is not None
+            else (0, BLOCK_SIZE))
         super().__init__()
 
     def elaborate(self, platform):
@@ -173,16 +219,26 @@ class SDCardComponent(wiring.Component):
             ]
         engine_enabled = enabled_sd & configuration_valid
 
-        m.submodules.host_decoder = host_decoder = COBSCRCFrameDecoder(FRAME_CRC16)
+        # Unlike the SD engines, the host transport runs from Glasgow's always-on sync clock.
+        # Reset its sync-side state while the card is disabled so a target power cycle cannot
+        # splice a partial old COBS frame or raw block into the first request of the new session.
+        # Holding enabled low over the sensed power-off interval guarantees this synchronous
+        # reset is observed; no target-provided SD clocks are required.
+        transport_reset = ~self.enabled
+        host_decoder = COBSCRCFrameDecoder(FRAME_CRC16)
+        m.submodules.host_decoder = ResetInserter(transport_reset)(host_decoder)
         wiring.connect(m, host_decoder.i, wiring.flipped(self.i_stream))
 
-        m.submodules.host_reply_packer = host_reply_packer = HostReplyWordPacker()
+        host_reply_packer = HostReplyWordPacker()
+        m.submodules.host_reply_packer = ResetInserter(transport_reset)(host_reply_packer)
         wiring.connect(m, host_decoder.o, host_reply_packer.i_stream)
 
         host_to_sd = AsyncQueue(
             shape=HOST_REPLY_WORD_LAYOUT,
             depth=16, i_domain="sync", o_domain="sd")
-        m.submodules.raw_read_packer = raw_read_packer = RawBlockWordPacker()
+        raw_read_packer = RawBlockWordPacker()
+        m.submodules.raw_read_packer = ResetInserter(transport_reset)(raw_read_packer)
+        m.d.comb += raw_read_packer.generation.eq(self.generation)
         wiring.connect(m, wiring.flipped(self.read_i_stream), raw_read_packer.i_stream)
         raw_read_to_sd = AsyncQueue(
             shape=RAW_BLOCK_WORD_LAYOUT,
@@ -192,24 +248,25 @@ class SDCardComponent(wiring.Component):
         sd_to_host = AsyncQueue(
             shape=data.StructLayout({"data": 8, "end": 1}),
             depth=64, i_domain="sd", o_domain="sync")
-        m.submodules.host_to_sd = host_to_sd
-        m.submodules.raw_read_to_sd = raw_read_to_sd
-        m.submodules.sd_to_host = sd_to_host
+        m.submodules.host_to_sd = ResetInserter({"sync": transport_reset})(host_to_sd)
+        m.submodules.raw_read_to_sd = ResetInserter({"sync": transport_reset})(raw_read_to_sd)
+        m.submodules.sd_to_host = ResetInserter({"sync": transport_reset})(sd_to_host)
         wiring.connect(m, host_to_sd.i, host_reply_packer.o_stream)
         wiring.connect(m, raw_read_to_sd.i, raw_read_packer.o_stream)
 
-        m.submodules.host_encoder = host_encoder = COBSCRCFrameEncoder(
-            FRAME_CRC16, fifo_depth=1024)
+        host_encoder = COBSCRCFrameEncoder(FRAME_CRC16, fifo_depth=1024)
+        m.submodules.host_encoder = ResetInserter(transport_reset)(host_encoder)
         wiring.connect(m, host_encoder.i, sd_to_host.o)
         wiring.connect(m, wiring.flipped(self.o_stream), host_encoder.o)
         m.d.sync += self.o_flush.eq(0)
         with m.If(self.o_stream.valid & self.o_stream.ready & (self.o_stream.payload == 0)):
             m.d.sync += self.o_flush.eq(1)
 
-        m.submodules.block_buffer = block_buffer = BlockBuffer()
+        m.submodules.block_buffer = block_buffer = BlockBuffer(boot_data=self._boot_data)
 
         dat_i = Cat(*(buffer.i for buffer in dat_buffers))
-        m.submodules.command_engine = command_engine = CommandEngine()
+        m.submodules.command_engine = command_engine = CommandEngine(
+            capture_cmd17_wire=self._capture_cmd17_wire)
         m.submodules.data_engine = data_engine = DataEngine()
         m.submodules.host_engine = host_engine = HostBlockEngine()
         diagnostics_snapshot = data.View(
@@ -238,6 +295,11 @@ class SDCardComponent(wiring.Component):
             data_engine.scr.eq(configuration.scr),
             data_engine.image_size.eq(configuration.image_size),
             data_engine.prime_first_read.eq(configuration.prime_first_read),
+            data_engine.boot_preinitialized.eq(self._boot_data is not None),
+            data_engine.boot_address_0.eq(self._boot_addresses[0]),
+            data_engine.boot_address_1.eq(self._boot_addresses[1]),
+            data_engine.boot_restored.eq(block_buffer.boot_restored),
+            block_buffer.restore_boot.eq(data_engine.restore_boot),
 
             host_engine.generation.eq(configuration.generation),
             host_engine.image_size.eq(configuration.image_size),
@@ -310,7 +372,8 @@ class SDCardInterface:
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
             clk: GlasgowPin, cmd: GlasgowPin, dat: tuple[GlasgowPin, ...],
             max_sd_clock: int = DEFAULT_TRANSFER_SPEED,
-            static_pulls: bool = True,
+            static_pulls: bool = True, boot_data=None, boot_addresses=None,
+            capture_cmd17_wire=False,
             worker_factory=BackendWorker):
         self._logger = logger
         self._level = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
@@ -321,7 +384,13 @@ class SDCardInterface:
         if static_pulls:
             assembly.use_pulls({cmd: "high", dat: "high"})
         component = assembly.add_submodule(
-            SDCardComponent(ports, max_sd_clock=max_sd_clock))
+            SDCardComponent(
+                ports, max_sd_clock=max_sd_clock, boot_data=boot_data,
+                boot_addresses=boot_addresses,
+                capture_cmd17_wire=capture_cmd17_wire))
+        self._boot_data = boot_data
+        self._boot_addresses = (
+            boot_addresses if boot_data is not None else None)
         self._pipe = assembly.add_inout_pipe(
             component.o_stream, component.i_stream, in_flush=component.o_flush,
             in_fifo_depth=0, out_fifo_depth=0,
@@ -359,6 +428,7 @@ class SDCardInterface:
         self._lifecycle_lock = asyncio.Lock()
         self._operation_lock = asyncio.Lock()
         self._generation = 0
+        self._transport_epoch = 0
         self._active = False
         self._flush_count = 0
         self._host_backend_errors = 0
@@ -377,6 +447,28 @@ class SDCardInterface:
             generation = secrets.randbits(16)
         self._generation = generation
         return generation
+
+    async def _reset_transport(self):
+        # A service coroutine may still be blocked in recv_until() while the USB pipes are
+        # reset. Record the reset before touching either pipe so serve() can distinguish the
+        # resulting cancellation/error from an actual applet failure even if the card has
+        # already been re-enabled by the time the exception is delivered.
+        self._transport_epoch += 1
+        await self._pipe.reset()
+        await self._read_pipe.reset()
+
+    async def _write_card_configuration(self, session, generation):
+        # Hardware pipe reset asserts the complete applet clock-domain reset. The RW registers
+        # live in that same domain, so resetting either transport also clears every card setting,
+        # not only the pipe state. Always restore the coherent retained configuration after the
+        # reset and before enabling the SD clock domain.
+        await self._generation_reg.set(generation)
+        await self._read_only_reg.set(session.read_only)
+        await self._prime_first_read_reg.set(session.prime_first_read)
+        await self._image_size.set(session.image_size)
+        await self._cid.set(session.cid)
+        await self._csd.set(session.csd)
+        await self._scr.set(session.scr)
 
     async def configure(self, image_path: str | None = None, *,
             backend: BlockBackend | None = None, read_only: bool = False,
@@ -398,6 +490,22 @@ class SDCardInterface:
                 size, read_only=backend.read_only, transfer_speed=transfer_speed)
             cid = build_cid(serial=backend.identity)
             scr = build_scr(support_4bit=support_4bit)
+            new_session = replace(
+                new_session,
+                read_only=backend.read_only,
+                prime_first_read=prime_first_read,
+                image_size=size,
+                cid=cid,
+                csd=csd,
+                scr=scr)
+            if self._boot_data is not None:
+                actual_boot_data = b"".join(
+                    [await worker.read_block(address)
+                     for address in self._boot_addresses])
+                if actual_boot_data != self._boot_data:
+                    raise SDCardError(
+                        "the image boot blocks do not match the data embedded "
+                        "in this bitstream")
             if isinstance(backend, FileBlockBackend):
                 # Prime the bounded host read-ahead cache before the FPGA can issue its first
                 # request. The Sharp PXA25x driver can time out its FIFO before an uncached
@@ -419,21 +527,14 @@ class SDCardInterface:
                 try:
                     await self._enabled.set(0)
                     self._active = False
-                    await self._pipe.reset()
-                    await self._read_pipe.reset()
+                    await self._reset_transport()
                     old_session = self._session
                     self._session = None
                     if old_session is not None:
                         await self._retire_session(old_session, operation="reconfigure")
 
                     generation = self._next_generation()
-                    await self._generation_reg.set(generation)
-                    await self._read_only_reg.set(backend.read_only)
-                    await self._prime_first_read_reg.set(prime_first_read)
-                    await self._image_size.set(size)
-                    await self._cid.set(cid)
-                    await self._csd.set(csd)
-                    await self._scr.set(scr)
+                    await self._write_card_configuration(new_session, generation)
                     self._flush_count = 0
                     self._host_backend_errors = 0
                     self._session = new_session
@@ -511,25 +612,57 @@ class SDCardInterface:
                 if after_disable is not None:
                     await after_disable()
                 await self._generation_reg.set(self._next_generation())
-                await self._pipe.reset()
-                await self._read_pipe.reset()
+                await self._reset_transport()
 
     async def resume(self, *, reason: str = "requested"):
         async with self._lifecycle_lock:
             async with self._operation_lock:
                 if self._session is None or self._active:
                     return
-                await self._pipe.reset()
-                await self._read_pipe.reset()
-                await self._generation_reg.set(self._next_generation())
+                await self._reset_transport()
+                await self._write_card_configuration(
+                    self._session, self._next_generation())
                 await self._enabled.set(1)
                 self._active = True
                 self._logger.info(
                     "resumed SD card: %s (generation %#06x)", reason, self._generation)
 
+    async def rearm(self, *, reason: str = "requested", reset_hold: float = 0.05,
+            after_disable=None):
+        """Reset and re-enable the card while retaining its backing session."""
+        if reset_hold < 0:
+            raise SDCardError("reset hold time must be nonnegative")
+        async with self._lifecycle_lock:
+            async with self._operation_lock:
+                if self._session is None:
+                    return
+                self._logger.info("rearming SD card: %s", reason)
+                self._active = False
+                await self._enabled.set(0)
+                if after_disable is not None:
+                    await after_disable()
+                if reset_hold > 0:
+                    # Glasgow's transport and target-clock domains have different reset
+                    # mechanisms. Keep enabled low for a real interval so the always-running
+                    # sync side certainly resets even when external SD CLK has stopped.
+                    await asyncio.sleep(reset_hold)
+                await self._reset_transport()
+                await self._write_card_configuration(
+                    self._session, self._next_generation())
+                await self._enabled.set(1)
+                self._active = True
+                self._logger.info(
+                    "rearmed SD card: %s (generation %#06x)", reason, self._generation)
+
     async def monitor_power(self, device, port, *, off_threshold: float = 1.0,
             on_threshold: float = 1.8, interval: float = 0.25, debounce_samples: int = 3,
-            manage_signal_pulls: bool = False, resume_settle: float = 0.0):
+            manage_signal_pulls: bool = False, resume_settle: float = 0.0,
+            rearm_min_interval: float = 0.0, rearm_reset_hold: float = 0.05):
+        if rearm_min_interval < 0:
+            raise SDCardError("power rearm minimum interval must be nonnegative")
+        if rearm_reset_hold < 0:
+            raise SDCardError("power rearm reset hold must be nonnegative")
+
         async def flush_after_suspend():
             try:
                 await self.flush()
@@ -537,39 +670,73 @@ class SDCardInterface:
                 self._record_backend_error("power-loss flush", error)
 
         async def suspend_for_power_loss(voltage):
-            nonlocal target_power_active
+            nonlocal target_power_active, last_rearm
             target_power_active = False
             if manage_signal_pulls:
-                # Do not reset or disable the card engine here. MAINTE probes too soon after the
-                # rising rail for host-side polling to reactivate it, and resetting also discards
-                # the prefetched boot sectors. At idle the engine releases CMD/DAT; removing their
-                # external pull-ups eliminates the measured back-power path. CLK remains an input
-                # with a weak pull-down, so the armed engine cannot consume phantom clocks.
+                # Remove every sourcing pull, reset all protocol and transport state for a
+                # guaranteed interval, then leave the fresh engine listening while the target
+                # remains off. On this Zaurus the SD rail does not rise until ON, so waiting for
+                # that edge to re-enable loses the beginning of MAINTE initialization.
                 await self.set_signal_pulls(device, port, enabled=False)
-                self._logger.info(
-                    "target rail fell to %.2f V; SD engine and prefetch remain armed", voltage)
+                now = asyncio.get_running_loop().time()
+                if now - last_rearm >= rearm_min_interval:
+                    await self.rearm(
+                        reason=f"target rail fell to {voltage:.2f} V",
+                        reset_hold=rearm_reset_hold)
+                    last_rearm = asyncio.get_running_loop().time()
+                    self._logger.info(
+                        "target rail fell to %.2f V; fresh SD engine rearmed", voltage)
+                else:
+                    self._logger.info(
+                        "target rail fell to %.2f V only %.3f s after rearm; "
+                        "kept fresh engine armed through boot-time rail chatter",
+                        voltage, now - last_rearm)
             else:
                 await self.suspend(reason=f"target rail fell to {voltage:.2f} V")
 
         async def resume_after_power_restore(voltage):
-            nonlocal target_power_active
+            nonlocal target_power_active, last_rearm
             if manage_signal_pulls:
                 await self.set_signal_pulls(device, port, enabled=True)
                 if resume_settle > 0:
                     await asyncio.sleep(resume_settle)
                 if not self._active:
                     await self.resume(reason=f"target rail rose to {voltage:.2f} V")
+                # Anchor chatter suppression to every real rise. The target may remain off for
+                # hours after rearming, while its characteristic second dip follows ON closely.
+                last_rearm = asyncio.get_running_loop().time()
                 target_power_active = True
                 self._logger.info(
-                    "target rail rose to %.2f V; SD card was already listening", voltage)
+                    "target rail rose to %.2f V; fresh SD card is listening", voltage)
             else:
-                try:
-                    await self.resume(reason=f"target rail rose to {voltage:.2f} V")
-                except BaseException:
-                    raise
+                await self.resume(reason=f"target rail rose to {voltage:.2f} V")
 
         target_power_active = False
+        last_rearm = float("-inf")
         try:
+            if manage_signal_pulls:
+                # Establish a safe initial state before entering the edge-oriented debouncer.
+                # The applet may be started with either an already-powered target or a fully
+                # unpowered one. In the latter case configure() has briefly enabled the engine,
+                # so perform a complete timed rearm now and leave the fresh card listening.
+                initial_voltage = await device.measure_voltage(str(port))
+                if initial_voltage > on_threshold:
+                    await self.set_signal_pulls(device, port, enabled=True)
+                    target_power_active = True
+                    self._logger.info(
+                        "target rail initially active at %.2f V; SD card listening",
+                        initial_voltage)
+                else:
+                    await self.set_signal_pulls(device, port, enabled=False)
+                    await self.rearm(
+                        reason=f"target rail initially at {initial_voltage:.2f} V",
+                        reset_hold=rearm_reset_hold)
+                    await flush_after_suspend()
+                    last_rearm = asyncio.get_running_loop().time()
+                    self._logger.info(
+                        "target rail initially at %.2f V; fresh SD engine armed before ON",
+                        initial_voltage)
+
             monitor = TargetPowerLifecycle(
                 self._logger,
                 sample_voltage=lambda: device.measure_voltage(str(port)),
@@ -789,8 +956,9 @@ class SDCardInterface:
             # One unframed 512-byte block maps to one full USB high-speed packet. USB already
             # supplies link CRC and the FPGA accepts it only for the sole outstanding tagged read
             # transaction; avoiding a short second packet is essential for the PXA25x timer.
-            await self._read_pipe.send(b"".join(raw_blocks))
-            await self._read_pipe.flush()
+            if raw_blocks:
+                await self._read_pipe.send(b"".join(raw_blocks))
+                await self._read_pipe.flush()
 
         elif header.opcode == HostEvent.Write:
             address = fields["address"]
@@ -830,21 +998,24 @@ class SDCardInterface:
                 if not self._active:
                     await asyncio.sleep(0.05)
                     continue
+                transport_epoch = self._transport_epoch
                 try:
                     await self.serve_once()
                 except asyncio.CancelledError:
                     # Pipe reset cancels the pending receive future without cancelling this task.
                     # Preserve ordinary task cancellation so shutdown still reaches close().
                     task = asyncio.current_task()
-                    if (self._session is not None and not self._active and
+                    if (self._session is not None and
+                            (not self._active or transport_epoch != self._transport_epoch) and
                             task is not None and task.cancelling() == 0):
                         continue
                     raise
                 except Exception:
-                    # A deliberate target-power suspend resets the transport to
-                    # discard partial frames. Keep serving the retained backend
-                    # after resume instead of treating that reset as shutdown.
-                    if self._session is not None and not self._active:
+                    # A deliberate lifecycle transition resets the transport to discard partial
+                    # frames. It may immediately rearm, so use the reset epoch rather than only
+                    # the current active flag to recognize and retain the backend session.
+                    if (self._session is not None and
+                            (not self._active or transport_epoch != self._transport_epoch)):
                         continue
                     raise
         finally:
@@ -880,6 +1051,10 @@ class SDCardApplet(GlasgowAppletV2):
         parser.add_argument("--max-sd-clock", type=parse_transfer_speed,
             default=DEFAULT_TRANSFER_SPEED, metavar="RATE",
             help="constrain gateware for the maximum host clock (default: 25m)")
+        parser.add_argument("--boot-prefix", type=Path, metavar="IMAGE",
+            help="embed IMAGE MBR and first partition boot sector for deterministic startup")
+        parser.add_argument("--capture-cmd17-wire", action="store_true",
+            help="diagnostic build: capture the pad-observed CMD17 R1 in clock counters")
         power_idle_group = parser.add_mutually_exclusive_group()
         power_idle_group.add_argument(
             "--power-idle-high-z", dest="power_idle_high_z", action="store_true",
@@ -901,11 +1076,18 @@ class SDCardApplet(GlasgowAppletV2):
 
     def build(self, args):
         args.power_idle_high_z = self._resolve_power_idle_high_z(args)
+        boot_data = None
+        boot_addresses = None
+        if args.boot_prefix is not None:
+            boot_data, boot_addresses = _read_boot_blocks(args.boot_prefix)
         with self.assembly.add_applet(self):
             self.assembly.use_voltage(args.voltage)
             self.sd_card_iface = SDCardInterface(self.logger, self.assembly,
                 clk=args.clk, cmd=args.cmd, dat=args.dat,
                 max_sd_clock=args.max_sd_clock,
+                boot_data=boot_data,
+                boot_addresses=boot_addresses,
+                capture_cmd17_wire=args.capture_cmd17_wire,
                 static_pulls=not args.power_idle_high_z)
             self._sd_port = args.clk.port
 
@@ -936,9 +1118,19 @@ class SDCardApplet(GlasgowAppletV2):
             help="samples required for a transition (high-Z default: 2; normal: 3)")
         parser.add_argument("--power-resume-settle", type=float, default=0.005, metavar="SECONDS",
             help="wait after restoring pulls before enabling the card (default: 0.005)")
+        parser.add_argument("--power-rearm-min-interval", type=float, default=10.0,
+            metavar="SECONDS",
+            help="suppress repeated engine resets during boot-time rail chatter "
+                 "(default: 10.0)")
+        parser.add_argument("--power-rearm-reset-hold", type=float, default=0.05,
+            metavar="SECONDS",
+            help="hold all SD and host-transport state in reset before off-rail rearming "
+                 "(default: 0.05)")
         parser.add_argument("--diagnostics-interval", type=float, default=0.0,
             metavar="SECONDS",
             help="periodically log FPGA and backend diagnostics (default: disabled)")
+        parser.add_argument("--trace-commands", action="store_true",
+            help="log command-counter/last-command transitions for target debugging")
 
     async def setup(self, args):
         if args.power_idle_high_z and args.no_power_monitor:
@@ -990,6 +1182,31 @@ class SDCardApplet(GlasgowAppletV2):
                 self.sd_card_iface._log_diagnostics(
                     await self.sd_card_iface.read_diagnostics())
 
+        async def trace_commands():
+            previous_command = None
+            while True:
+                # This register already exists independently of the packed diagnostic snapshot,
+                # so command tracing remains usable with a prebuilt bitstream. Poll it alone to
+                # keep the sampling interval below a legacy 1 Mbit/s single-block transfer; read
+                # the counter only after a transition, where it is useful context rather than a
+                # prerequisite for observing the command.
+                last_command = await self.sd_card_iface.last_command
+                if last_command != previous_command:
+                    if args.capture_cmd17_wire and previous_command == 17:
+                        wire_low = await self.sd_card_iface.clock_count
+                        wire_high = await self.sd_card_iface.command_low_count
+                        wire_response = ((wire_high << 32) | wire_low) & ((1 << 48) - 1)
+                        self.logger.info(
+                            "CMD17 pad-observed R1: %012x", wire_response)
+                    command_count = await self.sd_card_iface.command_count
+                    self.logger.info(
+                        "SD command trace: count~%d last=CMD%d",
+                        command_count, last_command)
+                    previous_command = last_command
+                # Leave headroom for the 10 ms target-power monitor and the block-service
+                # worker; an unthrottled USB register loop can otherwise delay a SENSE edge.
+                await asyncio.sleep(0.001)
+
         high_z = args.power_idle_high_z
         off_threshold = args.power_off_threshold
         on_threshold = args.power_on_threshold
@@ -1010,6 +1227,8 @@ class SDCardApplet(GlasgowAppletV2):
                 return
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(self.sd_card_iface.serve())
+                if args.trace_commands:
+                    tasks.create_task(trace_commands())
                 if not args.no_power_monitor:
                     tasks.create_task(self.sd_card_iface.monitor_power(
                         self.device, self._sd_port,
@@ -1018,7 +1237,9 @@ class SDCardApplet(GlasgowAppletV2):
                         interval=interval,
                         debounce_samples=debounce_samples,
                         manage_signal_pulls=high_z,
-                        resume_settle=args.power_resume_settle))
+                        resume_settle=args.power_resume_settle,
+                        rearm_min_interval=args.power_rearm_min_interval,
+                        rearm_reset_hold=args.power_rearm_reset_hold))
                 if args.diagnostics_interval > 0:
                     tasks.create_task(log_diagnostics())
         finally:

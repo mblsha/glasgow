@@ -11,7 +11,14 @@ from ._lanes import SDDataLaneCodec
 from ._read_buffer import ReadBufferManager
 
 
-__all__ = ["DataEngine"]
+__all__ = ["READ_NAC_CLOCKS", "DataEngine"]
+
+
+# Leave a small card access-time (Nac) interval between the final R1 response bit and the data
+# start token. A zero-gap response is legal in the abstract protocol model but is unlike a
+# physical card and can race legacy host-controller software while it consumes the response.
+# Keep this much shorter than the PXA25x driver's first-data timeout.
+READ_NAC_CLOCKS = 8
 
 
 class DataEngine(wiring.Component):
@@ -21,6 +28,11 @@ class DataEngine(wiring.Component):
     scr: In(64)
     image_size: In(IMAGE_SIZE_WIDTH)
     prime_first_read: In(1)
+    boot_preinitialized: In(1)
+    boot_address_0: In(32)
+    boot_address_1: In(32)
+    boot_restored: In(1)
+    restore_boot: Out(1)
 
     control: In(CommandDataSignature())
     storage: Out(DataHostSignature())
@@ -69,6 +81,9 @@ def _elaborate_data_transfer_engine(
     m.d.comb += [
         read_buffers.reset.eq(
             stop_requested | ((data_mode == DataMode.Idle) & ~boot_prime_active)),
+        read_buffers.preload_boot.eq(0),
+        read_buffers.preload_boot_address_0.eq(self.boot_address_0),
+        read_buffers.preload_boot_address_1.eq(self.boot_address_1),
         read_buffers.lookup_address.eq(current_address),
         read_buffers.reserve.eq(0),
         read_buffers.reserve_address.eq(0),
@@ -76,6 +91,7 @@ def _elaborate_data_transfer_engine(
         read_buffers.discard_stale.eq(0),
         read_buffers.activate.eq(0),
         read_buffers.release.eq(0),
+        self.restore_boot.eq(0),
     ]
 
     m.d.comb += [
@@ -172,16 +188,22 @@ def _elaborate_data_transfer_engine(
                     # ordinary idle reset and are consumed by that first transfer. CMD0 re-arms
                     # this path for every target reboot even when Glasgow stays powered.
                     m.d.comb += read_buffers.lookup_address.eq(0)
-                    reserve_address = read_buffers.ready_ahead * BLOCK_SIZE
-                    m.d.comb += [
-                        read_buffers.reserve_address.eq(reserve_address),
-                        read_buffers.reserve_blocks.eq(2),
-                    ]
-                    with m.If(read_buffers.reserve_ready &
-                              (read_buffers.ready_ahead < BUFFER_BLOCKS)):
-                        m.d.comb += read_buffers.reserve.eq(1)
-                    with m.If(read_buffers.ready_ahead == BUFFER_BLOCKS):
-                        m.d.sd += boot_prime_active.eq(0)
+                    with m.If(self.boot_preinitialized):
+                        m.d.comb += self.restore_boot.eq(1)
+                        with m.If(self.boot_restored):
+                            m.d.comb += read_buffers.preload_boot.eq(1)
+                            m.d.sd += boot_prime_active.eq(0)
+                    with m.Else():
+                        reserve_address = read_buffers.ready_ahead * BLOCK_SIZE
+                        m.d.comb += [
+                            read_buffers.reserve_address.eq(reserve_address),
+                            read_buffers.reserve_blocks.eq(2),
+                        ]
+                        with m.If(read_buffers.reserve_ready &
+                                  (read_buffers.ready_ahead < BUFFER_BLOCKS)):
+                            m.d.comb += read_buffers.reserve.eq(1)
+                        with m.If(read_buffers.ready_ahead == BUFFER_BLOCKS):
+                            m.d.sd += boot_prime_active.eq(0)
                 with m.Else():
                     with m.Switch(data_mode):
                         with m.Case(DataMode.ReadSingle, DataMode.ReadMulti):
@@ -198,20 +220,20 @@ def _elaborate_data_transfer_engine(
                                 m.d.comb += read_buffers.activate.eq(1)
                                 m.d.sd += [
                                     data_byte.eq(0),
-                                    data_bit.eq(0),
+                                    data_bit.eq(READ_NAC_CLOCKS),
                                 ]
                                 for lane in range(4):
                                     m.d.sd += crc_lanes[lane].eq(0)
-                                m.next = "Read-Start"
+                                m.next = "Read-Nac"
                         with m.Case(DataMode.ReadSCR, DataMode.ReadSDStatus):
                             with m.If(~response_active):
                                 m.d.sd += [
                                     data_byte.eq(0),
-                                    data_bit.eq(0),
+                                    data_bit.eq(READ_NAC_CLOCKS),
                                 ]
                                 for lane in range(4):
                                     m.d.sd += crc_lanes[lane].eq(0)
-                                m.next = "Read-Start"
+                                m.next = "Read-Nac"
                         with m.Case(DataMode.WriteSingle, DataMode.WriteMulti):
                             with m.If(~response_active):
                                 m.next = "Write-Wait-Start"
@@ -219,6 +241,18 @@ def _elaborate_data_transfer_engine(
                             with m.If(~response_active):
                                 m.d.sd += erase_request.eq(1)
                                 m.next = "Busy"
+
+        with m.State("Read-Nac"):
+            # Keep DAT released while the host finishes consuming the command response. This is
+            # the initial read-data access interval; Read-Gap separately handles CMD18 blocks.
+            with m.If(stop_requested | ~valid_read):
+                m.next = "Idle"
+            with m.Elif(data_bit == 0):
+                m.next = "Read-Start"
+            with m.Else():
+                # data_bit is otherwise idle between the response and the first data bit, so
+                # reusing it avoids another counter on the nearly full iCE40.
+                m.d.sd += data_bit.eq(data_bit - 1)
 
         with m.State("Read-Start"):
             m.d.comb += [

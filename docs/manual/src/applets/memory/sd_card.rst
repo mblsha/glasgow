@@ -150,9 +150,16 @@ Zaurus-specific gotchas
 * The Zaurus removes SD power during reboot, but Glasgow itself remains powered. The applet polls
   the ``Vsense`` rail for the CLK pin's port. In ordinary mode it suspends, resets, changes
   transport generation, flushes the image, and resumes when power returns. In
-  ``--power-idle-high-z`` mode it instead removes only the external CMD/DAT pulls and flushes the
-  image, preserving both an immediately listening engine and the prefetched boot sectors. MAINTE
-  begins its probe too soon for a host-side USB voltage sample to activate or refill the emulator.
+  ``--power-idle-high-z`` mode the first debounced fall removes the external CMD/DAT pulls,
+  flushes the image, resets both protocol and host transports, and rearms the card while the
+  target is still off. A minimum rearm interval suppresses another full reset during the same
+  startup's rail chatter. MAINTE begins its probe too soon for a host-side USB voltage sample to
+  activate or refill the emulator, so command reception never waits for the power poll.
+
+  Hardware pipe reset also resets the applet-domain RW registers. The host lifecycle therefore
+  rewrites generation, write protection, boot priming, image size, CID, CSD, and SCR after every
+  transport reset and before enabling the card. Omitting that restoration leaves
+  ``image_size=0`` and makes the first valid CMD17 return a CRC-valid ``ADDRESS_OUT_OF_RANGE`` R1.
   Reload ``sharp_mmcsd_m`` after reconnecting; the applet itself should remain running.
   ``--no-power-monitor`` restores the old always-active behavior, disables the automatic
   high-impedance default, and must not be used for unattended cold cycling.

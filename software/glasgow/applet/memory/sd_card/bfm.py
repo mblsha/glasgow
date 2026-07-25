@@ -48,9 +48,16 @@ class SDHostBFM:
 
     async def receive_response(self, length, *, timeout_cycles=16):
         bits = []
+        started = False
         for _ in range(length + timeout_cycles):
             command_oe, command_o, _ = await self.cycle()
-            if command_oe:
+            # A card may turn the bidirectional CMD buffer around while keeping the line at its
+            # idle-high level. The wire-format response starts at the first driven low bit, not
+            # at output-enable assertion.
+            if not started:
+                started = command_oe and command_o == 0
+            if started:
+                self.testcase.assertEqual(command_oe, 1)
                 bits.append(command_o)
                 if len(bits) == length:
                     break

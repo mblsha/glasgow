@@ -104,6 +104,7 @@ def _elaborate_host_block_engine(
     reply_header = Signal(REPLY_GATEWARE_SCHEMA.layout)
     reply_header_count = Signal(range(REPLY_SCHEMA.size + 1))
     reply_count = Signal(range(BLOCK_SIZE + 1))
+    raw_stale_block = Signal()
     m.d.comb += [
         self.transaction_phase.eq(transaction.phase),
         self.reply_header_bytes.eq(reply_header_count),
@@ -116,6 +117,7 @@ def _elaborate_host_block_engine(
     reply_error = i_stream.p.error
     reply_fire = i_stream.valid & i_stream.ready
     raw_read_fire = read_i_stream.valid & read_i_stream.ready
+    raw_read_current = read_i_stream.p.generation == self.generation
     speculative_read_pending = speculative_read_count != 0
     speculative_read_matches = read.request_address == speculative_read_address
     discard_speculative_read = speculative_read_pending & (
@@ -195,11 +197,11 @@ def _elaborate_host_block_engine(
                 # A two-block backend fetch may leave its second, sequential packet in the raw
                 # pipe when CMD12 changes the target's next address. Drain that exactly one
                 # packet before accepting the unrelated request; it must never be relabelled.
-                m.d.sd += reply_count.eq(0)
+                m.d.sd += [reply_count.eq(0), raw_stale_block.eq(0)]
                 m.next = "Raw-Discard"
             with m.Elif((transaction.phase == TransactionPhase.AwaitReply) &
                       (transaction.event == HostEvent.Read)):
-                m.d.sd += reply_count.eq(0)
+                m.d.sd += [reply_count.eq(0), raw_stale_block.eq(0)]
                 m.next = "Raw-Read"
             with m.Else():
                 # Framed replies are retained for write/erase acknowledgements. Read data uses
@@ -227,12 +229,29 @@ def _elaborate_host_block_engine(
         with m.State("Raw-Read"):
             m.d.comb += [
                 read_i_stream.ready.eq(1),
-                block_buffer.write_en.eq(Mux(raw_read_fire, C(0xff, 8), 0)),
+                block_buffer.write_en.eq(Mux(
+                    raw_read_fire & raw_read_current & ~raw_stale_block,
+                    C(0xff, 8), 0)),
                 block_buffer.write_address.eq(Cat(reply_count[:9], transaction.bank)),
                 block_buffer.write_data.eq(read_i_stream.p.data),
             ]
             with m.If(raw_read_fire):
-                with m.If(reply_count == BLOCK_SIZE - 8):
+                with m.If(raw_stale_block | ~raw_read_current):
+                    with m.If(read_i_stream.p.last):
+                        m.d.sd += [
+                            raw_stale_block.eq(0),
+                            reply_count.eq(0),
+                            self.stale_replies.eq(self.stale_replies + 1),
+                        ]
+                    with m.Else():
+                        m.d.sd += [
+                            raw_stale_block.eq(1),
+                            reply_count.eq(Mux(
+                                reply_count == BLOCK_SIZE - 8,
+                                0, reply_count + 8)),
+                        ]
+                with m.Elif((reply_count == BLOCK_SIZE - 8) &
+                            read_i_stream.p.last):
                     m.d.sd += [
                         read_buffer_ready.eq(1),
                         read_buffer_address.eq(transaction.address),
@@ -247,14 +266,42 @@ def _elaborate_host_block_engine(
                             speculative_read_address.eq(transaction.address + BLOCK_SIZE),
                         ]
                     m.next = "Header"
+                with m.Elif(read_i_stream.p.last |
+                            (reply_count == BLOCK_SIZE - 8)):
+                    m.d.sd += [
+                        read_reply_error.eq(1),
+                        transaction.phase.eq(TransactionPhase.Idle),
+                        reply_count.eq(0),
+                        self.protocol_errors.eq(self.protocol_errors + 1),
+                    ]
+                    m.next = "Header"
                 with m.Else():
                     m.d.sd += reply_count.eq(reply_count + 8)
 
         with m.State("Raw-Discard"):
             m.d.comb += read_i_stream.ready.eq(1)
             with m.If(raw_read_fire):
-                with m.If(reply_count == BLOCK_SIZE - 8):
-                    m.d.sd += reply_count.eq(0)
+                with m.If(raw_stale_block | ~raw_read_current):
+                    with m.If(read_i_stream.p.last):
+                        m.d.sd += [
+                            raw_stale_block.eq(0),
+                            reply_count.eq(0),
+                            self.stale_replies.eq(self.stale_replies + 1),
+                        ]
+                    with m.Else():
+                        m.d.sd += [
+                            raw_stale_block.eq(1),
+                            reply_count.eq(Mux(
+                                reply_count == BLOCK_SIZE - 8,
+                                0, reply_count + 8)),
+                        ]
+                with m.Elif(read_i_stream.p.last):
+                    m.d.sd += [
+                        reply_count.eq(0),
+                        self.protocol_errors.eq(
+                            self.protocol_errors +
+                            (reply_count != BLOCK_SIZE - 8)),
+                    ]
                     with m.If(speculative_read_count == 1):
                         m.d.sd += speculative_read_count.eq(0)
                         m.next = "Header"
@@ -264,6 +311,11 @@ def _elaborate_host_block_engine(
                             speculative_read_address.eq(
                                 speculative_read_address + BLOCK_SIZE),
                         ]
+                with m.Elif(reply_count == BLOCK_SIZE - 8):
+                    m.d.sd += [
+                        reply_count.eq(0),
+                        self.protocol_errors.eq(self.protocol_errors + 1),
+                    ]
                 with m.Else():
                     m.d.sd += reply_count.eq(reply_count + 8)
 

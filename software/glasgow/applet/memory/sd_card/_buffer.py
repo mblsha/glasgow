@@ -37,10 +37,21 @@ class BlockBuffer(wiring.Component):
     the SD domain is reset rather than selecting a client and silently corrupting a block.
     """
 
-    def __init__(self):
+    def __init__(self, *, boot_data=None):
+        if boot_data is not None:
+            if len(boot_data) != BUFFER_SIZE:
+                raise ValueError(f"boot buffer must be exactly {BUFFER_SIZE} bytes")
+            self._boot_init = [
+                int.from_bytes(boot_data[offset:offset + 8], "little")
+                for offset in range(0, BUFFER_SIZE, 8)
+            ]
+        else:
+            self._boot_init = None
         super().__init__({
             "host": In(BlockBufferPortSignature()),
             "data": In(BlockBufferPortSignature()),
+            "restore_boot": In(1),
+            "boot_restored": Out(1),
             "bank_states": In(BUFFER_STATE_WIDTH),
             "collision": Out(1),
             "collision_count": Out(16),
@@ -56,6 +67,48 @@ class BlockBuffer(wiring.Component):
             shape=64, depth=BUFFER_SIZE // 8, init=[])
         write_port = block_memory.write_port(domain="sd", granularity=8)
         read_port = block_memory.read_port(domain="sd")
+        restore_active = Signal()
+        restore_valid = Signal()
+        restore_read_address = Signal(range(BUFFER_SIZE // 8))
+        restore_write_address = Signal(range(BUFFER_SIZE // 8))
+        if self._boot_init is not None:
+            m.submodules.boot_memory = boot_memory = memory.Memory(
+                shape=64, depth=BUFFER_SIZE // 8, init=self._boot_init)
+            boot_read_port = boot_memory.read_port(domain="sd")
+            m.d.comb += boot_read_port.addr.eq(restore_read_address)
+
+            with m.If(~self.restore_boot):
+                m.d.sd += [
+                    restore_active.eq(0),
+                    restore_valid.eq(0),
+                    self.boot_restored.eq(0),
+                ]
+            with m.Elif(~restore_active & ~self.boot_restored):
+                m.d.sd += [
+                    restore_active.eq(1),
+                    restore_valid.eq(0),
+                    restore_read_address.eq(0),
+                    restore_write_address.eq(0),
+                ]
+            with m.Elif(restore_active):
+                with m.If(restore_valid):
+                    with m.If(restore_write_address == BUFFER_SIZE // 8 - 1):
+                        m.d.sd += [
+                            restore_active.eq(0),
+                            self.boot_restored.eq(1),
+                        ]
+                    with m.Else():
+                        m.d.sd += [
+                            restore_write_address.eq(restore_write_address + 1),
+                        ]
+                        with m.If(restore_read_address < BUFFER_SIZE // 8 - 1):
+                            m.d.sd += restore_read_address.eq(
+                                restore_read_address + 1)
+                with m.Else():
+                    m.d.sd += [
+                        restore_valid.eq(1),
+                        restore_read_address.eq(1),
+                    ]
 
         fault_active = Signal()
         host_write_state = self.bank_states.word_select(
@@ -88,6 +141,7 @@ class BlockBuffer(wiring.Component):
         # Any ownership violation poisons the buffer until the SD domain is reset. Both clients
         # are denied on the collision cycle as well, so priority cannot silently corrupt a block.
         healthy = ~fault_event & ~self.fault
+        restore_write_grant = restore_active & restore_valid
         host_write_grant = healthy & self.host.write_en.any()
         data_write_grant = healthy & self.data.write_en.any()
         host_read_grant = healthy & self.host.read_active
@@ -106,13 +160,17 @@ class BlockBuffer(wiring.Component):
         ]
 
         m.d.comb += [
-            write_port.en.eq(Mux(host_write_grant, self.host.write_en,
-                Mux(data_write_grant, self.data.write_en, 0))),
+            write_port.en.eq(Mux(restore_write_grant, C(0xff, 8),
+                Mux(host_write_grant, self.host.write_en,
+                    Mux(data_write_grant, self.data.write_en, 0)))),
             write_port.addr.eq(Mux(
-                host_write_grant, self.host.write_address[3:],
-                self.data.write_address[3:])),
+                restore_write_grant, restore_write_address,
+                Mux(host_write_grant, self.host.write_address[3:],
+                    self.data.write_address[3:]))),
             write_port.data.eq(Mux(
-                host_write_grant, self.host.write_data, self.data.write_data)),
+                restore_write_grant,
+                boot_read_port.data if self._boot_init is not None else 0,
+                Mux(host_write_grant, self.host.write_data, self.data.write_data))),
             read_port.addr.eq(Mux(
                 host_read_grant, self.host.read_address[3:],
                 Mux(data_read_grant, self.data.read_address[3:], 0))),

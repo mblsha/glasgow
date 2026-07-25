@@ -17,6 +17,9 @@ class ReadBufferClientSignature(wiring.Signature):
     def __init__(self):
         super().__init__({
             "reset": Out(1),
+            "preload_boot": Out(1),
+            "preload_boot_address_0": Out(32),
+            "preload_boot_address_1": Out(32),
             "lookup_address": Out(32),
             "reserve": Out(1),
             "reserve_address": Out(32),
@@ -53,11 +56,17 @@ class ReadBufferManager(wiring.Component):
         bank_address = Array(
             Signal(32, name=f"bank_{index}_address")
             for index in range(BUFFER_BLOCKS))
+        bank_pinned = Array(
+            Signal(name=f"bank_{index}_pinned")
+            for index in range(BUFFER_BLOCKS))
         next_state = Array(
             Signal(ReadBufferState, name=f"bank_{index}_next_state")
             for index in range(BUFFER_BLOCKS))
         next_address = Array(
             Signal(32, name=f"bank_{index}_next_address")
+            for index in range(BUFFER_BLOCKS))
+        next_pinned = Array(
+            Signal(name=f"bank_{index}_next_pinned")
             for index in range(BUFFER_BLOCKS))
 
         request_next = Signal()
@@ -129,6 +138,7 @@ class ReadBufferManager(wiring.Component):
             m.d.comb += [
                 next_state[bank].eq(bank_state[bank]),
                 next_address[bank].eq(bank_address[bank]),
+                next_pinned[bank].eq(bank_pinned[bank]),
             ]
 
         # The following is the complete transition priority, from ordinary events to the
@@ -144,6 +154,7 @@ class ReadBufferManager(wiring.Component):
                 request_blocks_next.eq(client.reserve_blocks),
                 next_state[empty_bank].eq(ReadBufferState.Filling),
                 next_address[empty_bank].eq(client.reserve_address),
+                next_pinned[empty_bank].eq(0),
             ]
 
         with m.If(host.reply_ready):
@@ -187,7 +198,10 @@ class ReadBufferManager(wiring.Component):
 
         with m.If(client.release):
             with m.If(client.active):
-                m.d.comb += next_state[client.active_bank].eq(ReadBufferState.Empty)
+                m.d.comb += [
+                    next_state[client.active_bank].eq(ReadBufferState.Empty),
+                    next_pinned[client.active_bank].eq(0),
+                ]
             with m.Else():
                 m.d.comb += reply_fault_next.eq(1)
 
@@ -195,7 +209,11 @@ class ReadBufferManager(wiring.Component):
             for bank, state in enumerate(bank_state):
                 in_window = (bank_address[bank] == client.lookup_address) | \
                     (bank_address[bank] == client.lookup_address + BLOCK_SIZE)
-                with m.If((state == ReadBufferState.Ready) & ~in_window):
+                # Preserve the non-contiguous companion boot block only while the requested
+                # address itself hits the embedded set. An unrelated first access must be able
+                # to evict both pinned banks and use the ordinary host-backed reservoir.
+                with m.If((state == ReadBufferState.Ready) & ~in_window &
+                          (~bank_pinned[bank] | ~client.ready)):
                     m.d.comb += next_state[bank].eq(ReadBufferState.Empty)
 
         with m.If(client.reset):
@@ -223,7 +241,21 @@ class ReadBufferManager(wiring.Component):
                 with m.Elif(state == ReadBufferState.Ready):
                     m.d.comb += next_state[bank].eq(ReadBufferState.Ready)
                 with m.Else():
-                    m.d.comb += next_state[bank].eq(ReadBufferState.Empty)
+                    m.d.comb += [
+                        next_state[bank].eq(ReadBufferState.Empty),
+                        next_pinned[bank].eq(0),
+                    ]
+
+        with m.If(client.preload_boot):
+            m.d.comb += [request_next.eq(0), reply_fault_next.eq(0)]
+            for bank in range(BUFFER_BLOCKS):
+                m.d.comb += [
+                    next_state[bank].eq(ReadBufferState.Ready),
+                    next_address[bank].eq(
+                        client.preload_boot_address_0 if bank == 0
+                        else client.preload_boot_address_1),
+                    next_pinned[bank].eq(1),
+                ]
 
         m.d.sd += [
             host.request.eq(request_next),
@@ -237,6 +269,7 @@ class ReadBufferManager(wiring.Component):
             m.d.sd += [
                 bank_state[bank].eq(next_state[bank]),
                 bank_address[bank].eq(next_address[bank]),
+                bank_pinned[bank].eq(next_pinned[bank]),
             ]
         with m.If(host.request):
             m.d.sd += [
