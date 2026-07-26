@@ -2,15 +2,21 @@ from collections import deque
 import os
 import random
 import tempfile
+import unittest
 
 from glasgow.simulation.assembly import SimulationAssembly
 
-from . import BLOCK_SIZE, build_cid, build_csd, build_scr
+from . import BLOCK_SIZE, build_cid, build_csd, build_scr, crc16
 from .bfm import SDHostBFM
+from ._backend import BackendError
 from ._data import READ_NAC_CLOCKS
+from ._protocol import BackendStatus
 from ._response import RESPONSE_GUARD_CLOCKS
 from ._test_support import InlineWorker
 from ._diagnostics import decode_fpga_diagnostics
+
+
+R1_PERSISTENT_ERROR_MASK = sum(1 << bit for bit in range(19, 32))
 
 
 class SimHostServiceAgent:
@@ -143,8 +149,51 @@ class SDCardSimulationTestMixin:
             f"{agent.requests_started}/{agent.requests_completed}, "
             f"errors={await applet.sd_card_iface.protocol_errors})")
 
+    async def _prefetch_second_block_then_stop(self, applet, bfm, first_block):
+        await bfm.send_command(18, 0)
+        bfm.assert_r1(await bfm.receive_response(48), 18)
+        await self._receive_sim_block(applet, bfm, first_block)
+        await bfm.send_command(12)
+        bfm.assert_r1(await bfm.receive_response(48), 12)
+        await bfm.idle(16)
+
+    async def _assert_cmd13_reports_persistent_error(self, bfm):
+        await bfm.send_command(13, 0x1234_0000)
+        response = await bfm.receive_response(48)
+        bfm.assert_r1(response, 13)
+        status = (response >> 8) & 0xffff_ffff
+        self.assertNotEqual(
+            status & R1_PERSISTENT_ERROR_MASK, 0,
+            f"CMD13 returned clean status {status:#010x} after a backend mutation failure")
+
+    async def _receive_optional_sim_block(self, bfm, *, timeout_cycles=2048):
+        for _ in range(timeout_cycles):
+            _, _, data_sample = await bfm.cycle()
+            if data_sample[0] == (1, 0):
+                break
+        else:
+            return None
+
+        block = 0
+        for _ in range(BLOCK_SIZE * 8):
+            _, _, data_sample = await bfm.cycle()
+            if data_sample[0][0] != 1:
+                return None
+            block = (block << 1) | data_sample[0][1]
+        block = block.to_bytes(BLOCK_SIZE, "big")
+
+        received_crc = 0
+        for _ in range(16):
+            _, _, data_sample = await bfm.cycle()
+            if data_sample[0][0] != 1:
+                return None
+            received_crc = (received_crc << 1) | data_sample[0][1]
+
+        _, _, data_sample = await bfm.cycle()
+        return block, received_crc == crc16(block), data_sample[0] == (1, 1)
+
     def _run_simulation(self, payload, scenario, *, setup_arguments=(), host_stalls=(),
-            embed_boot_prefix=False):
+            embed_boot_prefix=False, worker_factory=InlineWorker):
         with tempfile.NamedTemporaryFile() as image:
             image.write(payload)
             image.flush()
@@ -156,7 +205,7 @@ class SDCardSimulationTestMixin:
             assembly = SimulationAssembly()
             applet = self.applet_cls(assembly)
             applet.build(args)
-            applet.sd_card_iface._worker_factory = InlineWorker
+            applet.sd_card_iface._worker_factory = worker_factory
 
             clk = assembly.get_pin("A2")
             cmd = assembly.get_pin("A5")
@@ -410,6 +459,144 @@ class SDCardSimulationTestMixin:
                 bytes([0xff]) * BLOCK_SIZE)
 
         self._run_simulation(payload, scenario)
+
+    # These regressions specify the required behavior for known P1 defects without changing the
+    # implementation. Remove expectedFailure as each defect is fixed; an unexpected success keeps
+    # the suite red until that cleanup is made deliberately.
+    @unittest.expectedFailure
+    def test_p1_backend_read_error_is_not_returned_as_valid_ff_block(self):
+        """A backend failure must not appear on the SD wire as a valid all-FF sector."""
+        payload = bytes(
+            ((index // BLOCK_SIZE) * 0x29 + index) & 0xff
+            for index in range(BLOCK_SIZE * 8))
+        failed_address = BLOCK_SIZE * 4
+
+        class FailingReadWorker(InlineWorker):
+            async def read_block(self, address):
+                if address == failed_address:
+                    raise BackendError(BackendStatus.IOError, "injected read failure")
+                return await super().read_block(address)
+
+        async def scenario(applet, bfm, image):
+            await bfm.send_command(17, failed_address)
+            bfm.assert_r1(await bfm.receive_response(48), 17)
+            received = await self._receive_optional_sim_block(bfm)
+            valid_ff_block = received is not None and \
+                received[0] == bytes([0xff]) * BLOCK_SIZE and received[1:] == (True, True)
+            self.assertFalse(
+                valid_ff_block,
+                "backend failure was returned as a CRC-valid all-FF sector")
+
+        self._run_simulation(payload, scenario, worker_factory=FailingReadWorker)
+
+    @unittest.expectedFailure
+    def test_p1_cached_block_is_invalidated_after_write(self):
+        """A successful write must supersede any prefetched copy of the same sector."""
+        payload = bytes(
+            ((index // BLOCK_SIZE) * 0x31 + index) & 0xff
+            for index in range(BLOCK_SIZE * 8))
+        replacement = bytes((0xa5 ^ index) & 0xff for index in range(BLOCK_SIZE))
+
+        async def scenario(applet, bfm, image):
+            await self._prefetch_second_block_then_stop(
+                applet, bfm, payload[:BLOCK_SIZE])
+
+            await bfm.send_command(24, BLOCK_SIZE)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            await bfm.send_data_block_1bit(replacement)
+            self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
+            await self._complete_sim_busy_request(
+                applet, bfm, "host-backed cache-coherency write")
+            self.assertEqual(
+                os.pread(image.fileno(), BLOCK_SIZE, BLOCK_SIZE), replacement)
+
+            await bfm.send_command(17, BLOCK_SIZE)
+            bfm.assert_r1(await bfm.receive_response(48), 17)
+            await self._receive_sim_block(applet, bfm, replacement)
+
+        self._run_simulation(payload, scenario)
+
+    @unittest.expectedFailure
+    def test_p1_cached_block_is_invalidated_after_erase(self):
+        """A successful erase must supersede any prefetched copy of the erased sector."""
+        payload = bytes(
+            ((index // BLOCK_SIZE) * 0x53 + index) & 0xff
+            for index in range(BLOCK_SIZE * 8))
+        erased = bytes([0xff]) * BLOCK_SIZE
+
+        async def scenario(applet, bfm, image):
+            await self._prefetch_second_block_then_stop(
+                applet, bfm, payload[:BLOCK_SIZE])
+
+            await bfm.send_command(32, BLOCK_SIZE)
+            bfm.assert_r1(await bfm.receive_response(48), 32)
+            await bfm.send_command(33, BLOCK_SIZE)
+            bfm.assert_r1(await bfm.receive_response(48), 33)
+            await bfm.send_command(38)
+            bfm.assert_r1(await bfm.receive_response(48), 38)
+            await self._complete_sim_busy_request(
+                applet, bfm, "host-backed cache-coherency erase")
+            self.assertEqual(
+                os.pread(image.fileno(), BLOCK_SIZE, BLOCK_SIZE), erased)
+
+            await bfm.send_command(17, BLOCK_SIZE)
+            bfm.assert_r1(await bfm.receive_response(48), 17)
+            await self._receive_sim_block(applet, bfm, erased)
+
+        self._run_simulation(payload, scenario)
+
+    @unittest.expectedFailure
+    def test_p1_failed_write_is_reported_by_cmd13(self):
+        """A backend write failure must remain visible after DAT0 busy is released."""
+        payload = bytes(
+            ((index // BLOCK_SIZE) * 0x67 + index) & 0xff
+            for index in range(BLOCK_SIZE * 8))
+        replacement = bytes((0x3c ^ index) & 0xff for index in range(BLOCK_SIZE))
+
+        class FailingWriteWorker(InlineWorker):
+            async def write_block(self, address, block):
+                raise BackendError(BackendStatus.IOError, "injected write failure")
+
+        async def scenario(applet, bfm, image):
+            address = BLOCK_SIZE * 2
+            original = os.pread(image.fileno(), BLOCK_SIZE, address)
+            await bfm.send_command(24, address)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            await bfm.send_data_block_1bit(replacement)
+            self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
+            await self._complete_sim_busy_request(
+                applet, bfm, "injected failed host write")
+            self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, address), original)
+            await self._assert_cmd13_reports_persistent_error(bfm)
+
+        self._run_simulation(payload, scenario, worker_factory=FailingWriteWorker)
+
+    @unittest.expectedFailure
+    def test_p1_failed_erase_is_reported_by_cmd13(self):
+        """A backend erase failure must remain visible after DAT0 busy is released."""
+        payload = bytes(
+            ((index // BLOCK_SIZE) * 0x79 + index) & 0xff
+            for index in range(BLOCK_SIZE * 8))
+
+        class FailingEraseWorker(InlineWorker):
+            async def erase(self, start, end):
+                raise BackendError(BackendStatus.IOError, "injected erase failure")
+
+        async def scenario(applet, bfm, image):
+            address = BLOCK_SIZE * 2
+            original = os.pread(image.fileno(), BLOCK_SIZE, address)
+            await bfm.send_command(32, address)
+            bfm.assert_r1(await bfm.receive_response(48), 32)
+            await bfm.send_command(33, address)
+            bfm.assert_r1(await bfm.receive_response(48), 33)
+            await bfm.send_command(38)
+            bfm.assert_r1(await bfm.receive_response(48), 38)
+            await self._complete_sim_busy_request(
+                applet, bfm, "injected failed host erase")
+            self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, address), original)
+            await self._assert_cmd13_reports_persistent_error(bfm)
+
+        self._run_simulation(payload, scenario, worker_factory=FailingEraseWorker)
 
     def test_sim_sustained_cmd18_with_host_stalls_and_random_cmd12(self):
         payload = b"".join(
