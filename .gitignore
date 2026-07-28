@@ -1,5 +1,6 @@
 /.ruff_cache
 /.work/
+/LOG
 
 *.vcd
 *.gtkw
