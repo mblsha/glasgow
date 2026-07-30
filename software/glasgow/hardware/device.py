@@ -410,15 +410,19 @@ class GlasgowDevice:
         force_download = (bitstream_file_id == b"\xff" * 16)
         if force_download:
             logger.warning("prebuilt bitstream ID is all ones, forcing download")
-        elif await self.bitstream_id() == plan.bitstream_id:
-            logger.info("device already has bitstream ID %s", plan.bitstream_id.hex())
+            loaded_bitstream_id = plan.bitstream_id
+        else:
+            loaded_bitstream_id = bitstream_file_id
+        if not force_download and await self.bitstream_id() == loaded_bitstream_id:
+            logger.info("device already has prebuilt bitstream ID %s",
+                        loaded_bitstream_id.hex())
             return
-        elif bitstream_file_id != plan.bitstream_id:
+        if not force_download and bitstream_file_id != plan.bitstream_id:
             logger.warning("prebuilt bitstream ID %s does not match design bitstream ID %s",
                            bitstream_file_id.hex(), plan.bitstream_id.hex())
         logger.info("downloading prebuilt bitstream ID %s from file %r",
-                    plan.bitstream_id.hex(), bitstream_file.name)
-        await self.download_bitstream(bitstream_file.read(), plan.bitstream_id)
+                    loaded_bitstream_id.hex(), bitstream_file.name)
+        await self.download_bitstream(bitstream_file.read(), loaded_bitstream_id)
 
     async def _iobuf_enable(self, on):
         # control the IO-buffers (FXMA108) on revAB, they are on by default

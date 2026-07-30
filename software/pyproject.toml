@@ -120,6 +120,7 @@ memory-prom = "glasgow.applet.memory.prom:MemoryPROMApplet"
 memory-floppy = "glasgow.applet.memory.floppy:MemoryFloppyApplet"
 memory-sd-card = "glasgow.applet.memory.sd_card:SDCardApplet"
 memory-sd-resume-probe = "glasgow.applet.memory.sd_resume_probe:SDResumeProbeApplet"
+memory-sdram-resume-probe = "glasgow.applet.memory.sdram_resume_probe:SDRAMResumeProbeApplet"
 
 debug-arc = "glasgow.applet.debug.arc:DebugARCApplet"
 debug-arm = "glasgow.applet.debug.arm.jtag:DebugARMJTAGApplet"
