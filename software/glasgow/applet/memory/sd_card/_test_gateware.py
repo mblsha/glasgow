@@ -7,6 +7,7 @@ from glasgow.gateware import cobs as gateware_cobs
 
 from . import BLOCK_SIZE
 from ._buffer import BlockBuffer
+from ._host import HostBlockEngine, TransactionPhase
 from ._interfaces import ReadBufferState
 from ._read_buffer import ReadBufferManager
 
@@ -46,6 +47,59 @@ class BlockBufferTestCase(unittest.TestCase):
             ctx.set(dut.data.read_address, BLOCK_SIZE + 7)
             await ctx.tick("sd")
             self.assertEqual(ctx.get(dut.collision_count), 3)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6, domain="sd")
+        simulator.add_testbench(testbench)
+        simulator.run()
+
+
+class HostBlockEngineTestCase(unittest.TestCase):
+    def test_raw_read_fill_backpressures_during_sd_buffer_write(self):
+        m = Module()
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = HostBlockEngine()
+
+        async def testbench(ctx):
+            ctx.set(dut.generation, 0x4321)
+            ctx.set(dut.image_size, BLOCK_SIZE * 8)
+            ctx.set(dut.storage.read.request, 1)
+            ctx.set(dut.storage.read.request_address, BLOCK_SIZE)
+            ctx.set(dut.storage.read.request_bank, 0)
+            ctx.set(dut.storage.read.request_blocks, 1)
+            ctx.set(dut.o_stream.ready, 1)
+
+            for _ in range(8):
+                await ctx.tick("sd")
+                if ctx.get(dut.storage.read.request_accepted):
+                    break
+            else:
+                self.fail("read request was not accepted")
+            ctx.set(dut.storage.read.request, 0)
+
+            for _ in range(32):
+                await ctx.tick("sd")
+                if ctx.get(dut.transaction_phase) == TransactionPhase.AwaitReply.value:
+                    break
+            else:
+                self.fail("read transaction did not reach AwaitReply")
+
+            # Let the reply FSM enter Raw-Read, then present one complete raw
+            # word while the SD data engine owns the shared write port.
+            await ctx.tick("sd")
+            ctx.set(dut.read_i_stream.p.generation, 0x4321)
+            ctx.set(dut.read_i_stream.p.data, 0xa5a5a5a5a5a5a5a5)
+            ctx.set(dut.read_i_stream.p.last, 0)
+            ctx.set(dut.read_i_stream.valid, 1)
+            ctx.set(dut.buffer_write_blocked, 1)
+            self.assertEqual(ctx.get(dut.read_i_stream.ready), 0)
+            self.assertEqual(ctx.get(dut.buffer.write_en), 0)
+
+            # Releasing the SD writer must consume and publish the exact same
+            # queued word rather than dropping it during the collision window.
+            ctx.set(dut.buffer_write_blocked, 0)
+            self.assertEqual(ctx.get(dut.read_i_stream.ready), 1)
+            self.assertEqual(ctx.get(dut.buffer.write_en), 0xff)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6, domain="sd")
