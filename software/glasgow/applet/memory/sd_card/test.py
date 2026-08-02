@@ -146,4 +146,5 @@ from ._test_host import (
     BackendWorkerTestCase, FAT16ImageTestCase, FileBlockBackendTestCase,
     SDCardInterfaceTestCase, SDCardProtocolTestCase,
 )
+from ._test_sideband_console import SidebandConsoleTestCase
 from ._test_zaurus import ConsoleTransportTestCase, ZaurusSDControllerTestCase
