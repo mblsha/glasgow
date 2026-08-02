@@ -183,3 +183,4 @@ class TestSDCardInterface(SDCardInterface):
         self._active = backend is not None
         self._flush_count = 0
         self._host_backend_errors = 0
+        self._sideband_console = None

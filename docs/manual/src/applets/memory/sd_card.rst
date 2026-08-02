@@ -64,6 +64,36 @@ that window before reaching the backend. At most one operation may wait behind t
 progress, and operations remain strictly ordered, so a slow ``fsync`` cannot block power
 monitoring or unboundedly queue later writes.
 
+Reserved-LBA sideband console
+-----------------------------
+
+``--console-pty PATH`` enables a retry-safe byte-stream console without adding a second physical
+connection. This mode is deliberately opt-in. The image must have a non-bootable type ``0xDA``
+fourth MBR partition of at least four sectors, ending exactly at the image boundary. The applet
+intercepts the entire partition before the file backend, so mailbox writes never alter the image.
+It rejects erase ranges that overlap the partition and cannot be combined with ``--read-only``.
+
+The first four partition-relative sectors are control (target read), target output (target write),
+host input (target read), and host-input acknowledgement (target write). Every sector contains a
+versioned 512-byte frame with an IEEE CRC32. Host-input reads peek at one sequence until the target
+explicitly acknowledges it. Repeated target-output writes with the same session, sequence, and
+contents are accepted once, which makes Linux MMC retries harmless. A new applet process chooses
+a new random session; the target renegotiates and restarts its sequence space.
+
+The PTY is owned by the applet process, not by the target-power lifecycle. It therefore remains
+open while SD power is absent and across the applet's off-rail transport rearm. Target output and
+host input use bounded 1 MiB queues; overflow is reported in the control-frame flags. For example::
+
+    glasgow run memory-sd-card -V B=3.3 \
+        --clk B2 --cmd B5 --dat B1,B0,B7,B6 \
+        --max-sd-clock 5m --transfer-speed 1m --one-bit \
+        --prime-first-read --console-pty /tmp/glasgow-zaurus-console \
+        zaurus-erofs.img
+
+Attach any raw-terminal client to the published symlink. Closing and reopening the client does not
+stop the applet or consume queued target input. Restarting the applet does replace the PTY and the
+protocol session, so restart the terminal client in that case as well.
+
 Zaurus SL-C860
 --------------
 

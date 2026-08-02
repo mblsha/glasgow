@@ -37,6 +37,7 @@ from ._reply_packer import (
     HostReplyWordPacker, HOST_REPLY_WORD_LAYOUT,
     RawBlockWordPacker, RAW_BLOCK_WORD_LAYOUT,
 )
+from ._sideband_console import SidebandConsole, SidebandPartition
 
 
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     "ReplyFrame", "ReplyHeader",
     "DEFAULT_TRANSFER_SPEED", "SDCardDiagnostics", "SDCardError", "SDCardComponent",
     "SDCardInterface", "SDCardApplet",
+    "SidebandConsole", "SidebandPartition",
     "crc7", "crc16", "build_cid", "build_csd", "build_scr", "create_fat16_image",
     "decode_csd_transfer_speed", "encode_csd_transfer_speed", "parse_transfer_speed",
 ]
@@ -448,6 +450,7 @@ class SDCardInterface:
         self._active = False
         self._flush_count = 0
         self._host_backend_errors = 0
+        self._sideband_console = None
 
     @property
     def backend(self) -> BlockBackend | None:
@@ -516,7 +519,8 @@ class SDCardInterface:
             sync_writes: bool = True,
             transfer_speed: int = DEFAULT_TRANSFER_SPEED,
             support_4bit: bool = True,
-            prime_first_read: bool = False, activate: bool = True):
+            prime_first_read: bool = False, activate: bool = True,
+            sideband_console: SidebandConsole | None = None):
         if (image_path is None) == (backend is None):
             raise ValueError("exactly one of image_path or backend must be provided")
         if backend is None:
@@ -578,6 +582,7 @@ class SDCardInterface:
                     await self._write_card_configuration(new_session, generation)
                     self._flush_count = 0
                     self._host_backend_errors = 0
+                    self._sideband_console = sideband_console
                     self._session = new_session
                     adopted = True
                     await self._enabled.set(int(activate))
@@ -989,7 +994,11 @@ class SDCardInterface:
                 self._logger.log(self._level, "read block at %#x", block_address)
                 status = BackendStatus.OK
                 try:
-                    block = await session.worker.read_block(block_address)
+                    if (self._sideband_console is not None and
+                            self._sideband_console.handles(block_address)):
+                        block = self._sideband_console.read_block(block_address)
+                    else:
+                        block = await session.worker.read_block(block_address)
                 except BackendError as error:
                     self._record_backend_error("read", error)
                     status = error.status
@@ -1008,9 +1017,13 @@ class SDCardInterface:
             self._logger.log(self._level, "write block at %#x", address)
             status = BackendStatus.OK
             try:
-                await session.worker.write_block(address, block)
-                if session.sync_writes:
-                    await self._flush_session(session)
+                if (self._sideband_console is not None and
+                        self._sideband_console.handles(address)):
+                    self._sideband_console.write_block(address, block)
+                else:
+                    await session.worker.write_block(address, block)
+                    if session.sync_writes:
+                        await self._flush_session(session)
             except BackendError as error:
                 self._record_backend_error("write", error)
                 status = error.status
@@ -1022,6 +1035,11 @@ class SDCardInterface:
             self._logger.log(self._level, "erase blocks at %#x..%#x", start, end)
             status = BackendStatus.OK
             try:
+                if (self._sideband_console is not None and
+                        self._sideband_console.overlaps(start, end)):
+                    raise BackendError(
+                        BackendStatus.Invalid,
+                        "erase range overlaps the reserved sideband console partition")
                 await session.worker.erase(start, end)
                 if session.sync_writes:
                     await self._flush_session(session)
@@ -1173,8 +1191,21 @@ class SDCardApplet(GlasgowAppletV2):
             help="periodically log FPGA and backend diagnostics (default: disabled)")
         parser.add_argument("--trace-commands", action="store_true",
             help="log command-counter/last-command transitions for target debugging")
+        parser.add_argument("--console-pty", metavar="PATH",
+            help="intercept a type-0xDA fourth partition as a retry-safe console and "
+                 "publish its persistent host PTY at PATH")
 
     async def setup(self, args):
+        self.sideband_console = None
+        if args.console_pty is not None:
+            if args.read_only:
+                raise SDCardError("--console-pty cannot be used with --read-only")
+            try:
+                partition = SidebandPartition.from_image(args.image)
+            except (OSError, ValueError) as error:
+                raise SDCardError(f"cannot enable SD sideband console: {error}") from error
+            self.sideband_console = SidebandConsole(self.logger, partition)
+
         if args.power_idle_high_z and args.no_power_monitor:
             raise SDCardError("--power-idle-high-z cannot be used with --no-power-monitor")
         if args.power_idle_high_z:
@@ -1209,13 +1240,27 @@ class SDCardApplet(GlasgowAppletV2):
                 "port %s armed in target-off state: Vio on, card listening, "
                 "CMD/DAT high-impedance, CLK weak-low, sense %.2f V",
                 self._sd_port, sense_voltage)
+        if self.sideband_console is not None:
+            try:
+                self.sideband_console.open_pty(args.console_pty)
+            except OSError as error:
+                self.sideband_console.close()
+                raise SDCardError(
+                    f"cannot create SD sideband console PTY: {error}") from error
         try:
             await self.sd_card_iface.configure(
                 args.image, read_only=args.read_only, sync_writes=not args.volatile_writes,
                 transfer_speed=args.transfer_speed, support_4bit=not args.one_bit,
-                prime_first_read=args.prime_first_read)
+                prime_first_read=args.prime_first_read,
+                sideband_console=self.sideband_console)
         except OSError as error:
+            if self.sideband_console is not None:
+                self.sideband_console.close()
             raise SDCardError(f"cannot open image {args.image!r}: {error.strerror}") from error
+        except BaseException:
+            if self.sideband_console is not None:
+                self.sideband_console.close()
+            raise
 
     async def run(self, args):
         async def log_diagnostics():
@@ -1264,11 +1309,14 @@ class SDCardApplet(GlasgowAppletV2):
             debounce_samples = 2 if high_z else 3
 
         try:
-            if args.no_power_monitor and args.diagnostics_interval <= 0:
+            if (args.no_power_monitor and args.diagnostics_interval <= 0 and
+                    self.sideband_console is None):
                 await self.sd_card_iface.serve()
                 return
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(self.sd_card_iface.serve())
+                if self.sideband_console is not None:
+                    tasks.create_task(self.sideband_console.serve_pty())
                 if args.trace_commands:
                     tasks.create_task(trace_commands())
                 if not args.no_power_monitor:
@@ -1285,6 +1333,8 @@ class SDCardApplet(GlasgowAppletV2):
                 if args.diagnostics_interval > 0:
                     tasks.create_task(log_diagnostics())
         finally:
+            if self.sideband_console is not None:
+                self.sideband_console.close()
             if high_z:
                 await self.sd_card_iface.set_signal_pulls(
                     self.device, self._sd_port, enabled=False)
