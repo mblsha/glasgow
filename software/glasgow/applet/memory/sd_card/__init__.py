@@ -189,10 +189,15 @@ class SDCardComponent(wiring.Component):
             # while the complete SD engine is disabled and held in reset. The target pin remains
             # input-only; normal operation switches back to the external rising/falling edges.
             cd_sd.clk.eq(Mux(self.enabled, clk_buffer.i, reset_clock)),
-            cd_sd.rst.eq(ResetSignal() | ~self.enabled),
             cd_sd_fall.clk.eq(Mux(self.enabled, ~clk_buffer.i, reset_clock)),
-            cd_sd_fall.rst.eq(ResetSignal() | ~self.enabled),
         ]
+        # Switching clock sources and releasing reset on the same combinational transition can
+        # expose a runt first edge to the command parser. Assert reset asynchronously, but release
+        # it only after each newly selected external clock has supplied synchronizer edges.
+        engine_reset = ResetSignal() | ~self.enabled
+        m.submodules.sd_reset_sync = cdc.ResetSynchronizer(engine_reset, domain="sd")
+        m.submodules.sd_fall_reset_sync = cdc.ResetSynchronizer(
+            engine_reset, domain="sd_fall")
 
         enabled_sd = Signal()
         m.submodules.enabled_sync = cdc.FFSynchronizer(self.enabled, enabled_sd, o_domain="sd")
