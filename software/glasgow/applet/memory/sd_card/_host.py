@@ -37,6 +37,7 @@ class HostBlockEngine(wiring.Component):
     current_address: In(32)
     erase_start: In(32)
     erase_end: In(32)
+    buffer_write_blocked: In(1)
 
     storage: In(DataHostSignature())
     buffer: Out(BlockBufferPortSignature())
@@ -228,7 +229,11 @@ def _elaborate_host_block_engine(
 
         with m.State("Raw-Read"):
             m.d.comb += [
-                read_i_stream.ready.eq(1),
+                # The SD data engine and host-fill path share one BRAM write
+                # port. Backpressure the lossless raw FIFO while an incoming
+                # SD write owns that port; consuming either payload here would
+                # otherwise poison the block buffer at the first collision.
+                read_i_stream.ready.eq(~self.buffer_write_blocked),
                 block_buffer.write_en.eq(Mux(
                     raw_read_fire & raw_read_current & ~raw_stale_block,
                     C(0xff, 8), 0)),

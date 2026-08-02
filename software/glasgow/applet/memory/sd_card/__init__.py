@@ -306,6 +306,7 @@ class SDCardComponent(wiring.Component):
             host_engine.current_address.eq(command_engine.control.current_address),
             host_engine.erase_start.eq(command_engine.control.erase_start),
             host_engine.erase_end.eq(command_engine.control.erase_end),
+            host_engine.buffer_write_blocked.eq(data_engine.buffer.write_en.any()),
             block_buffer.bank_states.eq(data_engine.read_bank_states),
 
             self.last_command.eq(command_engine.last_command),
