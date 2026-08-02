@@ -642,12 +642,19 @@ class SDCardInterface:
                 await self._enabled.set(0)
                 if after_disable is not None:
                     await after_disable()
+                # Clear both USB endpoints as soon as the engine is disabled. A transfer that
+                # was already submitted to the host controller can complete after cancellation,
+                # so a timed rearm uses the hold as a quarantine interval and clears the pipes
+                # again before assigning the new generation. This prevents a late old-session
+                # raw block from becoming the first payload of the fresh card session.
+                await self._reset_transport()
                 if reset_hold > 0:
                     # Glasgow's transport and target-clock domains have different reset
                     # mechanisms. Keep enabled low for a real interval so the always-running
-                    # sync side certainly resets even when external SD CLK has stopped.
+                    # sync side certainly resets even when external SD CLK has stopped, then
+                    # discard any USB transfer that retired during that interval.
                     await asyncio.sleep(reset_hold)
-                await self._reset_transport()
+                    await self._reset_transport()
                 await self._write_card_configuration(
                     self._session, self._next_generation())
                 await self._enabled.set(1)

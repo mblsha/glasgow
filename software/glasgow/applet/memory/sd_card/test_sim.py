@@ -637,5 +637,6 @@ class SDCardSimulationTestMixin:
             self.assertGreater(await applet.sd_card_iface.prefetch_waits, 0)
             self.assertEqual(await applet.sd_card_iface.buffer_faults, 0)
             self.assertEqual(await applet.sd_card_iface.protocol_errors, 0)
+            self.assertEqual(await applet.sd_card_iface.stale_replies, 0)
 
         self._run_simulation(payload, scenario, host_stalls=stalls)

@@ -500,6 +500,8 @@ class SDCardInterfaceTestCase(unittest.TestCase):
                 observed_holds.append(delay)
                 self.assertFalse(iface._active)
                 self.assertEqual(iface._enabled.value, 0)
+                self.assertEqual(iface._pipe.resets, 1)
+                self.assertEqual(iface._read_pipe.resets, 1)
 
             with mock.patch(
                     "glasgow.applet.memory.sd_card.asyncio.sleep",
@@ -512,8 +514,8 @@ class SDCardInterfaceTestCase(unittest.TestCase):
             self.assertTrue(iface._active)
             self.assertIs(iface.backend, backend)
             self.assertFalse(backend.closed)
-            self.assertEqual(iface._pipe.resets, 1)
-            self.assertEqual(iface._read_pipe.resets, 1)
+            self.assertEqual(iface._pipe.resets, 2)
+            self.assertEqual(iface._read_pipe.resets, 2)
 
         asyncio.run(scenario())
 
