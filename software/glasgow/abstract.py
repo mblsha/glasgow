@@ -234,6 +234,16 @@ class AbstractInPipe(metaclass=ABCMeta):
         pass
 
     @abstractmethod
+    async def pause(self):
+        """Disable the transport while retaining ownership of its interface."""
+        pass
+
+    @abstractmethod
+    async def resume(self):
+        """Re-enable a transport previously disabled with :meth:`pause`."""
+        pass
+
+    @abstractmethod
     async def detach(self) -> tuple[int, None]:
         pass
 
@@ -254,6 +264,16 @@ class AbstractOutPipe(metaclass=ABCMeta):
 
     @abstractmethod
     async def reset(self):
+        pass
+
+    @abstractmethod
+    async def pause(self):
+        """Disable the transport while retaining ownership of its interface."""
+        pass
+
+    @abstractmethod
+    async def resume(self):
+        """Re-enable a transport previously disabled with :meth:`pause`."""
         pass
 
     @abstractmethod

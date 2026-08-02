@@ -88,6 +88,12 @@ class SimulationPipe(AbstractInOutPipe):
         if self._o_buffer is not None:
             self._o_buffer.clear()
 
+    async def pause(self):
+        await self.reset()
+
+    async def resume(self):
+        pass
+
     async def detach(self) -> tuple[int, int]:
         raise NotImplementedError
 

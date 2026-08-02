@@ -231,6 +231,14 @@ class HardwareInPipe(AbstractInPipe):
         await self._stop()
         await self._start()
 
+    async def pause(self):
+        self._logger.trace(f"IN pipe {self._in_interface}: pause")
+        await self._stop()
+
+    async def resume(self):
+        self._logger.trace(f"IN pipe {self._in_interface}: resume")
+        await self._start()
+
     async def detach(self) -> tuple[int, None]:
         self._logger.trace(f"IN pipe {self._in_interface}: detaching")
         _check_detach()
@@ -398,6 +406,14 @@ class HardwareOutPipe(AbstractOutPipe):
     async def reset(self):
         self._logger.trace(f"OUT pipe {self._out_interface}: reset")
         await self._stop()
+        await self._start()
+
+    async def pause(self):
+        self._logger.trace(f"OUT pipe {self._out_interface}: pause")
+        await self._stop()
+
+    async def resume(self):
+        self._logger.trace(f"OUT pipe {self._out_interface}: resume")
         await self._start()
 
     async def detach(self) -> tuple[None, int]:

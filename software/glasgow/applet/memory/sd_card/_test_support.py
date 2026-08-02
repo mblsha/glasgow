@@ -32,6 +32,8 @@ class FakePipe:
         self.replies = bytearray()
         self.flushes = 0
         self.resets = 0
+        self.pauses = 0
+        self.resumes = 0
 
     async def recv_until(self, delimiter):
         length = self.request.index(delimiter) + len(delimiter)
@@ -49,6 +51,14 @@ class FakePipe:
         self.resets += 1
         self.request.clear()
         self.replies.clear()
+
+    async def pause(self):
+        self.pauses += 1
+        self.request.clear()
+        self.replies.clear()
+
+    async def resume(self):
+        self.resumes += 1
 
 
 class MemoryBackend(BlockBackend):

@@ -500,8 +500,12 @@ class SDCardInterfaceTestCase(unittest.TestCase):
                 observed_holds.append(delay)
                 self.assertFalse(iface._active)
                 self.assertEqual(iface._enabled.value, 0)
-                self.assertEqual(iface._pipe.resets, 1)
-                self.assertEqual(iface._read_pipe.resets, 1)
+                self.assertEqual(iface._pipe.resets, 0)
+                self.assertEqual(iface._read_pipe.resets, 0)
+                self.assertEqual(iface._pipe.pauses, 1)
+                self.assertEqual(iface._read_pipe.pauses, 1)
+                self.assertEqual(iface._pipe.resumes, 0)
+                self.assertEqual(iface._read_pipe.resumes, 0)
 
             with mock.patch(
                     "glasgow.applet.memory.sd_card.asyncio.sleep",
@@ -514,8 +518,32 @@ class SDCardInterfaceTestCase(unittest.TestCase):
             self.assertTrue(iface._active)
             self.assertIs(iface.backend, backend)
             self.assertFalse(backend.closed)
-            self.assertEqual(iface._pipe.resets, 2)
-            self.assertEqual(iface._read_pipe.resets, 2)
+            self.assertEqual(iface._pipe.resets, 0)
+            self.assertEqual(iface._read_pipe.resets, 0)
+            self.assertEqual(iface._pipe.pauses, 1)
+            self.assertEqual(iface._read_pipe.pauses, 1)
+            self.assertEqual(iface._pipe.resumes, 1)
+            self.assertEqual(iface._read_pipe.resumes, 1)
+
+        asyncio.run(scenario())
+
+    def test_transport_quarantine_resumes_every_pipe_after_cleanup_error(self):
+        async def scenario():
+            iface = TestSDCardInterface(_MemoryBackend(bytes(BLOCK_SIZE * 4)))
+            original_resume = iface._pipe.resume
+
+            async def failing_resume():
+                await original_resume()
+                raise OSError("injected control-pipe resume failure")
+
+            iface._pipe.resume = failing_resume
+            with self.assertRaisesRegex(OSError, "injected control-pipe resume failure"):
+                await iface._quarantine_transport(0)
+
+            self.assertEqual(iface._pipe.pauses, 1)
+            self.assertEqual(iface._pipe.resumes, 1)
+            self.assertEqual(iface._read_pipe.pauses, 1)
+            self.assertEqual(iface._read_pipe.resumes, 1)
 
         asyncio.run(scenario())
 

@@ -182,10 +182,15 @@ class SDCardComponent(wiring.Component):
 
         m.domains.sd = cd_sd = ClockDomain(async_reset=True, local=True)
         m.domains.sd_fall = cd_sd_fall = ClockDomain(async_reset=True, local=True)
+        reset_clock = ClockSignal()
         m.d.comb += [
-            cd_sd.clk.eq(clk_buffer.i),
+            # An async FIFO still needs destination-domain edges to settle its reset. The
+            # Zaurus stops SD CLK while card power is down, so use Glasgow's internal clock only
+            # while the complete SD engine is disabled and held in reset. The target pin remains
+            # input-only; normal operation switches back to the external rising/falling edges.
+            cd_sd.clk.eq(Mux(self.enabled, clk_buffer.i, reset_clock)),
             cd_sd.rst.eq(ResetSignal() | ~self.enabled),
-            cd_sd_fall.clk.eq(~clk_buffer.i),
+            cd_sd_fall.clk.eq(Mux(self.enabled, ~clk_buffer.i, reset_clock)),
             cd_sd_fall.rst.eq(ResetSignal() | ~self.enabled),
         ]
 
@@ -248,9 +253,14 @@ class SDCardComponent(wiring.Component):
         sd_to_host = AsyncQueue(
             shape=data.StructLayout({"data": 8, "end": 1}),
             depth=64, i_domain="sd", o_domain="sync")
-        m.submodules.host_to_sd = ResetInserter({"sync": transport_reset})(host_to_sd)
-        m.submodules.raw_read_to_sd = ResetInserter({"sync": transport_reset})(raw_read_to_sd)
-        m.submodules.sd_to_host = ResetInserter({"sync": transport_reset})(sd_to_host)
+        # Reset both pointers of every asynchronous queue explicitly. The external SD clock can
+        # be stopped throughout target power loss, so relying on ordinary destination-domain
+        # clocking to retire or clear its read pointer can expose an old raw block after rearm.
+        # The ``sd`` domain is asynchronously reset, making this effective without an SD edge.
+        transport_resets = {"sync": transport_reset, "sd": transport_reset}
+        m.submodules.host_to_sd = ResetInserter(transport_resets)(host_to_sd)
+        m.submodules.raw_read_to_sd = ResetInserter(transport_resets)(raw_read_to_sd)
+        m.submodules.sd_to_host = ResetInserter(transport_resets)(sd_to_host)
         wiring.connect(m, host_to_sd.i, host_reply_packer.o_stream)
         wiring.connect(m, raw_read_to_sd.i, raw_read_packer.o_stream)
 
@@ -458,6 +468,31 @@ class SDCardInterface:
         await self._pipe.reset()
         await self._read_pipe.reset()
 
+    async def _quarantine_transport(self, hold):
+        """Keep every USB endpoint disabled for an uninterrupted reset interval."""
+        self._transport_epoch += 1
+        paused = []
+        try:
+            # Pausing either endpoint asserts the complete applet-domain reset. Start the
+            # in/out control pipe first on resume so the raw pipe remains disabled until the
+            # final transition; there is never an interval where both endpoints are active.
+            for pipe in (self._pipe, self._read_pipe):
+                await pipe.pause()
+                paused.append(pipe)
+            await asyncio.sleep(hold)
+        finally:
+            resume_errors = []
+            for pipe in paused:
+                try:
+                    await pipe.resume()
+                except BaseException as error:
+                    resume_errors.append(error)
+            if len(resume_errors) == 1:
+                raise resume_errors[0]
+            if resume_errors:
+                raise BaseExceptionGroup(
+                    "SD transport quarantine cleanup failed", resume_errors)
+
     async def _write_card_configuration(self, session, generation):
         # Hardware pipe reset asserts the complete applet clock-domain reset. The RW registers
         # live in that same domain, so resetting either transport also clears every card setting,
@@ -642,18 +677,12 @@ class SDCardInterface:
                 await self._enabled.set(0)
                 if after_disable is not None:
                     await after_disable()
-                # Clear both USB endpoints as soon as the engine is disabled. A transfer that
-                # was already submitted to the host controller can complete after cancellation,
-                # so a timed rearm uses the hold as a quarantine interval and clears the pipes
-                # again before assigning the new generation. This prevents a late old-session
-                # raw block from becoming the first payload of the fresh card session.
-                await self._reset_transport()
                 if reset_hold > 0:
-                    # Glasgow's transport and target-clock domains have different reset
-                    # mechanisms. Keep enabled low for a real interval so the always-running
-                    # sync side certainly resets even when external SD CLK has stopped, then
-                    # discard any USB transfer that retired during that interval.
-                    await asyncio.sleep(reset_hold)
+                    # Do not re-enable either endpoint during the quarantine. A host-controller
+                    # transfer may retire after cancellation; keeping its interface disabled
+                    # makes that transfer fail instead of entering a newly reset FPGA FIFO.
+                    await self._quarantine_transport(reset_hold)
+                else:
                     await self._reset_transport()
                 await self._write_card_configuration(
                     self._session, self._next_generation())
