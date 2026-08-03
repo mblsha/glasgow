@@ -87,6 +87,49 @@ errors. A final ``rail-fell`` delta with mask ``1`` and no buffer faults is cons
 collapsing while power disappears, but the run remains non-clean until a repeated trace establishes
 the fixture-specific rule.
 
+Early input-only marker trace
+-----------------------------
+
+``--early-marker-trace`` adds the earliest practical diagnostic receiver to the card-emulator
+bitstream. It is deliberately build-time opt-in so ordinary applet gateware and behavior do not
+change. The receiver only taps the SD CLK input in Glasgow's 48 MHz domain; it adds no output or
+output-enable path and does not inspect or drive CMD or DAT. A target can therefore report a
+one-byte, nonzero progress or fault marker before its MMC host driver exists by temporarily driving
+its SD-clock GPIO. The last validated marker appears as ``early_marker`` in every
+``--preinit-trace`` diagnostics object. Zero means that no marker has been accepted in the current
+emulator generation.
+
+The wire format reuses the already qualified PXA deep-resume marker protocol: physically inverted
+115200-8N1 bytes ``55 d3 4d 01 SEQUENCE TYPE ~TYPE CRC``. ``CRC`` is CRC-8/ATM over
+``01 SEQUENCE TYPE ~TYPE``. To fit beside the complete emulator on revC3, this compact receiver
+validates UART framing, all three sync bytes, version, and the independently transmitted type and
+complement (40 structural bits), then consumes but does not evaluate the CRC byte. The dedicated
+input-only probe applet remains the full CRC/raw-edge authority. The in-card receiver retains only
+the latest marker rather than a byte stream: this is a progressive binary-search/fault channel, not
+an interactive console. An SD card is a synchronous slave, so a host-to-target channel remains
+impossible until target code supplies clocks and receives a response.
+
+On the SL-C860, PXA GPIO6/MMCCLK reaches CLK on the SD socket and Glasgow B2. The established
+target transmitter uses the 3.6864 MHz OS timer (32 ticks per 115200 bit), saves GPIO6's live mux,
+direction, and output latch, stops any concurrent MMC-clock owner, switches GPIO6 to AF0 output-low,
+emits a bounded frame, then restores the saved GPIO state before normal MMC setup. It must leave CMD
+and DAT untouched. The emulator sees the marker's CLK edges as idle SD clocks with CMD high, so no
+command, response, data transfer, or protocol error is introduced. Instrumentation after PXA I/O
+mapping can emit unique types around a suspect early-ARM call; the last retained type is the last
+proven point.
+
+Use the input-only marker receiver together with the lifecycle trace as follows::
+
+    glasgow run memory-sd-card -V B=3.3 \
+        --clk B2 --cmd B5 --dat B1,B0,B7,B6 \
+        --max-sd-clock 25m --boot-prefix card.img \
+        --power-idle-high-z --early-marker-trace \
+        --preinit-trace /tmp/zaurus-preinit.jsonl card.img
+
+If execution cannot reach the bounded GPIO6 transmitter, this feature cannot manufacture evidence:
+the independently sensed SD-power transition remains the only asynchronous observation. A
+``rail-fell`` record captures ``early_marker`` before the applet resets the emulator generation.
+
 This trace deliberately does not claim to be a kernel console. An SD memory card is a synchronous
 slave: it only receives clocks from the target and drives CMD or DAT as a response to a target
 command or data transfer. If MAINTE has finished and Linux has not initialized the PXA MMC host,
