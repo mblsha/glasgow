@@ -6,10 +6,9 @@ import unittest
 
 from glasgow.simulation.assembly import SimulationAssembly
 
-from . import BLOCK_SIZE, build_cid, build_csd, build_scr, crc16
+from . import BLOCK_SIZE, build_cid, build_csd, build_scr, crc16, encode_early_marker
 from .bfm import SDHostBFM
 from ._backend import BackendError
-from ._command import EARLY_MARKER_COMMAND, EARLY_MARKER_MAGIC
 from ._data import READ_NAC_CLOCKS
 from ._protocol import BackendStatus
 from ._response import RESPONSE_GUARD_CLOCKS
@@ -354,16 +353,6 @@ class SDCardSimulationTestMixin:
             await self._receive_sim_block(
                 applet, bfm, payload[BLOCK_SIZE * 3:BLOCK_SIZE * 4])
 
-            marker = 0x3
-            marker_argument = (
-                (EARLY_MARKER_MAGIC << 8) |
-                ((marker ^ 0xf) << 4) |
-                marker
-            )
-            await bfm.send_command(EARLY_MARKER_COMMAND, marker_argument)
-            self.assertEqual(await applet.sd_card_iface._early_marker, marker)
-            self.assertEqual(await applet.sd_card_iface.protocol_errors, 0)
-
             # Restore the source CID that _initialize_sim_card deliberately changed after the
             # first coherent snapshot, then emulate a target rail fall. Rearming must reset both
             # sides of the async transport while retaining the same host backing session.
@@ -385,7 +374,7 @@ class SDCardSimulationTestMixin:
                 after_disable=hold_reset)
             self.assertTrue(applet.sd_card_iface._active)
             self.assertNotEqual(applet.sd_card_iface._generation, generation)
-            self.assertEqual(await applet.sd_card_iface._early_marker, 0)
+            self.assertEqual(await applet.sd_card_iface.last_command, 0)
 
             # MAINTE does not provide the long pre-command idle sequence required by modern
             # interpretations of the SD specification. Do not add any post-reset padding here;
@@ -409,8 +398,57 @@ class SDCardSimulationTestMixin:
 
         self._run_simulation(
             payload, scenario,
-            setup_arguments=("--prime-first-read", "--early-marker-trace"),
+            setup_arguments=("--prime-first-read",),
             embed_boot_prefix=True)
+
+    def test_sim_idle_last_command_marker_protocol(self):
+        payload = bytes(
+            ((index // BLOCK_SIZE) * 0x2b + index) & 0xff
+            for index in range(BLOCK_SIZE * 8))
+
+        async def scenario(applet, bfm, image):
+            async def hold_reset():
+                await bfm.idle(8)
+
+            await applet.sd_card_iface.rearm(
+                reason="simulation early-marker Idle state", reset_hold=0,
+                after_disable=hold_reset)
+            await bfm.idle(8)
+
+            for marker in range(1, 16):
+                command, argument = encode_early_marker(marker)
+                await bfm.send_command(command, argument)
+
+                samples = [await bfm.cycle() for _ in range(64)]
+                response_start = next(
+                    index for index, (oe, value, _) in enumerate(samples)
+                    if oe and value == 0)
+                self.assertEqual(response_start, RESPONSE_GUARD_CLOCKS + 1)
+                response_samples = samples[response_start:response_start + 48]
+                self.assertEqual(len(response_samples), 48)
+                self.assertTrue(all(oe for oe, _, _ in response_samples))
+                response = sum(
+                    value << bitno
+                    for bitno, (_, value, _) in enumerate(reversed(response_samples)))
+                bfm.assert_r1(response, command)
+                status = (response >> 8) & 0xffff_ffff
+                self.assertEqual(status, (1 << 22) | (1 << 8))
+                self.assertTrue(all(
+                    not oe for oe, _, _ in samples[response_start + 48:]))
+
+                diagnostics = await applet.sd_card_iface.read_diagnostics()
+                self.assertEqual(diagnostics.last_command, command)
+                self.assertEqual(diagnostics.card_state, 0)
+                self.assertEqual(diagnostics.early_marker, marker)
+                self.assertEqual(diagnostics.data_mode, 0)
+                self.assertEqual(diagnostics.reads, 0)
+                self.assertEqual(diagnostics.writes, 0)
+                self.assertEqual(diagnostics.protocol_errors, 0)
+
+                await bfm.idle(8)
+                self.assertEqual(await applet.sd_card_iface.last_command, command)
+
+        self._run_simulation(payload, scenario)
 
     def test_sim_single_and_multi_bit_writes_and_erase(self):
         payload = bytes(
