@@ -162,7 +162,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         iface._diagnostics_snapshot.value = packed_diagnostics(**{
             name: value for value, name in enumerate(field_names, 1)
         })
-        iface._early_marker = _ImmediateRegister(0x31)
+        iface._early_marker = _ImmediateRegister(0x3)
         iface._host_backend_errors = 14
         iface._flush_count = 15
 
@@ -174,7 +174,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
             ProtocolErrorSource.COMMAND_FRAME |
             ProtocolErrorSource.COMMAND_CRC |
             ProtocolErrorSource.DATA)
-        self.assertEqual(diagnostics.early_marker, 0x31)
+        self.assertEqual(diagnostics.early_marker, 0x3)
         self.assertEqual(diagnostics.prefetch_wait_cycles, 12)
         self.assertEqual(diagnostics.max_prefetch_wait_cycles, 13)
         self.assertEqual(diagnostics.max_host_service_latency_cycles, 14)

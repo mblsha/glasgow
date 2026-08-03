@@ -15,55 +15,51 @@ from ._read_buffer import ReadBufferManager
 
 
 class EarlyMarkerCaptureTestCase(unittest.TestCase):
-    def test_retains_only_structurally_valid_complemented_markers(self):
-        bit_cycles = 8
+    def test_retains_only_timing_valid_complemented_markers(self):
         m = Module()
-        m.submodules.dut = dut = EarlyMarkerCapture(bit_cycles=bit_cycles)
-
-        def crc8_atm(payload):
-            crc = 0
-            for octet in payload:
-                crc ^= octet
-                for _ in range(8):
-                    crc = ((crc << 1) ^ 0x07) & 0xff if crc & 0x80 else (crc << 1) & 0xff
-            return crc
-
-        def marker_frame(sequence, marker):
-            body = bytes((1, sequence, marker, marker ^ 0xff))
-            return b"\x55\xd3\x4d" + body + bytes((crc8_atm(body),))
+        m.submodules.dut = dut = EarlyMarkerCapture(
+            break_min=12, sync_min=12, sync_max=15,
+            short_min=3, short_max=5, long_min=7, long_max=9)
 
         async def testbench(ctx):
-            async def drive(level, cycles=bit_cycles):
+            async def drive(level, cycles):
                 ctx.set(dut.clk_i, level)
                 await ctx.tick().repeat(cycles)
 
-            async def send_octet(octet):
-                await drive(1)  # Inverted logical start bit.
+            async def send_frame(marker, *, complement=None, sync_cycles=14):
+                if complement is None:
+                    complement = marker ^ 0xf
+                frame = marker | (complement << 4)
+                await drive(0, 14)  # BREAK
+                await drive(1, sync_cycles)  # SYNC
                 for bit in range(8):
-                    await drive(not ((octet >> bit) & 1))
-                await drive(0)  # Inverted logical stop bit and idle.
+                    await drive(0, 4)
+                    await drive(1, 8 if (frame >> bit) & 1 else 4)
+                await drive(0, 14)
 
-            async def send_frame(frame):
-                for octet in frame:
-                    await send_octet(octet)
-                await drive(0, bit_cycles * 2)
+            await drive(0, 16)
+            await send_frame(0x3)
+            self.assertEqual(ctx.get(dut.last_marker), 0x3)
 
-            await drive(0, bit_cycles * 2)
-            await send_frame(marker_frame(1, 0x31))
-            self.assertEqual(ctx.get(dut.last_marker), 0x31)
+            # A long SD idle followed by ordinary short clock pulses can begin
+            # BREAK recognition, but the first high pulse cannot pass SYNC.
+            await drive(0, 20)
+            for _ in range(64):
+                await drive(1, 1)
+                await drive(0, 1)
+            self.assertEqual(ctx.get(dut.last_marker), 0x3)
 
-            bad_complement = bytearray(marker_frame(2, 0x32))
-            bad_complement[6] ^= 1
-            await send_frame(bad_complement)
-            self.assertEqual(ctx.get(dut.last_marker), 0x31)
+            await send_frame(0x4, complement=0xa)
+            self.assertEqual(ctx.get(dut.last_marker), 0x3)
 
-            bad_magic = bytearray(marker_frame(3, 0x33))
-            bad_magic[2] ^= 1
-            await send_frame(bad_magic)
-            self.assertEqual(ctx.get(dut.last_marker), 0x31)
+            await send_frame(0x5, sync_cycles=4)
+            self.assertEqual(ctx.get(dut.last_marker), 0x3)
 
-            await send_frame(marker_frame(4, 0x34))
-            self.assertEqual(ctx.get(dut.last_marker), 0x34)
+            await send_frame(0x0)
+            self.assertEqual(ctx.get(dut.last_marker), 0x3)
+
+            await send_frame(0xa)
+            self.assertEqual(ctx.get(dut.last_marker), 0xa)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6)
