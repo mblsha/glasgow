@@ -19,11 +19,13 @@ from ._protocol import BLOCK_SIZE, BackendStatus
 
 MAGIC = b"GSCON001"
 VERSION = 1
-PARTITION_TYPE = 0xDA
-PARTITION_INDEX = 3
 FRAME_HEADER = struct.Struct("<8sHBBQQQHH")
 CRC_OFFSET = BLOCK_SIZE - 4
 PAYLOAD_SIZE = CRC_OFFSET - FRAME_HEADER.size
+LOCATOR_MAGIC = b"GSCTAIL1"
+LOCATOR_VERSION = 1
+LOCATOR_HEADER = struct.Struct("<8sHHQQQ")
+MINIMUM_REGION_SECTORS = 5
 
 
 class ConsoleFrameKind(IntEnum):
@@ -89,9 +91,59 @@ class ConsoleFrame:
 
 
 @dataclass(frozen=True)
-class SidebandPartition:
+class SidebandLocator:
     start_lba: int
     sectors: int
+    image_sectors: int
+
+    def encode(self) -> bytes:
+        self.validate()
+        block = bytearray(BLOCK_SIZE)
+        LOCATOR_HEADER.pack_into(
+            block, 0, LOCATOR_MAGIC, LOCATOR_VERSION, LOCATOR_HEADER.size,
+            self.start_lba, self.sectors, self.image_sectors)
+        struct.pack_into("<I", block, CRC_OFFSET,
+            binascii.crc32(block[:CRC_OFFSET]) & 0xffff_ffff)
+        return bytes(block)
+
+    def validate(self):
+        if self.start_lba <= 0:
+            raise ValueError("sideband start LBA must be positive")
+        if self.sectors < MINIMUM_REGION_SECTORS:
+            raise ValueError(
+                f"sideband reservation requires at least {MINIMUM_REGION_SECTORS} sectors")
+        if self.start_lba + self.sectors != self.image_sectors:
+            raise ValueError("sideband reservation must end at the image boundary")
+
+    @classmethod
+    def decode(cls, block: bytes, *, expected_image_sectors: int | None = None):
+        if len(block) != BLOCK_SIZE:
+            raise ValueError("sideband locator is not exactly one sector")
+        expected_crc, = struct.unpack_from("<I", block, CRC_OFFSET)
+        actual_crc = binascii.crc32(block[:CRC_OFFSET]) & 0xffff_ffff
+        if actual_crc != expected_crc:
+            raise ValueError("sideband locator CRC mismatch")
+        magic, version, header_size, start_lba, sectors, image_sectors = (
+            LOCATOR_HEADER.unpack_from(block))
+        if magic != LOCATOR_MAGIC:
+            raise ValueError("sideband locator magic mismatch")
+        if version != LOCATOR_VERSION or header_size != LOCATOR_HEADER.size:
+            raise ValueError("unsupported sideband locator version")
+        if any(block[LOCATOR_HEADER.size:CRC_OFFSET]):
+            raise ValueError("sideband locator reserved bytes are not zero")
+        locator = cls(start_lba, sectors, image_sectors)
+        locator.validate()
+        if (expected_image_sectors is not None and
+                image_sectors != expected_image_sectors):
+            raise ValueError("sideband locator image size mismatch")
+        return locator
+
+
+@dataclass(frozen=True)
+class SidebandRegion:
+    start_lba: int
+    sectors: int
+    image_sectors: int
 
     @property
     def start(self) -> int:
@@ -101,38 +153,44 @@ class SidebandPartition:
     def size(self) -> int:
         return self.sectors * BLOCK_SIZE
 
+    @property
+    def locator(self) -> SidebandLocator:
+        return SidebandLocator(self.start_lba, self.sectors, self.image_sectors)
+
     @classmethod
-    def from_image(cls, image_path: str | os.PathLike[str]) -> "SidebandPartition":
+    def from_image(cls, image_path: str | os.PathLike[str]) -> "SidebandRegion":
         path = Path(image_path)
         with path.open("rb") as image:
             header = image.read(BLOCK_SIZE)
             image.seek(0, os.SEEK_END)
             image_size = image.tell()
+            if image_size >= BLOCK_SIZE:
+                image.seek(-BLOCK_SIZE, os.SEEK_END)
+                locator_block = image.read(BLOCK_SIZE)
+            else:
+                locator_block = b""
         if len(header) != BLOCK_SIZE or header[510:512] != b"\x55\xaa":
             raise ValueError("console image does not contain a valid MBR")
         if image_size % BLOCK_SIZE:
             raise ValueError("console image is not block aligned")
 
+        image_sectors = image_size // BLOCK_SIZE
+        locator = SidebandLocator.decode(
+            locator_block, expected_image_sectors=image_sectors)
         entries = []
         for index in range(4):
             entry = header[446 + index * 16:446 + (index + 1) * 16]
             entries.append((entry[0], entry[4],
                 int.from_bytes(entry[8:12], "little"),
                 int.from_bytes(entry[12:16], "little")))
-        bootable, kind, start_lba, sectors = entries[PARTITION_INDEX]
-        if bootable != 0 or kind != PARTITION_TYPE or start_lba == 0 or sectors < 4:
-            raise ValueError(
-                "fourth MBR partition must be a non-bootable type-0xDA console partition "
-                "of at least four sectors")
-        total_sectors = image_size // BLOCK_SIZE
-        if start_lba + sectors != total_sectors:
-            raise ValueError("console partition must end at the image boundary")
-        for index, (_, other_kind, other_start, other_sectors) in enumerate(entries[:3]):
-            if other_kind == 0 or other_sectors == 0:
+        for index, (_, kind, start_lba, sectors) in enumerate(entries):
+            if kind == 0 or sectors == 0:
                 continue
-            if other_start < start_lba + sectors and start_lba < other_start + other_sectors:
-                raise ValueError(f"console partition overlaps MBR partition {index + 1}")
-        return cls(start_lba, sectors)
+            if (start_lba < locator.start_lba + locator.sectors and
+                    locator.start_lba < start_lba + sectors):
+                raise ValueError(
+                    f"sideband reservation overlaps MBR partition {index + 1}")
+        return cls(locator.start_lba, locator.sectors, locator.image_sectors)
 
 
 class SidebandConsole:
@@ -145,9 +203,9 @@ class SidebandConsole:
     MAX_PENDING_BYTES = 1 << 20
     REMEMBERED_OUTPUTS = 256
 
-    def __init__(self, logger, partition: SidebandPartition):
+    def __init__(self, logger, region: SidebandRegion):
         self._logger = logger
-        self.partition = partition
+        self.region = region
         self.session = secrets.randbits(64) or 1
         self._last_output_sequence = 0
         self._output_fingerprints = OrderedDict()
@@ -168,16 +226,16 @@ class SidebandConsole:
         return self._pty_name
 
     def handles(self, address: int) -> bool:
-        return self.partition.start <= address < self.partition.start + self.partition.size
+        return self.region.start <= address < self.region.start + self.region.size
 
     def overlaps(self, start: int, end: int) -> bool:
-        return start < self.partition.start + self.partition.size and end >= self.partition.start
+        return start < self.region.start + self.region.size and end >= self.region.start
 
     def _sector(self, address: int) -> int:
         if address % BLOCK_SIZE or not self.handles(address):
             raise BackendError(BackendStatus.Invalid,
-                f"address outside console partition: {address:#x}")
-        return (address - self.partition.start) // BLOCK_SIZE
+                f"address outside sideband reservation: {address:#x}")
+        return (address - self.region.start) // BLOCK_SIZE
 
     def _flags(self) -> int:
         flags = ConsoleFrameFlag.HostReady if self._primary_fd is not None else 0
@@ -201,6 +259,8 @@ class SidebandConsole:
 
     def read_block(self, address: int) -> bytes:
         sector = self._sector(address)
+        if sector == self.region.sectors - 1:
+            return self.region.locator.encode()
         if sector == self.CONTROL_SECTOR:
             self._materialize_input()
             input_sequence = self._input_frames[0].sequence if self._input_frames else 0

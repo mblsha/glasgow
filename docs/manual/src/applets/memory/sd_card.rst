@@ -64,21 +64,28 @@ that window before reaching the backend. At most one operation may wait behind t
 progress, and operations remain strictly ordered, so a slow ``fsync`` cannot block power
 monitoring or unboundedly queue later writes.
 
-Reserved-LBA sideband console
------------------------------
+Unpartitioned-tail sideband console
+-----------------------------------
 
 ``--console-pty PATH`` enables a retry-safe byte-stream console without adding a second physical
-connection. This mode is deliberately opt-in. The image must have a non-bootable type ``0xDA``
-fourth MBR partition of at least four sectors, ending exactly at the image boundary. The applet
-intercepts the entire partition before the file backend, so mailbox writes never alter the image.
-It rejects erase ranges that overlap the partition and cannot be combined with ``--read-only``.
+connection. This mode is deliberately opt-in. The image must reserve at least five unpartitioned
+sectors at its end and store a versioned, CRC-protected ``GSCTAIL1`` locator in the final sector.
+All four MBR entries may remain in use; in the Zaurus A/B layout p4 remains the persistent ext2
+``/data`` partition, shortened by 1 MiB, and boot-control sectors LBA1/LBA2 are unchanged. The
+applet validates that no partition overlaps the located tail and intercepts it before the file
+backend, so mailbox writes never alter the image. It rejects erase ranges that overlap the tail
+and cannot be combined with ``--read-only``.
 
-The first four partition-relative sectors are control (target read), target output (target write),
+The first four tail-relative sectors are control (target read), target output (target write),
 host input (target read), and host-input acknowledgement (target write). Every sector contains a
 versioned 512-byte frame with an IEEE CRC32. Host-input reads peek at one sequence until the target
 explicitly acknowledges it. Repeated target-output writes with the same session, sequence, and
 contents are accepted once, which makes Linux MMC retries harmless. A new applet process chooses
 a new random session; the target renegotiates and restarts its sequence space.
+
+The target discovers the reservation by reading the final sector of the whole-card block device,
+then accesses the mailbox with aligned direct I/O outside every partition. A missing or invalid
+locator is fail-closed: Glasgow refuses ``--console-pty`` and the target daemon performs no writes.
 
 The PTY is owned by the applet process, not by the target-power lifecycle. It therefore remains
 open while SD power is absent and across the applet's off-rail transport rearm. Target output and
