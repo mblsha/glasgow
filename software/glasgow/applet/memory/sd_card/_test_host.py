@@ -403,16 +403,23 @@ class SDCardInterfaceTestCase(unittest.TestCase):
                 iface._active = True
                 complete.set()
 
+            async def transition(event, *, voltage):
+                transitions.append((event, voltage))
+
             iface.flush = flush
             iface.suspend = suspend
             iface.resume = resume
             task = asyncio.create_task(iface.monitor_power(
-                Device(), "B", interval=0.001, debounce_samples=2))
+                Device(), "B", interval=0.001, debounce_samples=2,
+                transition_callback=transition))
             await asyncio.wait_for(complete.wait(), 1)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            self.assertEqual(transitions, ["suspend", "flush", "resume"])
+            self.assertEqual(transitions, [
+                ("rail-fell", 0.0), "suspend", "flush",
+                ("rail-rose", 3.3), "resume",
+            ])
 
         asyncio.run(scenario())
 

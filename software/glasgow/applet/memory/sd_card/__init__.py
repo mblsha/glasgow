@@ -25,6 +25,7 @@ from ._gateware_support import (
     BLOCK_SIZE, FRAME_CRC16, IMAGE_SIZE_WIDTH,
 )
 from ._host import HostBlockEngine
+from ._preinit_trace import PreinitTrace
 from ._protocol import (
     HOST_OPERATION_FOR_EVENT, BackendStatus, FrameError, HostEvent, HostReply,
     ReplyFrame, ReplyHeader, RequestFrame, RequestHeader,
@@ -458,6 +459,14 @@ class SDCardInterface:
             return None
         return self._session.backend
 
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
     def _next_generation(self) -> int:
         # Randomizing the initial value also protects against replies retained when the same
         # bitstream is reused by a later applet process.
@@ -704,7 +713,8 @@ class SDCardInterface:
     async def monitor_power(self, device, port, *, off_threshold: float = 1.0,
             on_threshold: float = 1.8, interval: float = 0.25, debounce_samples: int = 3,
             manage_signal_pulls: bool = False, resume_settle: float = 0.0,
-            rearm_min_interval: float = 0.0, rearm_reset_hold: float = 0.05):
+            rearm_min_interval: float = 0.0, rearm_reset_hold: float = 0.05,
+            transition_callback=None):
         if rearm_min_interval < 0:
             raise SDCardError("power rearm minimum interval must be nonnegative")
         if rearm_reset_hold < 0:
@@ -716,6 +726,17 @@ class SDCardInterface:
             except BackendError as error:
                 self._record_backend_error("power-loss flush", error)
 
+        async def notify_transition(event, voltage):
+            if transition_callback is None:
+                return
+            try:
+                await transition_callback(event, voltage=voltage)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._logger.warning(
+                    "cannot record %s target-power transition: %s", event, error)
+
         async def suspend_for_power_loss(voltage):
             nonlocal target_power_active, last_rearm
             target_power_active = False
@@ -725,6 +746,7 @@ class SDCardInterface:
                 # remains off. On this Zaurus the SD rail does not rise until ON, so waiting for
                 # that edge to re-enable loses the beginning of MAINTE initialization.
                 await self.set_signal_pulls(device, port, enabled=False)
+                await notify_transition("rail-fell", voltage)
                 now = asyncio.get_running_loop().time()
                 if now - last_rearm >= rearm_min_interval:
                     await self.rearm(
@@ -739,10 +761,12 @@ class SDCardInterface:
                         "kept fresh engine armed through boot-time rail chatter",
                         voltage, now - last_rearm)
             else:
+                await notify_transition("rail-fell", voltage)
                 await self.suspend(reason=f"target rail fell to {voltage:.2f} V")
 
         async def resume_after_power_restore(voltage):
             nonlocal target_power_active, last_rearm
+            await notify_transition("rail-rose", voltage)
             if manage_signal_pulls:
                 await self.set_signal_pulls(device, port, enabled=True)
                 if resume_settle > 0:
@@ -770,11 +794,13 @@ class SDCardInterface:
                 if initial_voltage > on_threshold:
                     await self.set_signal_pulls(device, port, enabled=True)
                     target_power_active = True
+                    await notify_transition("rail-initial", initial_voltage)
                     self._logger.info(
                         "target rail initially active at %.2f V; SD card listening",
                         initial_voltage)
                 else:
                     await self.set_signal_pulls(device, port, enabled=False)
+                    await notify_transition("rail-initial", initial_voltage)
                     await self.rearm(
                         reason=f"target rail initially at {initial_voltage:.2f} V",
                         reset_hold=rearm_reset_hold)
@@ -1191,6 +1217,11 @@ class SDCardApplet(GlasgowAppletV2):
             help="periodically log FPGA and backend diagnostics (default: disabled)")
         parser.add_argument("--trace-commands", action="store_true",
             help="log command-counter/last-command transitions for target debugging")
+        parser.add_argument("--preinit-trace", type=Path, metavar="PATH",
+            help="append flushed JSONL SD-progress and target-power records to PATH")
+        parser.add_argument("--preinit-trace-interval", type=float, default=0.25,
+            metavar="SECONDS",
+            help="sample SD diagnostics for --preinit-trace (default: 0.25)")
         parser.add_argument("--console-pty", metavar="PATH",
             help="intercept a final-sector-located unpartitioned tail as a retry-safe console and "
                  "publish its persistent host PTY at PATH")
@@ -1263,6 +1294,61 @@ class SDCardApplet(GlasgowAppletV2):
             raise
 
     async def run(self, args):
+        if args.preinit_trace_interval <= 0:
+            raise SDCardError("--preinit-trace-interval must be positive")
+        preinit_trace = None
+        if args.preinit_trace is not None:
+            try:
+                preinit_trace = PreinitTrace(args.preinit_trace)
+            except OSError as error:
+                raise SDCardError(
+                    f"cannot open pre-init trace {str(args.preinit_trace)!r}: "
+                    f"{error.strerror}") from error
+
+        async def record_preinit(event, *, voltage=None):
+            if preinit_trace is None:
+                return None
+            diagnostics = await self.sd_card_iface.read_diagnostics()
+            fields = {} if voltage is None else {"voltage": voltage}
+            preinit_trace.record_diagnostics(
+                event, diagnostics,
+                generation=self.sd_card_iface.generation,
+                active=self.sd_card_iface.active,
+                **fields,
+            )
+            return diagnostics
+
+        async def trace_preinit_progress():
+            previous = None
+            last_record = float("-inf")
+            while True:
+                diagnostics = await self.sd_card_iface.read_diagnostics()
+                key = (
+                    self.sd_card_iface.generation,
+                    diagnostics.sd_clocks,
+                    diagnostics.commands,
+                    diagnostics.reads,
+                    diagnostics.writes,
+                    diagnostics.protocol_errors,
+                    diagnostics.fpga_backend_errors,
+                    diagnostics.buffer_faults,
+                )
+                now = asyncio.get_running_loop().time()
+                if key != previous or now - last_record >= 5.0:
+                    try:
+                        preinit_trace.record_diagnostics(
+                            "sd-progress" if key != previous else "sd-idle",
+                            diagnostics,
+                            generation=self.sd_card_iface.generation,
+                            active=self.sd_card_iface.active,
+                        )
+                    except OSError as error:
+                        self.logger.warning("cannot append pre-init trace: %s", error)
+                        return
+                    previous = key
+                    last_record = now
+                await asyncio.sleep(args.preinit_trace_interval)
+
         async def log_diagnostics():
             while True:
                 await asyncio.sleep(args.diagnostics_interval)
@@ -1310,13 +1396,15 @@ class SDCardApplet(GlasgowAppletV2):
 
         try:
             if (args.no_power_monitor and args.diagnostics_interval <= 0 and
-                    self.sideband_console is None):
+                    self.sideband_console is None and preinit_trace is None):
                 await self.sd_card_iface.serve()
                 return
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(self.sd_card_iface.serve())
                 if self.sideband_console is not None:
                     tasks.create_task(self.sideband_console.serve_pty())
+                if preinit_trace is not None:
+                    tasks.create_task(trace_preinit_progress())
                 if args.trace_commands:
                     tasks.create_task(trace_commands())
                 if not args.no_power_monitor:
@@ -1329,10 +1417,16 @@ class SDCardApplet(GlasgowAppletV2):
                         manage_signal_pulls=high_z,
                         resume_settle=args.power_resume_settle,
                         rearm_min_interval=args.power_rearm_min_interval,
-                        rearm_reset_hold=args.power_rearm_reset_hold))
+                        rearm_reset_hold=args.power_rearm_reset_hold,
+                        transition_callback=record_preinit))
                 if args.diagnostics_interval > 0:
                     tasks.create_task(log_diagnostics())
         finally:
+            if preinit_trace is not None:
+                try:
+                    preinit_trace.close()
+                except OSError as error:
+                    self.logger.warning("cannot close pre-init trace: %s", error)
             if self.sideband_console is not None:
                 self.sideband_console.close()
             if high_z:
