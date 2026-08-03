@@ -75,15 +75,17 @@ changing the default sampling interval is 250 ms; unchanged state emits a five-s
 ``--preinit-trace-interval SECONDS`` changes the sampling interval. Existing files are appended,
 not replaced, and every run is bracketed by ``trace-start`` and ``trace-stop`` records.
 
-The aggregate ``protocol_errors`` remains the strict sum used by existing qualification. Every
-snapshot also breaks it down as ``command_protocol_errors``, ``data_protocol_errors``,
-``host_protocol_errors``, and the already separate ``buffer_faults``. Command errors are further
-split into malformed start/transmission/end framing and CRC7 failures. These counters are
-diagnostic attribution only: rail-correlated errors are not subtracted, cleared, or downgraded.
-In particular, a final ``rail-fell`` delta consisting only of command framing errors is consistent
-with CMD collapsing while power disappears, but the run remains non-clean until a repeated trace
-establishes the fixture-specific rule. Data or host-reply increments identify a different emulator
-path that must be investigated rather than treated as an expected power edge.
+The aggregate ``protocol_errors`` remains the strict command + data + host + buffer-fault count used
+by existing qualification, with ``buffer_faults`` also reported separately as before.
+``protocol_error_sources`` is a compact four-bit attribution mask: bit 0 is malformed command
+start/transmission/end framing, bit 1 is command CRC7, bit 2 is the data engine, and bit 3 is the
+host-reply engine. Within a bounded emulator generation before any 16-bit source counter wraps, a
+mask of exactly ``1`` together with ``buffer_faults == 0`` proves that every error in a nonzero
+aggregate came from command framing; any other set bit proves a CRC, data, or host-reply path also
+failed. This representation preserves revC3 FPGA capacity and does not subtract, clear, or downgrade
+errors. A final ``rail-fell`` delta with mask ``1`` and no buffer faults is consistent with CMD
+collapsing while power disappears, but the run remains non-clean until a repeated trace establishes
+the fixture-specific rule.
 
 This trace deliberately does not claim to be a kernel console. An SD memory card is a synchronous
 slave: it only receives clocks from the target and drives CMD or DAT as a response to a target

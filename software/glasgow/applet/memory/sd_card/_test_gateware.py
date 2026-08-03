@@ -34,14 +34,12 @@ class CommandEngineErrorBreakdownTestCase(unittest.TestCase):
             # Valid start/transmission/end framing with a deliberately bad CRC7.
             await send_word((1 << 46) | 1)
             self.assertEqual(ctx.get(dut.protocol_errors), 1)
-            self.assertEqual(ctx.get(dut.frame_errors), 0)
-            self.assertEqual(ctx.get(dut.crc_errors), 1)
+            self.assertEqual(ctx.get(dut.protocol_error_sources), 0b10)
 
             # An all-zero frame is malformed; it is still exactly one strict error.
             await send_word(0)
             self.assertEqual(ctx.get(dut.protocol_errors), 2)
-            self.assertEqual(ctx.get(dut.frame_errors), 1)
-            self.assertEqual(ctx.get(dut.crc_errors), 1)
+            self.assertEqual(ctx.get(dut.protocol_error_sources), 0b11)
 
         simulator = Simulator(m)
         simulator.add_clock(1e-6, domain="sd")
