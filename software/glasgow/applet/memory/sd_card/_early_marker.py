@@ -2,30 +2,63 @@ from amaranth import *
 from amaranth.lib import cdc, wiring
 from amaranth.lib.wiring import In, Out
 
-from ._resume_probe import RESUME_PROBE_BIT_CYCLES
+
+__all__ = [
+    "EARLY_MARKER_BREAK_MIN",
+    "EARLY_MARKER_SYNC_MIN",
+    "EARLY_MARKER_SYNC_MAX",
+    "EARLY_MARKER_SHORT_MIN",
+    "EARLY_MARKER_SHORT_MAX",
+    "EARLY_MARKER_LONG_MIN",
+    "EARLY_MARKER_LONG_MAX",
+    "EarlyMarkerCapture",
+]
 
 
-__all__ = ["EARLY_MARKER_BIT_CYCLES", "EarlyMarkerCapture"]
-
-
-EARLY_MARKER_BIT_CYCLES = RESUME_PROBE_BIT_CYCLES
+# Glasgow's sync domain is 48 MHz. The target-side transmitter uses the
+# 3.6864 MHz PXA OS timer: 128 ticks for BREAK/SYNC, 32 ticks for a short
+# interval, and 64 ticks for a long interval. These windows leave ample room
+# for synchronizer latency and software GPIO transition jitter.
+EARLY_MARKER_BREAK_MIN = 1400
+EARLY_MARKER_SYNC_MIN = 1400
+EARLY_MARKER_SYNC_MAX = 1950
+EARLY_MARKER_SHORT_MIN = 320
+EARLY_MARKER_SHORT_MAX = 560
+EARLY_MARKER_LONG_MIN = 700
+EARLY_MARKER_LONG_MAX = 1050
 
 
 class EarlyMarkerCapture(wiring.Component):
-    """Compact input-only decoder for early markers on the SD CLK pad.
+    """Minimal input-only pulse decoder for early markers on SD CLK.
 
-    The wire format is the qualified deep-resume marker frame: physically
-    inverted 115200-8N1 carrying ``55 d3 4d 01 seq type ~type crc8``. Only the
-    last nonzero, structurally valid type is retained. The SD card engine
-    continues to observe the same pad independently; this block never drives
-    any SD net.
+    A frame is a long low BREAK, a long high SYNC, then eight pulse-width
+    bits, least significant first. Each bit has a short low gap followed by a
+    short high pulse for zero or a long high pulse for one. Bits 0..3 are a
+    nonzero marker and bits 4..7 are its one's complement. Only the last valid
+    marker is retained.
+
+    The SD card engine observes the same pad independently. This component
+    has no output or output-enable path and never drives any SD net.
     """
 
     clk_i: In(1)
-    last_marker: Out(8)
+    last_marker: Out(4)
 
-    def __init__(self, *, bit_cycles=EARLY_MARKER_BIT_CYCLES):
-        self._bit_cycles = bit_cycles
+    def __init__(self, *,
+            break_min=EARLY_MARKER_BREAK_MIN,
+            sync_min=EARLY_MARKER_SYNC_MIN, sync_max=EARLY_MARKER_SYNC_MAX,
+            short_min=EARLY_MARKER_SHORT_MIN, short_max=EARLY_MARKER_SHORT_MAX,
+            long_min=EARLY_MARKER_LONG_MIN, long_max=EARLY_MARKER_LONG_MAX):
+        assert 0 < break_min
+        assert 0 < sync_min <= sync_max
+        assert 0 < short_min <= short_max < long_min <= long_max
+        self._break_min = break_min
+        self._sync_min = sync_min
+        self._sync_max = sync_max
+        self._short_min = short_min
+        self._short_max = short_max
+        self._long_min = long_min
+        self._long_max = long_max
         super().__init__()
 
     def elaborate(self, platform):
@@ -36,86 +69,70 @@ class EarlyMarkerCapture(wiring.Component):
 
         level_q = Signal()
         m.d.sync += level_q.eq(clk_sync)
+        rising = clk_sync & ~level_q
+        falling = ~clk_sync & level_q
+        edge = rising | falling
 
-        rx_active = Signal()
-        rx_timer = Signal(range(self._bit_cycles * 2))
-        rx_bit = Signal(range(9))
-        rx_shift = Signal(8)
-        rx_byte = Signal(8)
-        rx_byte_valid = Signal()
-        m.d.sync += rx_byte_valid.eq(0)
+        duration_width = max(
+            self._break_min, self._sync_max,
+            self._short_max, self._long_max,
+        ).bit_length()
+        duration = Signal(duration_width)
+        with m.If(edge):
+            m.d.sync += duration.eq(0)
+        with m.Elif(~duration.all()):
+            m.d.sync += duration.eq(duration + 1)
 
-        with m.If(~rx_active):
-            # Logical UART start is low, hence physical high on this inverted
-            # target-output wire. Each byte resynchronizes on its own edge.
-            with m.If(clk_sync & ~level_q):
-                m.d.sync += [
-                    rx_active.eq(1),
-                    rx_timer.eq(self._bit_cycles + self._bit_cycles // 2 - 1),
-                    rx_bit.eq(0),
-                    rx_shift.eq(0),
-                ]
-        with m.Elif(rx_timer != 0):
-            m.d.sync += rx_timer.eq(rx_timer - 1)
-        with m.Else():
-            with m.If(rx_bit < 8):
-                m.d.sync += [
-                    rx_shift.bit_select(rx_bit, 1).eq(~clk_sync),
-                    rx_bit.eq(rx_bit + 1),
-                    rx_timer.eq(self._bit_cycles - 1),
-                ]
-            with m.Else():
-                m.d.sync += rx_active.eq(0)
-                with m.If(~clk_sync):
-                    m.d.sync += [
-                        rx_byte.eq(rx_shift),
-                        rx_byte_valid.eq(1),
-                    ]
+        SEARCH_BREAK = 0
+        SYNC_HIGH = 1
+        BIT_LOW = 2
+        BIT_HIGH = 3
+        state = Signal(2)
+        bit_index = Signal(3)
+        frame_bits = Signal(7)
 
-        parser_state = Signal(range(8))
-        frame_type = Signal(8)
+        short_interval = (duration >= self._short_min) & (duration <= self._short_max)
+        long_interval = (duration >= self._long_min) & (duration <= self._long_max)
+        candidate = Cat(frame_bits, long_interval)
 
-        with m.If(rx_byte_valid):
-            with m.Switch(parser_state):
-                with m.Case(0):
-                    with m.If(rx_byte == 0x55):
-                        m.d.sync += parser_state.eq(1)
-                with m.Case(1):
-                    with m.If(rx_byte == 0xd3):
-                        m.d.sync += parser_state.eq(2)
-                    with m.Elif(rx_byte != 0x55):
-                        m.d.sync += parser_state.eq(0)
-                with m.Case(2):
-                    with m.If(rx_byte == 0x4d):
-                        m.d.sync += parser_state.eq(3)
-                    with m.Elif(rx_byte == 0x55):
-                        m.d.sync += parser_state.eq(1)
+        with m.Switch(state):
+            with m.Case(SEARCH_BREAK):
+                with m.If(rising & (duration >= self._break_min)):
+                    m.d.sync += state.eq(SYNC_HIGH)
+
+            with m.Case(SYNC_HIGH):
+                with m.If(falling):
+                    with m.If((duration >= self._sync_min) & (duration <= self._sync_max)):
+                        m.d.sync += [
+                            state.eq(BIT_LOW),
+                            bit_index.eq(0),
+                            frame_bits.eq(0),
+                        ]
                     with m.Else():
-                        m.d.sync += parser_state.eq(0)
-                with m.Case(3):
-                    with m.If(rx_byte == 0x01):
-                        m.d.sync += parser_state.eq(4)
+                        m.d.sync += state.eq(SEARCH_BREAK)
+
+            with m.Case(BIT_LOW):
+                with m.If(rising):
+                    with m.If(short_interval):
+                        m.d.sync += state.eq(BIT_HIGH)
                     with m.Else():
-                        m.d.sync += parser_state.eq(Mux(rx_byte == 0x55, 1, 0))
-                with m.Case(4):
-                    m.d.sync += parser_state.eq(5)
-                with m.Case(5):
-                    m.d.sync += [
-                        frame_type.eq(rx_byte),
-                        parser_state.eq(6),
-                    ]
-                with m.Case(6):
-                    with m.If((rx_byte == (frame_type ^ 0xff)) & (frame_type != 0)):
-                        m.d.sync += parser_state.eq(7)
+                        m.d.sync += state.eq(SEARCH_BREAK)
+
+            with m.Case(BIT_HIGH):
+                with m.If(falling):
+                    with m.If(short_interval | long_interval):
+                        with m.If(bit_index == 7):
+                            marker = candidate[:4]
+                            with m.If((marker != 0) & (candidate[4:] == (marker ^ 0xf))):
+                                m.d.sync += self.last_marker.eq(marker)
+                            m.d.sync += state.eq(SEARCH_BREAK)
+                        with m.Else():
+                            m.d.sync += [
+                                frame_bits.bit_select(bit_index, 1).eq(long_interval),
+                                bit_index.eq(bit_index + 1),
+                                state.eq(BIT_LOW),
+                            ]
                     with m.Else():
-                        m.d.sync += parser_state.eq(Mux(rx_byte == 0x55, 1, 0))
-                with m.Case(7):
-                    # Consume the existing frame's CRC byte for wire compatibility. The compact
-                    # in-card decoder relies on the 24-bit magic, version, and type complement;
-                    # the dedicated probe applet retains the full CRC checker and raw edge trace.
-                    m.d.sync += [
-                        self.last_marker.eq(frame_type),
-                        parser_state.eq(Mux(rx_byte == 0x55, 1, 0)),
-                    ]
+                        m.d.sync += state.eq(SEARCH_BREAK)
 
         return m

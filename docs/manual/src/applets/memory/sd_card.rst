@@ -94,29 +94,36 @@ Early input-only marker trace
 bitstream. It is deliberately build-time opt-in so ordinary applet gateware and behavior do not
 change. The receiver only taps the SD CLK input in Glasgow's 48 MHz domain; it adds no output or
 output-enable path and does not inspect or drive CMD or DAT. A target can therefore report a
-one-byte, nonzero progress or fault marker before its MMC host driver exists by temporarily driving
-its SD-clock GPIO. The last validated marker appears as ``early_marker`` in every
-``--preinit-trace`` diagnostics object. Zero means that no marker has been accepted in the current
-emulator generation.
+four-bit, nonzero progress or fault marker before its MMC host driver exists by temporarily driving
+its SD-clock GPIO. The last validated four-bit marker appears as ``early_marker`` in every
+``--preinit-trace`` diagnostics object. Zero means that no marker has been accepted since the
+gateware was configured. The latch intentionally survives SD-engine generation resets so that a
+``rail-fell`` snapshot cannot erase the evidence; reconfigure the applet between independent boot
+trials when marker freshness must be proven.
 
-The wire format reuses the already qualified PXA deep-resume marker protocol: physically inverted
-115200-8N1 bytes ``55 d3 4d 01 SEQUENCE TYPE ~TYPE CRC``. ``CRC`` is CRC-8/ATM over
-``01 SEQUENCE TYPE ~TYPE``. To fit beside the complete emulator on revC3, this compact receiver
-validates UART framing, all three sync bytes, version, and the independently transmitted type and
-complement (40 structural bits), then consumes but does not evaluate the CRC byte. The dedicated
-input-only probe applet remains the full CRC/raw-edge authority. The in-card receiver retains only
-the latest marker rather than a byte stream: this is a progressive binary-search/fault channel, not
-an interactive console. An SD card is a synchronous slave, so a host-to-target channel remains
-impossible until target code supplies clocks and receives a response.
+The compact wire format is intentionally not UART. It is a timing-framed pulse code, with the line
+idle low: BREAK is low for 128 PXA OS-timer ticks, SYNC is high for 128 ticks, and eight bits follow
+least-significant first. Each bit is a low gap of 32 ticks followed by a high pulse of 32 ticks for
+zero or 64 ticks for one. Bits 0--3 are a nonzero marker and bits 4--7 are ``marker XOR 0xf``. At
+the 3.6864 MHz PXA OS timer these durations are about 34.7, 8.7, and 17.4 microseconds. The receiver
+checks every interval and the complement before latching a marker. Ordinary SD clocks are far too
+short to pass these windows. The receiver retains only the latest marker rather than a byte stream:
+this is a progressive binary-search/fault channel, not an interactive console. Marker values are
+``1`` through ``15``; existing emitters for the former inverted-UART format must be replaced.
+At Glasgow's 48 MHz clock, the acceptance windows are: BREAK at least 1400 cycles; SYNC 1400--1950
+cycles; short gaps/pulses 320--560 cycles; and long pulses 700--1050 cycles. These correspond to
+at least 29.2 microseconds, 29.2--40.6 microseconds, 6.7--11.7 microseconds, and 14.6--21.9
+microseconds. The nominal OS-timer durations above sit near the center of every bounded window.
 
 On the SL-C860, PXA GPIO6/MMCCLK reaches CLK on the SD socket and Glasgow B2. The established
-target transmitter uses the 3.6864 MHz OS timer (32 ticks per 115200 bit), saves GPIO6's live mux,
-direction, and output latch, stops any concurrent MMC-clock owner, switches GPIO6 to AF0 output-low,
-emits a bounded frame, then restores the saved GPIO state before normal MMC setup. It must leave CMD
-and DAT untouched. The emulator sees the marker's CLK edges as idle SD clocks with CMD high, so no
-command, response, data transfer, or protocol error is introduced. Instrumentation after PXA I/O
-mapping can emit unique types around a suspect early-ARM call; the last retained type is the last
-proven point.
+target transmitter uses the 3.6864 MHz OS timer, saves GPIO6's live mux, direction, and output
+latch, stops any concurrent MMC-clock owner, switches GPIO6 to AF0 output-low, emits the bounded
+waveform above, returns low, then restores the saved GPIO state before normal MMC setup. Each level
+must be held until an OS-timer deadline rather than using an instruction-counted delay. It must
+leave CMD and DAT untouched. The emulator sees the marker's CLK edges as idle SD clocks with CMD
+high, so no command, response, data transfer, or protocol error is introduced. Instrumentation
+after PXA I/O mapping can emit unique values around a suspect early-ARM call; the last retained
+value is the last proven point.
 
 Use the input-only marker receiver together with the lifecycle trace as follows::
 
