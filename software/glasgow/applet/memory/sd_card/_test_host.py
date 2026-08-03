@@ -162,6 +162,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         iface._diagnostics_snapshot.value = packed_diagnostics(**{
             name: value for value, name in enumerate(field_names, 1)
         })
+        iface.last_command.value = 7
         iface._early_marker = _ImmediateRegister(0x3)
         iface._host_backend_errors = 14
         iface._flush_count = 15
@@ -169,6 +170,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         diagnostics = asyncio.run(iface.read_diagnostics())
         self.assertIsInstance(diagnostics, SDCardDiagnostics)
         self.assertEqual(diagnostics.sd_clocks, 1)
+        self.assertEqual(diagnostics.last_command, 7)
         self.assertEqual(
             diagnostics.protocol_error_sources,
             ProtocolErrorSource.COMMAND_FRAME |

@@ -112,6 +112,13 @@ successful internal no-op: it updates the latch but deliberately schedules no ca
 the target need not supply further clocks or consume R1. The target must return CMD high and release
 it after the final falling CLK edge.
 
+The hook is localized to the non-application CMD56 case; it does not wrap or gate common command
+dispatch. In particular, CMD7 and its R1 response use the same source control structure as an
+ordinary build. Do not emit the private CMD56 while an APP_CMD context from CMD55 is pending. The
+``last_command`` diagnostics field is sampled from the existing command register immediately after
+the packed FPGA snapshot, so it identifies a stable repeated command without adding gateware but is
+advisory if commands are changing continuously.
+
 On the SL-C860, save the live mux, direction, and output latch for GPIO6/MMCCLK and GPIO8/MMCCMD,
 stop any concurrent MMC owner, and confirm that the preceding card transaction is complete. Drive
 only CLK and CMD for the bounded 48-clock frame, release CMD before restoring ownership, then
