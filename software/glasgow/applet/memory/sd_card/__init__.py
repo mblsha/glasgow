@@ -62,6 +62,11 @@ class SDCardDiagnostics:
     reads: int
     writes: int
     protocol_errors: int
+    command_protocol_errors: int
+    command_frame_errors: int
+    command_crc_errors: int
+    data_protocol_errors: int
+    host_protocol_errors: int
     fpga_backend_errors: int
     stale_replies: int
     buffer_faults: int
@@ -353,6 +358,12 @@ class SDCardComponent(wiring.Component):
             diagnostics_snapshot.protocol_errors.eq(
                 command_engine.protocol_errors + data_engine.protocol_errors +
                 host_engine.protocol_errors + block_buffer.fault_count),
+            diagnostics_snapshot.command_protocol_errors.eq(
+                command_engine.protocol_errors),
+            diagnostics_snapshot.command_frame_errors.eq(command_engine.frame_errors),
+            diagnostics_snapshot.command_crc_errors.eq(command_engine.crc_errors),
+            diagnostics_snapshot.data_protocol_errors.eq(data_engine.protocol_errors),
+            diagnostics_snapshot.host_protocol_errors.eq(host_engine.protocol_errors),
             diagnostics_snapshot.backend_errors.eq(host_engine.backend_errors),
             diagnostics_snapshot.stale_replies.eq(host_engine.stale_replies),
             diagnostics_snapshot.buffer_faults.eq(block_buffer.fault_count),
@@ -918,6 +929,11 @@ class SDCardInterface:
             reads=fpga["reads"],
             writes=fpga["writes"],
             protocol_errors=fpga["protocol_errors"],
+            command_protocol_errors=fpga["command_protocol_errors"],
+            command_frame_errors=fpga["command_frame_errors"],
+            command_crc_errors=fpga["command_crc_errors"],
+            data_protocol_errors=fpga["data_protocol_errors"],
+            host_protocol_errors=fpga["host_protocol_errors"],
             fpga_backend_errors=fpga["backend_errors"],
             stale_replies=fpga["stale_replies"],
             buffer_faults=fpga["buffer_faults"],

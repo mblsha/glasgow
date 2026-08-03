@@ -15,7 +15,12 @@ class PreinitTraceTestCase(unittest.TestCase):
             commands=17,
             reads=8,
             writes=0,
-            protocol_errors=0,
+            protocol_errors=65,
+            command_protocol_errors=65,
+            command_frame_errors=65,
+            command_crc_errors=0,
+            data_protocol_errors=0,
+            host_protocol_errors=0,
             fpga_backend_errors=0,
             stale_replies=0,
             buffer_faults=0,
@@ -48,6 +53,11 @@ class PreinitTraceTestCase(unittest.TestCase):
             ])
             self.assertEqual(live_records[1]["generation"], 0x1234)
             self.assertEqual(live_records[1]["diagnostics"]["commands"], 17)
+            self.assertEqual(live_records[1]["diagnostics"]["protocol_errors"], 65)
+            self.assertEqual(
+                live_records[1]["diagnostics"]["command_protocol_errors"], 65)
+            self.assertEqual(
+                live_records[1]["diagnostics"]["command_frame_errors"], 65)
             self.assertEqual(live_records[1]["voltage"], 0.2)
             self.assertEqual(live_records[0]["run_id"], live_records[1]["run_id"])
 

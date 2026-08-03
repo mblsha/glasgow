@@ -31,6 +31,8 @@ class CommandEngine(wiring.Component):
     command_low_count: Out(32)
     command_count: Out(32)
     protocol_errors: Out(16)
+    frame_errors: Out(16)
+    crc_errors: Out(16)
 
     def __init__(self, *, capture_cmd17_wire=False):
         self._capture_cmd17_wire = capture_cmd17_wire
@@ -172,8 +174,16 @@ def _elaborate_command_engine(
                 ]
 
                 valid_frame = (cmd_word[47] == 0) & (cmd_word[46] == 1) & (cmd_word[0] == 1)
-                with m.If(~valid_frame | (cmd_crc != cmd_crc_calc)):
-                    m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
+                with m.If(~valid_frame):
+                    m.d.sd += [
+                        self.protocol_errors.eq(self.protocol_errors + 1),
+                        self.frame_errors.eq(self.frame_errors + 1),
+                    ]
+                with m.Elif(cmd_crc != cmd_crc_calc):
+                    m.d.sd += [
+                        self.protocol_errors.eq(self.protocol_errors + 1),
+                        self.crc_errors.eq(self.crc_errors + 1),
+                    ]
                 with m.Else():
                     with m.If(cmd_index != 55):
                         m.d.sd += app_command.eq(0)

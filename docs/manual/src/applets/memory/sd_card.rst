@@ -75,6 +75,16 @@ changing the default sampling interval is 250 ms; unchanged state emits a five-s
 ``--preinit-trace-interval SECONDS`` changes the sampling interval. Existing files are appended,
 not replaced, and every run is bracketed by ``trace-start`` and ``trace-stop`` records.
 
+The aggregate ``protocol_errors`` remains the strict sum used by existing qualification. Every
+snapshot also breaks it down as ``command_protocol_errors``, ``data_protocol_errors``,
+``host_protocol_errors``, and the already separate ``buffer_faults``. Command errors are further
+split into malformed start/transmission/end framing and CRC7 failures. These counters are
+diagnostic attribution only: rail-correlated errors are not subtracted, cleared, or downgraded.
+In particular, a final ``rail-fell`` delta consisting only of command framing errors is consistent
+with CMD collapsing while power disappears, but the run remains non-clean until a repeated trace
+establishes the fixture-specific rule. Data or host-reply increments identify a different emulator
+path that must be investigated rather than treated as an expected power edge.
+
 This trace deliberately does not claim to be a kernel console. An SD memory card is a synchronous
 slave: it only receives clocks from the target and drives CMD or DAT as a response to a target
 command or data transfer. If MAINTE has finished and Linux has not initialized the PXA MMC host,
