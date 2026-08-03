@@ -59,6 +59,8 @@ class SDCardAppletTestCase(
         self.assertEqual(args.power_rearm_reset_hold, 0.05)
         self.assertFalse(args.trace_commands)
         self.assertFalse(args.capture_cmd17_wire)
+        self.assertIsNone(args.preinit_trace)
+        self.assertEqual(args.preinit_trace_interval, 0.25)
         self.assertTrue(self._parse_args([
             "--trace-commands", "--clk", "B2", "card.img",
         ]).trace_commands)
@@ -146,5 +148,6 @@ from ._test_host import (
     BackendWorkerTestCase, FAT16ImageTestCase, FileBlockBackendTestCase,
     SDCardInterfaceTestCase, SDCardProtocolTestCase,
 )
+from ._test_preinit_trace import PreinitTraceTestCase
 from ._test_sideband_console import SidebandConsoleTestCase
 from ._test_zaurus import ConsoleTransportTestCase, ZaurusSDControllerTestCase

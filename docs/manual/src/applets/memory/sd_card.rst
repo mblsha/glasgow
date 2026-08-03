@@ -64,6 +64,39 @@ that window before reaching the backend. At most one operation may wait behind t
 progress, and operations remain strictly ordered, so a slow ``fsync`` cannot block power
 monitoring or unboundedly queue later writes.
 
+Pre-init lifecycle trace
+------------------------
+
+``--preinit-trace PATH`` appends a flushed JSON Lines record of everything Glasgow can observe
+before target userspace exists. Records include a random run identifier, host wall and monotonic
+timestamps, emulator generation, target-power transitions, and atomic snapshots of SD clocks,
+commands, reads, writes, protocol errors, backend errors, and buffer faults. While counters are
+changing the default sampling interval is 250 ms; unchanged state emits a five-second heartbeat.
+``--preinit-trace-interval SECONDS`` changes the sampling interval. Existing files are appended,
+not replaced, and every run is bracketed by ``trace-start`` and ``trace-stop`` records.
+
+This trace deliberately does not claim to be a kernel console. An SD memory card is a synchronous
+slave: it only receives clocks from the target and drives CMD or DAT as a response to a target
+command or data transfer. If MAINTE has finished and Linux has not initialized the PXA MMC host,
+Glasgow cannot send a byte to the target or solicit one over CLK/CMD/DAT. SDIO DAT1 interrupts do
+not help because the host has not enumerated or enabled an SDIO function. The independently sensed,
+target-driven SD supply is the only asynchronous observation on this wiring.
+
+For a pre-MMC failure, pair this trace with a diagnostic image that raises the isolated SD-power
+GPIO at exactly one decompressor or early-kernel milestone. A ``rail-rose`` record followed by
+zero commands in the freshly rearmed emulator generation proves that the CPU reached that marker
+without implying that MMC initialized;
+absence of the rise bounds the failure before the marker. ``rail-fell`` captures the final SD
+snapshot before the applet rearms and resets the emulator counters. This remains a one-bit stage
+probe, not textual logging, but it works while the SD protocol itself is silent and does not
+require Glasgow to drive an unpowered target. For example::
+
+    glasgow run memory-sd-card -V B=3.3 \
+        --clk B2 --cmd B5 --dat B1,B0,B7,B6 \
+        --max-sd-clock 5m --transfer-speed 1m --one-bit \
+        --prime-first-read --power-idle-high-z \
+        --preinit-trace /tmp/zaurus-preinit.jsonl card.img
+
 Unpartitioned-tail sideband console
 -----------------------------------
 
