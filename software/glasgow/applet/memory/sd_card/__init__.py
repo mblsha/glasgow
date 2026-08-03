@@ -21,7 +21,6 @@ from ._data import DataEngine
 from ._diagnostics import (
     FPGA_DIAGNOSTICS_LAYOUT, ProtocolErrorSource, decode_fpga_diagnostics,
 )
-from ._early_marker import EarlyMarkerCapture
 from ._errors import SDCardError
 from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 from ._gateware_support import (
@@ -191,15 +190,6 @@ class SDCardComponent(wiring.Component):
         if platform is not None:
             platform.add_clock_constraint(clk_buffer.i, self._max_sd_clock)
 
-        if self._early_marker_trace:
-            m.submodules.early_marker_capture = early_marker_capture = EarlyMarkerCapture()
-            m.d.comb += [
-                early_marker_capture.clk_i.eq(clk_buffer.i),
-                self.early_marker.eq(early_marker_capture.last_marker),
-            ]
-        else:
-            m.d.comb += self.early_marker.eq(0)
-
         m.domains.sd = cd_sd = ClockDomain(async_reset=True, local=True)
         m.domains.sd_fall = cd_sd_fall = ClockDomain(async_reset=True, local=True)
         reset_clock = ClockSignal()
@@ -301,7 +291,8 @@ class SDCardComponent(wiring.Component):
 
         dat_i = Cat(*(buffer.i for buffer in dat_buffers))
         m.submodules.command_engine = command_engine = CommandEngine(
-            capture_cmd17_wire=self._capture_cmd17_wire)
+            capture_cmd17_wire=self._capture_cmd17_wire,
+            early_marker_trace=self._early_marker_trace)
         m.submodules.data_engine = data_engine = DataEngine()
         m.submodules.host_engine = host_engine = HostBlockEngine()
         diagnostics_snapshot = data.View(
@@ -350,6 +341,7 @@ class SDCardComponent(wiring.Component):
             self.command_count.eq(command_engine.command_count),
             self.read_count.eq(data_engine.read_count),
             self.write_count.eq(data_engine.write_count),
+            self.early_marker.eq(command_engine.early_marker),
             self.protocol_errors.eq(
                 command_engine.protocol_errors + data_engine.protocol_errors +
                 host_engine.protocol_errors + block_buffer.fault_count),
@@ -1171,7 +1163,7 @@ class SDCardApplet(GlasgowAppletV2):
         parser.add_argument("--capture-cmd17-wire", action="store_true",
             help="diagnostic build: capture the pad-observed CMD17 R1 in clock counters")
         parser.add_argument("--early-marker-trace", action="store_true",
-            help="diagnostic build: decode input-only early markers on the SD CLK pad")
+            help="diagnostic build: accept private CRC7 early-marker commands")
         power_idle_group = parser.add_mutually_exclusive_group()
         power_idle_group.add_argument(
             "--power-idle-high-z", dest="power_idle_high_z", action="store_true",

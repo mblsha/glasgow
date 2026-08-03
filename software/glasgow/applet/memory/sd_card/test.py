@@ -149,7 +149,7 @@ class SDCardAppletTestCase(
 # cases live in smaller implementation-specific modules.
 from ._test_gateware import (
     BlockBufferTestCase, COBSRecoveryTestCase, CommandEngineErrorBreakdownTestCase,
-    EarlyMarkerCaptureTestCase, ReadBufferManagerTestCase,
+    EarlyMarkerCommandTestCase, ReadBufferManagerTestCase,
 )
 from ._test_host import (
     BackendWorkerTestCase, FAT16ImageTestCase, FileBlockBackendTestCase,
