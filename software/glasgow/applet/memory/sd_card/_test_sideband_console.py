@@ -203,6 +203,51 @@ class SidebandConsoleTestCase(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_pty_client_can_disconnect_and_reconnect_without_output_loss(self):
+        async def scenario():
+            console = self.make_console()
+            with tempfile.TemporaryDirectory() as temp_name:
+                link = Path(temp_name) / "console"
+                console.open_pty(link)
+                first_client = os.open(
+                    link, os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
+                task = asyncio.create_task(console.serve_pty())
+                try:
+                    os.close(first_client)
+                    output = ConsoleFrame(
+                        ConsoleFrameKind.TargetOutput, console.session,
+                        sequence=1, payload=b"survived-detach\r\n").encode()
+                    console.write_block(
+                        console.region.start + BLOCK_SIZE, output)
+                    for _ in range(100):
+                        await asyncio.sleep(0.001)
+                        if not console._target_output:
+                            break
+                    self.assertFalse(console._target_output)
+
+                    second_client = os.open(
+                        link, os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
+                    try:
+                        received = b""
+                        for _ in range(100):
+                            await asyncio.sleep(0.001)
+                            try:
+                                received += os.read(second_client, 4096)
+                            except BlockingIOError:
+                                pass
+                            if b"survived-detach\r\n" in received:
+                                break
+                        self.assertEqual(received.count(b"survived-detach\r\n"), 1)
+                    finally:
+                        os.close(second_client)
+                finally:
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    console.close()
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()
