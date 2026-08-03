@@ -1,11 +1,13 @@
 import asyncio
 
 from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
+from glasgow.simulation.assembly import SimulationAssembly
 
 from . import (
-    BLOCK_SIZE, DEFAULT_TRANSFER_SPEED, SDCardApplet,
+    BLOCK_SIZE, DEFAULT_TRANSFER_SPEED, SDCardApplet, SDCardError,
     build_cid, build_csd, build_scr, crc7, crc16,
-    decode_csd_transfer_speed, encode_csd_transfer_speed, parse_transfer_speed,
+    decode_csd_transfer_speed, encode_csd_transfer_speed, encode_early_marker,
+    parse_transfer_speed,
 )
 from .test_sim import SDCardSimulationTestMixin
 
@@ -68,9 +70,19 @@ class SDCardAppletTestCase(
         self.assertTrue(self._parse_args([
             "--capture-cmd17-wire", "--clk", "B2", "card.img",
         ]).capture_cmd17_wire)
-        self.assertTrue(self._parse_args([
+        removed_marker_args = self._parse_args([
             "--early-marker-trace", "--clk", "B2", "card.img",
-        ]).early_marker_trace)
+        ])
+        self.assertTrue(removed_marker_args.early_marker_trace)
+        with self.assertRaisesRegex(SDCardError, "was removed"):
+            self.applet_cls(SimulationAssembly()).build(removed_marker_args)
+
+    def test_early_marker_encoding(self):
+        self.assertEqual(encode_early_marker(3), (19, 0x474d_4bc3))
+        self.assertEqual(encode_early_marker(15), (31, 0x474d_4b0f))
+        for marker in (0, 16):
+            with self.assertRaises(ValueError):
+                encode_early_marker(marker)
 
     def test_high_z_setup_clears_voltage_alert_before_arming_signals(self):
         events = []
@@ -149,7 +161,7 @@ class SDCardAppletTestCase(
 # cases live in smaller implementation-specific modules.
 from ._test_gateware import (
     BlockBufferTestCase, COBSRecoveryTestCase, CommandEngineErrorBreakdownTestCase,
-    EarlyMarkerCommandTestCase, ReadBufferManagerTestCase,
+    ReadBufferManagerTestCase,
 )
 from ._test_host import (
     BackendWorkerTestCase, FAT16ImageTestCase, FileBlockBackendTestCase,

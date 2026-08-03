@@ -10,17 +10,7 @@ from ._interfaces import CommandDataSignature
 from ._response import ResponseEngine
 
 
-__all__ = [
-    "EARLY_MARKER_COMMAND", "EARLY_MARKER_MAGIC",
-    "CommandEngine",
-]
-
-
-# Private, no-response use of CMD56 for pre-MMC progress markers. The complete
-# command still uses ordinary SD framing and CRC7; only a matching magic
-# argument is intercepted by diagnostic builds.
-EARLY_MARKER_COMMAND = 56
-EARLY_MARKER_MAGIC = 0x474d4b  # ASCII "GMK"
+__all__ = ["CommandEngine"]
 
 
 class CommandEngine(wiring.Component):
@@ -42,25 +32,25 @@ class CommandEngine(wiring.Component):
     command_count: Out(32)
     protocol_errors: Out(16)
     protocol_error_sources: Out(2)
+    # Preserve the proven control build's inert interface shape. This output is
+    # constant zero and has no host register or decoded-command logic.
     early_marker: Out(4)
 
-    def __init__(self, *, capture_cmd17_wire=False, early_marker_trace=False):
+    def __init__(self, *, capture_cmd17_wire=False):
         self._capture_cmd17_wire = capture_cmd17_wire
-        self._early_marker_trace = early_marker_trace
         super().__init__()
 
     def elaborate(self, platform):
         m = Module()
         _elaborate_command_engine(
             m, self, self.cmd_i, self.cmd_o, self.cmd_oe, self.enabled, self.control,
-            capture_cmd17_wire=self._capture_cmd17_wire,
-            early_marker_trace=self._early_marker_trace)
+            capture_cmd17_wire=self._capture_cmd17_wire)
         return m
 
 
 def _elaborate_command_engine(
         m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, control, *,
-        capture_cmd17_wire=False, early_marker_trace=False):
+        capture_cmd17_wire=False):
     self = component
     card_state = control.card_state
     data_mode = control.data_mode
@@ -84,15 +74,7 @@ def _elaborate_command_engine(
     cmd_argument = cmd_word[8:40]
     cmd_crc = cmd_word[1:8]
 
-    if early_marker_trace:
-        marker = cmd_argument[:4]
-        early_marker_argument = (
-            (cmd_argument[8:32] == EARLY_MARKER_MAGIC) &
-            (cmd_argument[4:8] == (marker ^ 0xf)) &
-            (marker != 0)
-        )
-    else:
-        m.d.comb += self.early_marker.eq(0)
+    m.d.comb += self.early_marker.eq(0)
 
     if capture_cmd17_wire:
         # Reuse the parser's existing 48-bit shift path while it is idle during a response. This
@@ -397,15 +379,5 @@ def _elaborate_command_engine(
                             with m.Case(55):
                                 load_r1(cmd_index, status_value(app=True))
                                 m.d.sd += app_command.eq(1)
-                            if early_marker_trace:
-                                with m.Case(EARLY_MARKER_COMMAND):
-                                    # Keep every other command on the proven
-                                    # dispatch structure. A matching private
-                                    # CMD56 is the only path that suppresses the
-                                    # ordinary unsupported-command R1 response.
-                                    with m.If(early_marker_argument):
-                                        m.d.sd += self.early_marker.eq(marker)
-                                    with m.Else():
-                                        load_r1(cmd_index, status_value(extra=1 << 22))
                             with m.Default():
                                 load_r1(cmd_index, status_value(extra=1 << 22))

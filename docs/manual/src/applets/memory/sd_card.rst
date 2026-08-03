@@ -87,60 +87,63 @@ errors. A final ``rail-fell`` delta with mask ``1`` and no buffer faults is cons
 collapsing while power disappears, but the run remains non-clean until a repeated trace establishes
 the fixture-specific rule.
 
-Early in-band command marker
-----------------------------
+Zero-gateware early command marker
+----------------------------------
 
-``--early-marker-trace`` adds an opt-in hook after the card emulator's existing 48-bit command
-receiver. It adds no second consumer of the raw SD CLK pad and no new output or output-enable path.
-Ordinary builds structurally elide the hook. A target can report a four-bit progress or fault marker
-before its MMC driver exists by bit-banging one complete, CRC-valid private CMD56 on MMCCLK and
-MMCCMD. The last accepted marker appears as ``early_marker`` in each ``--preinit-trace`` diagnostics
-object. Marker values are ``1`` through ``15``.
+An early target can report a four-bit progress or fault marker without any diagnostic FPGA logic.
+Marker ``n`` from ``1`` through ``15`` is encoded as one ordinary, CRC-valid command with index
+``16 + n`` (CMD17 through CMD31). The card must be in Idle and no CMD55/APP_CMD context may be
+pending. In Idle, CMD17, CMD18, CMD24, and CMD25 take their existing wrong-state path; the remaining
+indices take the existing unsupported-command path. Every index returns an R1 with
+``ILLEGAL_COMMAND`` set, leaves the card in Idle, and starts no data transfer.
 
-The 32-bit CMD56 argument is ``0x474d4b00 | ((marker ^ 0xf) << 4) | marker``; ``0x474d4b`` is ASCII
-``GMK``. Transmit the ordinary SD command frame most-significant bit first: start bit ``0``,
-host-to-card transmission bit ``1``, six-bit command index ``56``, the argument, SD CRC7 over the
-40 bits from the transmission bit through the argument, and end bit ``1``. CMD idles high and CLK
-idles low. Set CMD while CLK is low, then pulse CLK high and low once for each of the 48 bits.
-As a complete integration vector, marker ``3`` has argument ``0x474d4bc3``, CRC7 ``0x52``, and
-48-bit frame ``78 47 4d 4b c3 a5`` on the wire in that byte order.
+Use argument ``0x474d4b00 | ((n ^ 0xf) << 4) | n``; ``0x474d4b`` is ASCII ``GMK``. The FPGA does
+not inspect the argument, so it is a human-recognizable scope or trace signature rather than a
+second authentication field. The ordinary command CRC7 still protects it. Transmit the SD command
+frame most-significant bit first: start bit ``0``, host-to-card transmission bit ``1``, six-bit
+command index, the 32-bit argument, CRC7 over the 40 bits from the transmission bit through the
+argument, and end bit ``1``. CMD idles high and CLK idles low.
 
-The ordinary command receiver validates start/transmission/end framing and CRC7 before checking the
-private argument. A bad frame or CRC remains a strict protocol error. A valid CMD56 with a different
-argument follows the emulator's existing unsupported-command path. A matching marker is a
-successful internal no-op: it updates the latch but deliberately schedules no card response, so
-the target need not supply further clocks or consume R1. The target must return CMD high and release
-it after the final falling CLK edge.
+As a complete vector, marker ``3`` is CMD19 with argument ``0x474d4bc3``, command CRC7 ``0x06``,
+and transmitted frame ``53 47 4d 4b c3 0d``. Its Idle-state R1 status is ``0x00400100``
+(``ILLEGAL_COMMAND | READY_FOR_DATA``), CRC7 is ``0x61``, and response frame is
+``13 00 40 01 00 c3``.
 
-The hook is localized to the non-application CMD56 case; it does not wrap or gate common command
-dispatch. In particular, CMD7 and its R1 response use the same source control structure as an
-ordinary build. Do not emit the private CMD56 while an APP_CMD context from CMD55 is pending. The
-``last_command`` diagnostics field is sampled from the existing command register immediately after
-the packed FPGA snapshot, so it identifies a stable repeated command without adding gateware but is
-advisory if commands are changing continuously.
+After the final command bit, return CMD high and change GPIO8/MMCCMD to input immediately after the
+falling CLK edge. Supply 64 more idle clocks with CMD released. The existing response engine drives
+eight idle-high Ncr clocks followed by the complete 48-bit illegal-command R1, then releases CMD;
+64 clocks therefore include eight post-response clocks. Do not restore GPIO ownership before these
+64 clocks complete.
+
+``--preinit-trace`` derives ``early_marker = last_command - 16`` only while its packed card-state
+snapshot is Idle and ``last_command`` is CMD17 through CMD31. ``last_command`` is the existing FPGA
+register: it persists until another complete command frame arrives or the SD engine is reset or
+rearmed. It is read immediately after the packed diagnostics snapshot, so the derived marker is
+advisory if commands or card state are changing concurrently. Normal CMD17 traffic outside Idle is
+never reported as a marker. The existing register records a complete frame before CRC disposition;
+qualify a marker only when the protocol-error counter did not increase.
+
+The former ``--early-marker-trace`` CMD56 decoder was removed because even opt-in decoded logic
+perturbed the marginal legacy MAINTE fixture. Passing the obsolete option is now an error. Pulse,
+inverted-UART, and private-CMD56 emitters are incompatible and must not be used.
 
 On the SL-C860, save the live mux, direction, and output latch for GPIO6/MMCCLK and GPIO8/MMCCMD,
-stop any concurrent MMC owner, and confirm that the preceding card transaction is complete. Drive
-only CLK and CMD for the bounded 48-clock frame, release CMD before restoring ownership, then
-restore both GPIOs exactly. Leave every DAT line untouched. Glasgow continues to use its existing
-input-only CLK path and does not drive CMD for the recognized private command. Existing pulse or
-inverted-UART marker emitters are incompatible and must not be used.
+stop any concurrent MMC owner, and confirm Idle state and no pending application command. Drive only
+CLK and CMD for the bounded command frame, switch CMD to input for the 64 response-drain clocks,
+then restore both GPIOs exactly. Leave every DAT line untouched. Glasgow's CLK path remains
+input-only; its existing command-response path temporarily drives CMD for R1.
 
-The marker latch is in the resettable SD-command domain. ``rail-fell`` captures it before rearming;
-the following SD-engine generation starts at zero, making freshness explicit without requiring a
-gateware reconfiguration.
-
-Use the command marker together with the lifecycle trace as follows::
+Use the marker together with the lifecycle trace and the ordinary bitstream as follows::
 
     glasgow run memory-sd-card -V B=3.3 \
         --clk B2 --cmd B5 --dat B1,B0,B7,B6 \
         --max-sd-clock 25m --boot-prefix card.img \
-        --power-idle-high-z --early-marker-trace \
+        --power-idle-high-z \
         --preinit-trace /tmp/zaurus-preinit.jsonl card.img
 
 If execution cannot reach the bounded GPIO transmitter, this feature cannot manufacture evidence:
 the independently sensed SD-power transition remains the only asynchronous observation. A
-``rail-fell`` record captures ``early_marker`` before the applet resets the emulator generation.
+``rail-fell`` record captures the derived marker before the applet resets the emulator generation.
 
 This trace deliberately does not claim to be a kernel console. An SD memory card is a synchronous
 slave: it only receives clocks from the target and drives CMD or DAT as a response to a target

@@ -24,7 +24,7 @@ from ._diagnostics import (
 from ._errors import SDCardError
 from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 from ._gateware_support import (
-    BLOCK_SIZE, FRAME_CRC16, IMAGE_SIZE_WIDTH,
+    BLOCK_SIZE, FRAME_CRC16, IMAGE_SIZE_WIDTH, CardState,
 )
 from ._host import HostBlockEngine
 from ._preinit_trace import PreinitTrace
@@ -52,9 +52,31 @@ __all__ = [
     "SDCardComponent",
     "SDCardInterface", "SDCardApplet",
     "SidebandConsole", "SidebandRegion",
+    "EARLY_MARKER_COMMAND_BASE", "EARLY_MARKER_MAGIC", "encode_early_marker",
     "crc7", "crc16", "build_cid", "build_csd", "build_scr", "create_fat16_image",
     "decode_csd_transfer_speed", "encode_csd_transfer_speed", "parse_transfer_speed",
 ]
+
+
+EARLY_MARKER_COMMAND_BASE = 16
+EARLY_MARKER_MAGIC = 0x474d4b  # ASCII "GMK"
+
+
+def encode_early_marker(marker):
+    """Return the ordinary SD command index and recognizable argument for a marker."""
+    if not 1 <= marker <= 15:
+        raise ValueError("early marker must be between 1 and 15")
+    return (
+        EARLY_MARKER_COMMAND_BASE + marker,
+        (EARLY_MARKER_MAGIC << 8) | ((marker ^ 0xf) << 4) | marker,
+    )
+
+
+def _decode_early_marker(last_command, card_state):
+    if (card_state == CardState.Idle.value and
+            EARLY_MARKER_COMMAND_BASE < last_command <= EARLY_MARKER_COMMAND_BASE + 15):
+        return last_command - EARLY_MARKER_COMMAND_BASE
+    return 0
 
 
 @dataclass(frozen=True)
@@ -163,15 +185,15 @@ class SDCardComponent(wiring.Component):
     max_prefetch_wait: Out(32)
     max_host_service_latency: Out(32)
     diagnostics_snapshot: Out(FPGA_DIAGNOSTICS_LAYOUT.size)
+    # Kept constant zero solely to preserve the proven control netlist shape.
     early_marker: Out(8)
 
     def __init__(self, ports, *, max_sd_clock=25_000_000, boot_data=None,
-            boot_addresses=None, capture_cmd17_wire=False, early_marker_trace=False):
+            boot_addresses=None, capture_cmd17_wire=False):
         self._ports = ports
         self._max_sd_clock = max_sd_clock
         self._boot_data = boot_data
         self._capture_cmd17_wire = capture_cmd17_wire
-        self._early_marker_trace = early_marker_trace
         self._boot_addresses = (
             boot_addresses if boot_addresses is not None
             else (0, BLOCK_SIZE))
@@ -292,8 +314,7 @@ class SDCardComponent(wiring.Component):
 
         dat_i = Cat(*(buffer.i for buffer in dat_buffers))
         m.submodules.command_engine = command_engine = CommandEngine(
-            capture_cmd17_wire=self._capture_cmd17_wire,
-            early_marker_trace=self._early_marker_trace)
+            capture_cmd17_wire=self._capture_cmd17_wire)
         m.submodules.data_engine = data_engine = DataEngine()
         m.submodules.host_engine = host_engine = HostBlockEngine()
         diagnostics_snapshot = data.View(
@@ -407,7 +428,7 @@ class SDCardInterface:
             clk: GlasgowPin, cmd: GlasgowPin, dat: tuple[GlasgowPin, ...],
             max_sd_clock: int = DEFAULT_TRANSFER_SPEED,
             static_pulls: bool = True, boot_data=None, boot_addresses=None,
-            capture_cmd17_wire=False, early_marker_trace=False,
+            capture_cmd17_wire=False,
             worker_factory=BackendWorker):
         self._logger = logger
         self._level = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
@@ -421,8 +442,7 @@ class SDCardInterface:
             SDCardComponent(
                 ports, max_sd_clock=max_sd_clock, boot_data=boot_data,
                 boot_addresses=boot_addresses,
-                capture_cmd17_wire=capture_cmd17_wire,
-                early_marker_trace=early_marker_trace))
+                capture_cmd17_wire=capture_cmd17_wire))
         self._boot_data = boot_data
         self._boot_addresses = (
             boot_addresses if boot_data is not None else None)
@@ -457,9 +477,6 @@ class SDCardInterface:
         self.max_host_service_latency = assembly.add_ro_register(
             component.max_host_service_latency)
         self._diagnostics_snapshot = assembly.add_ro_register(component.diagnostics_snapshot)
-        self._early_marker = (
-            assembly.add_ro_register(component.early_marker)
-            if early_marker_trace else None)
 
         self._session = None
         self._worker_factory = worker_factory
@@ -934,7 +951,7 @@ class SDCardInterface:
         worker = None if session is None else session.worker
         fpga = decode_fpga_diagnostics(await self._diagnostics_snapshot)
         last_command = await self.last_command
-        early_marker = 0 if self._early_marker is None else await self._early_marker
+        early_marker = _decode_early_marker(last_command, fpga["card_state"])
         return SDCardDiagnostics(
             sd_clocks=fpga["sd_clocks"],
             command_low_clocks=fpga["command_low_clocks"],
@@ -1169,7 +1186,7 @@ class SDCardApplet(GlasgowAppletV2):
         parser.add_argument("--capture-cmd17-wire", action="store_true",
             help="diagnostic build: capture the pad-observed CMD17 R1 in clock counters")
         parser.add_argument("--early-marker-trace", action="store_true",
-            help="diagnostic build: accept private CRC7 early-marker commands")
+            help="removed unsafe diagnostic gateware; ordinary Idle-state markers need no flag")
         power_idle_group = parser.add_mutually_exclusive_group()
         power_idle_group.add_argument(
             "--power-idle-high-z", dest="power_idle_high_z", action="store_true",
@@ -1190,6 +1207,10 @@ class SDCardApplet(GlasgowAppletV2):
         return vio is not None and vio.value is not None and vio.value > 0
 
     def build(self, args):
+        if args.early_marker_trace:
+            raise SDCardError(
+                "--early-marker-trace was removed because its opt-in gateware perturbed "
+                "legacy hosts; use the ordinary Idle-state command marker protocol")
         args.power_idle_high_z = self._resolve_power_idle_high_z(args)
         boot_data = None
         boot_addresses = None
@@ -1203,7 +1224,6 @@ class SDCardApplet(GlasgowAppletV2):
                 boot_data=boot_data,
                 boot_addresses=boot_addresses,
                 capture_cmd17_wire=args.capture_cmd17_wire,
-                early_marker_trace=args.early_marker_trace,
                 static_pulls=not args.power_idle_high_z)
             self._sd_port = args.clk.port
 
