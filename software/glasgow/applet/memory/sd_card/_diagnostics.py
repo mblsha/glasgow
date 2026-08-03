@@ -1,9 +1,18 @@
+from enum import IntFlag
+
 from amaranth.lib import data
 
 
 __all__ = [
-    "FPGA_DIAGNOSTICS_LAYOUT", "decode_fpga_diagnostics",
+    "FPGA_DIAGNOSTICS_LAYOUT", "ProtocolErrorSource", "decode_fpga_diagnostics",
 ]
+
+
+class ProtocolErrorSource(IntFlag):
+    COMMAND_FRAME = 1 << 0
+    COMMAND_CRC = 1 << 1
+    DATA = 1 << 2
+    HOST = 1 << 3
 
 
 # A single control-register transaction latches this complete layout. Keeping the schema in one
@@ -15,11 +24,7 @@ FPGA_DIAGNOSTICS_LAYOUT = data.StructLayout({
     "reads": 32,
     "writes": 32,
     "protocol_errors": 16,
-    "command_protocol_errors": 16,
-    "command_frame_errors": 16,
-    "command_crc_errors": 16,
-    "data_protocol_errors": 16,
-    "host_protocol_errors": 16,
+    "protocol_error_sources": 4,
     "backend_errors": 16,
     "stale_replies": 16,
     "buffer_faults": 16,

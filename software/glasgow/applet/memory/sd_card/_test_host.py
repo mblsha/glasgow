@@ -10,7 +10,8 @@ from glasgow.gateware import cobs as gateware_cobs
 
 from . import (
     BLOCK_SIZE, BackendError, BackendStatus, BackendWorker, FileBlockBackend,
-    HostEvent, HostReply, ReplyFrame, RequestFrame, SDCardDiagnostics, SDCardError,
+    HostEvent, HostReply, ProtocolErrorSource, ReplyFrame, RequestFrame,
+    SDCardDiagnostics, SDCardError,
 )
 from ._fat16 import FAT16Image, create_fat16_image
 from ._protocol import (
@@ -150,8 +151,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
 
         field_names = (
             "sd_clocks", "command_low_clocks", "commands", "reads", "writes",
-            "protocol_errors", "command_protocol_errors", "command_frame_errors",
-            "command_crc_errors", "data_protocol_errors", "host_protocol_errors",
+            "protocol_errors", "protocol_error_sources",
             "backend_errors", "stale_replies", "buffer_faults",
             "prefetch_waits", "prefetch_wait_cycles", "max_prefetch_wait_cycles",
             "max_host_service_latency_cycles",
@@ -168,14 +168,14 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         diagnostics = asyncio.run(iface.read_diagnostics())
         self.assertIsInstance(diagnostics, SDCardDiagnostics)
         self.assertEqual(diagnostics.sd_clocks, 1)
-        self.assertEqual(diagnostics.command_protocol_errors, 7)
-        self.assertEqual(diagnostics.command_frame_errors, 8)
-        self.assertEqual(diagnostics.command_crc_errors, 9)
-        self.assertEqual(diagnostics.data_protocol_errors, 10)
-        self.assertEqual(diagnostics.host_protocol_errors, 11)
-        self.assertEqual(diagnostics.prefetch_wait_cycles, 16)
-        self.assertEqual(diagnostics.max_prefetch_wait_cycles, 17)
-        self.assertEqual(diagnostics.max_host_service_latency_cycles, 18)
+        self.assertEqual(
+            diagnostics.protocol_error_sources,
+            ProtocolErrorSource.COMMAND_FRAME |
+            ProtocolErrorSource.COMMAND_CRC |
+            ProtocolErrorSource.DATA)
+        self.assertEqual(diagnostics.prefetch_wait_cycles, 12)
+        self.assertEqual(diagnostics.max_prefetch_wait_cycles, 13)
+        self.assertEqual(diagnostics.max_host_service_latency_cycles, 14)
         self.assertEqual(diagnostics.host_backend_errors, 14)
         self.assertEqual(diagnostics.durable_flushes, 15)
         self.assertEqual(diagnostics.backend_calls, 91)
@@ -188,8 +188,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         iface._active = True
         field_names = (
             "sd_clocks", "command_low_clocks", "commands", "reads", "writes",
-            "protocol_errors", "command_protocol_errors", "command_frame_errors",
-            "command_crc_errors", "data_protocol_errors", "host_protocol_errors",
+            "protocol_errors", "protocol_error_sources",
             "backend_errors", "stale_replies", "buffer_faults",
             "prefetch_waits", "prefetch_wait_cycles", "max_prefetch_wait_cycles",
             "max_host_service_latency_cycles",
@@ -210,7 +209,7 @@ class SDCardInterfaceTestCase(unittest.TestCase):
         self.assertIsNone(iface._session)
         self.assertEqual(len(diagnostics), 1)
         self.assertEqual(diagnostics[0].sd_clocks, 1)
-        self.assertEqual(diagnostics[0].max_host_service_latency_cycles, 18)
+        self.assertEqual(diagnostics[0].max_host_service_latency_cycles, 14)
         self.assertEqual(diagnostics[0].durable_flushes, 1)
 
     def test_close_still_retires_backend_when_diagnostics_fail(self):

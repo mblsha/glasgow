@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from . import SDCardDiagnostics
+from . import ProtocolErrorSource, SDCardDiagnostics
 from ._preinit_trace import PreinitTrace
 
 
@@ -16,11 +16,7 @@ class PreinitTraceTestCase(unittest.TestCase):
             reads=8,
             writes=0,
             protocol_errors=65,
-            command_protocol_errors=65,
-            command_frame_errors=65,
-            command_crc_errors=0,
-            data_protocol_errors=0,
-            host_protocol_errors=0,
+            protocol_error_sources=ProtocolErrorSource.COMMAND_FRAME,
             fpga_backend_errors=0,
             stale_replies=0,
             buffer_faults=0,
@@ -55,9 +51,7 @@ class PreinitTraceTestCase(unittest.TestCase):
             self.assertEqual(live_records[1]["diagnostics"]["commands"], 17)
             self.assertEqual(live_records[1]["diagnostics"]["protocol_errors"], 65)
             self.assertEqual(
-                live_records[1]["diagnostics"]["command_protocol_errors"], 65)
-            self.assertEqual(
-                live_records[1]["diagnostics"]["command_frame_errors"], 65)
+                live_records[1]["diagnostics"]["protocol_error_sources"], 1)
             self.assertEqual(live_records[1]["voltage"], 0.2)
             self.assertEqual(live_records[0]["run_id"], live_records[1]["run_id"])
 
