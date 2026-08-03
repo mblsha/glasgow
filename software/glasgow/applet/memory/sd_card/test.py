@@ -143,7 +143,10 @@ class SDCardAppletTestCase(
 
 # Keep the applet's historical test module as the single suite entry point while the focused
 # cases live in smaller implementation-specific modules.
-from ._test_gateware import BlockBufferTestCase, COBSRecoveryTestCase, ReadBufferManagerTestCase
+from ._test_gateware import (
+    BlockBufferTestCase, COBSRecoveryTestCase, CommandEngineErrorBreakdownTestCase,
+    ReadBufferManagerTestCase,
+)
 from ._test_host import (
     BackendWorkerTestCase, FAT16ImageTestCase, FileBlockBackendTestCase,
     SDCardInterfaceTestCase, SDCardProtocolTestCase,

@@ -7,9 +7,46 @@ from glasgow.gateware import cobs as gateware_cobs
 
 from . import BLOCK_SIZE
 from ._buffer import BlockBuffer
+from ._command import CommandEngine
 from ._host import HostBlockEngine, TransactionPhase
 from ._interfaces import ReadBufferState
 from ._read_buffer import ReadBufferManager
+
+
+class CommandEngineErrorBreakdownTestCase(unittest.TestCase):
+    def test_framing_and_crc_errors_remain_strict_and_separate(self):
+        m = Module()
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = CommandEngine()
+
+        async def testbench(ctx):
+            ctx.set(dut.enabled, 1)
+            ctx.set(dut.cmd_i, 1)
+            await ctx.tick("sd")
+
+            async def send_word(word):
+                for bit in range(47, -1, -1):
+                    ctx.set(dut.cmd_i, (word >> bit) & 1)
+                    await ctx.tick("sd")
+                ctx.set(dut.cmd_i, 1)
+                await ctx.tick("sd")
+
+            # Valid start/transmission/end framing with a deliberately bad CRC7.
+            await send_word((1 << 46) | 1)
+            self.assertEqual(ctx.get(dut.protocol_errors), 1)
+            self.assertEqual(ctx.get(dut.frame_errors), 0)
+            self.assertEqual(ctx.get(dut.crc_errors), 1)
+
+            # An all-zero frame is malformed; it is still exactly one strict error.
+            await send_word(0)
+            self.assertEqual(ctx.get(dut.protocol_errors), 2)
+            self.assertEqual(ctx.get(dut.frame_errors), 1)
+            self.assertEqual(ctx.get(dut.crc_errors), 1)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6, domain="sd")
+        simulator.add_testbench(testbench)
+        simulator.run()
 
 
 class BlockBufferTestCase(unittest.TestCase):
