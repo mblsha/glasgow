@@ -75,6 +75,19 @@ changing the default sampling interval is 250 ms; unchanged state emits a five-s
 ``--preinit-trace-interval SECONDS`` changes the sampling interval. Existing files are appended,
 not replaced, and every run is bracketed by ``trace-start`` and ``trace-stop`` records.
 
+Each ordinary-mode diagnostics object also contains a host-derived ``command_framing`` object. A
+complete command attempt consumes exactly 48 clocks, so the total clock, CMD-low, and command
+counters give strict lower and upper bounds for the CMD-high and CMD-low samples that occurred
+inside complete frames. The object reports the complete-frame and non-frame clock totals plus those
+four bounds. It is omitted with ``--capture-cmd17-wire``, where the two clock counters are
+deliberately repurposed as a captured response. This analysis adds no gateware and works with the
+ordinary prebuilt control bitstream.
+
+``--trace-commands`` polls the existing command-count register every millisecond and reads the other
+diagnostics only when that count changes. It therefore reports repeated CMD0 or repeated malformed
+attempts even when ``last_command`` never changes. Its log line includes the cumulative frame-high
+range; use ``--preinit-trace`` when flushed, run-scoped evidence is required.
+
 The aggregate ``protocol_errors`` remains the strict command + data + host + buffer-fault count used
 by existing qualification, with ``buffer_faults`` also reported separately as before.
 ``protocol_error_sources`` is a compact four-bit attribution mask: bit 0 is malformed command
