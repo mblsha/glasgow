@@ -21,6 +21,7 @@ from ._data import DataEngine
 from ._diagnostics import (
     FPGA_DIAGNOSTICS_LAYOUT, ProtocolErrorSource, decode_fpga_diagnostics,
 )
+from ._early_marker import EarlyMarkerCapture
 from ._errors import SDCardError
 from ._fat16 import FAT16Error, FAT16Image, create_fat16_image
 from ._gateware_support import (
@@ -66,6 +67,7 @@ class SDCardDiagnostics:
     writes: int
     protocol_errors: int
     protocol_error_sources: ProtocolErrorSource
+    early_marker: int
     fpga_backend_errors: int
     stale_replies: int
     buffer_faults: int
@@ -161,13 +163,15 @@ class SDCardComponent(wiring.Component):
     max_prefetch_wait: Out(32)
     max_host_service_latency: Out(32)
     diagnostics_snapshot: Out(FPGA_DIAGNOSTICS_LAYOUT.size)
+    early_marker: Out(8)
 
     def __init__(self, ports, *, max_sd_clock=25_000_000, boot_data=None,
-            boot_addresses=None, capture_cmd17_wire=False):
+            boot_addresses=None, capture_cmd17_wire=False, early_marker_trace=False):
         self._ports = ports
         self._max_sd_clock = max_sd_clock
         self._boot_data = boot_data
         self._capture_cmd17_wire = capture_cmd17_wire
+        self._early_marker_trace = early_marker_trace
         self._boot_addresses = (
             boot_addresses if boot_addresses is not None
             else (0, BLOCK_SIZE))
@@ -186,6 +190,15 @@ class SDCardComponent(wiring.Component):
 
         if platform is not None:
             platform.add_clock_constraint(clk_buffer.i, self._max_sd_clock)
+
+        if self._early_marker_trace:
+            m.submodules.early_marker_capture = early_marker_capture = EarlyMarkerCapture()
+            m.d.comb += [
+                early_marker_capture.clk_i.eq(clk_buffer.i),
+                self.early_marker.eq(early_marker_capture.last_marker),
+            ]
+        else:
+            m.d.comb += self.early_marker.eq(0)
 
         m.domains.sd = cd_sd = ClockDomain(async_reset=True, local=True)
         m.domains.sd_fall = cd_sd_fall = ClockDomain(async_reset=True, local=True)
@@ -401,7 +414,7 @@ class SDCardInterface:
             clk: GlasgowPin, cmd: GlasgowPin, dat: tuple[GlasgowPin, ...],
             max_sd_clock: int = DEFAULT_TRANSFER_SPEED,
             static_pulls: bool = True, boot_data=None, boot_addresses=None,
-            capture_cmd17_wire=False,
+            capture_cmd17_wire=False, early_marker_trace=False,
             worker_factory=BackendWorker):
         self._logger = logger
         self._level = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
@@ -415,7 +428,8 @@ class SDCardInterface:
             SDCardComponent(
                 ports, max_sd_clock=max_sd_clock, boot_data=boot_data,
                 boot_addresses=boot_addresses,
-                capture_cmd17_wire=capture_cmd17_wire))
+                capture_cmd17_wire=capture_cmd17_wire,
+                early_marker_trace=early_marker_trace))
         self._boot_data = boot_data
         self._boot_addresses = (
             boot_addresses if boot_data is not None else None)
@@ -450,6 +464,9 @@ class SDCardInterface:
         self.max_host_service_latency = assembly.add_ro_register(
             component.max_host_service_latency)
         self._diagnostics_snapshot = assembly.add_ro_register(component.diagnostics_snapshot)
+        self._early_marker = (
+            assembly.add_ro_register(component.early_marker)
+            if early_marker_trace else None)
 
         self._session = None
         self._worker_factory = worker_factory
@@ -920,6 +937,7 @@ class SDCardInterface:
     async def _read_diagnostics_unlocked(self, session) -> SDCardDiagnostics:
         worker = None if session is None else session.worker
         fpga = decode_fpga_diagnostics(await self._diagnostics_snapshot)
+        early_marker = 0 if self._early_marker is None else await self._early_marker
         return SDCardDiagnostics(
             sd_clocks=fpga["sd_clocks"],
             command_low_clocks=fpga["command_low_clocks"],
@@ -928,6 +946,7 @@ class SDCardInterface:
             writes=fpga["writes"],
             protocol_errors=fpga["protocol_errors"],
             protocol_error_sources=ProtocolErrorSource(fpga["protocol_error_sources"]),
+            early_marker=early_marker,
             fpga_backend_errors=fpga["backend_errors"],
             stale_replies=fpga["stale_replies"],
             buffer_faults=fpga["buffer_faults"],
@@ -1151,6 +1170,8 @@ class SDCardApplet(GlasgowAppletV2):
             help="embed IMAGE MBR and first partition boot sector for deterministic startup")
         parser.add_argument("--capture-cmd17-wire", action="store_true",
             help="diagnostic build: capture the pad-observed CMD17 R1 in clock counters")
+        parser.add_argument("--early-marker-trace", action="store_true",
+            help="diagnostic build: decode input-only early markers on the SD CLK pad")
         power_idle_group = parser.add_mutually_exclusive_group()
         power_idle_group.add_argument(
             "--power-idle-high-z", dest="power_idle_high_z", action="store_true",
@@ -1184,6 +1205,7 @@ class SDCardApplet(GlasgowAppletV2):
                 boot_data=boot_data,
                 boot_addresses=boot_addresses,
                 capture_cmd17_wire=args.capture_cmd17_wire,
+                early_marker_trace=args.early_marker_trace,
                 static_pulls=not args.power_idle_high_z)
             self._sd_port = args.clk.port
 
@@ -1342,6 +1364,7 @@ class SDCardApplet(GlasgowAppletV2):
                     diagnostics.protocol_errors,
                     diagnostics.fpga_backend_errors,
                     diagnostics.buffer_faults,
+                    diagnostics.early_marker,
                 )
                 now = asyncio.get_running_loop().time()
                 if key != previous or now - last_record >= 5.0:

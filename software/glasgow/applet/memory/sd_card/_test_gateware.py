@@ -8,9 +8,67 @@ from glasgow.gateware import cobs as gateware_cobs
 from . import BLOCK_SIZE
 from ._buffer import BlockBuffer
 from ._command import CommandEngine
+from ._early_marker import EarlyMarkerCapture
 from ._host import HostBlockEngine, TransactionPhase
 from ._interfaces import ReadBufferState
 from ._read_buffer import ReadBufferManager
+
+
+class EarlyMarkerCaptureTestCase(unittest.TestCase):
+    def test_retains_only_structurally_valid_complemented_markers(self):
+        bit_cycles = 8
+        m = Module()
+        m.submodules.dut = dut = EarlyMarkerCapture(bit_cycles=bit_cycles)
+
+        def crc8_atm(payload):
+            crc = 0
+            for octet in payload:
+                crc ^= octet
+                for _ in range(8):
+                    crc = ((crc << 1) ^ 0x07) & 0xff if crc & 0x80 else (crc << 1) & 0xff
+            return crc
+
+        def marker_frame(sequence, marker):
+            body = bytes((1, sequence, marker, marker ^ 0xff))
+            return b"\x55\xd3\x4d" + body + bytes((crc8_atm(body),))
+
+        async def testbench(ctx):
+            async def drive(level, cycles=bit_cycles):
+                ctx.set(dut.clk_i, level)
+                await ctx.tick().repeat(cycles)
+
+            async def send_octet(octet):
+                await drive(1)  # Inverted logical start bit.
+                for bit in range(8):
+                    await drive(not ((octet >> bit) & 1))
+                await drive(0)  # Inverted logical stop bit and idle.
+
+            async def send_frame(frame):
+                for octet in frame:
+                    await send_octet(octet)
+                await drive(0, bit_cycles * 2)
+
+            await drive(0, bit_cycles * 2)
+            await send_frame(marker_frame(1, 0x31))
+            self.assertEqual(ctx.get(dut.last_marker), 0x31)
+
+            bad_complement = bytearray(marker_frame(2, 0x32))
+            bad_complement[6] ^= 1
+            await send_frame(bad_complement)
+            self.assertEqual(ctx.get(dut.last_marker), 0x31)
+
+            bad_magic = bytearray(marker_frame(3, 0x33))
+            bad_magic[2] ^= 1
+            await send_frame(bad_magic)
+            self.assertEqual(ctx.get(dut.last_marker), 0x31)
+
+            await send_frame(marker_frame(4, 0x34))
+            self.assertEqual(ctx.get(dut.last_marker), 0x34)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6)
+        simulator.add_testbench(testbench)
+        simulator.run()
 
 
 class CommandEngineErrorBreakdownTestCase(unittest.TestCase):

@@ -59,6 +59,7 @@ class SDCardAppletTestCase(
         self.assertEqual(args.power_rearm_reset_hold, 0.05)
         self.assertFalse(args.trace_commands)
         self.assertFalse(args.capture_cmd17_wire)
+        self.assertFalse(args.early_marker_trace)
         self.assertIsNone(args.preinit_trace)
         self.assertEqual(args.preinit_trace_interval, 0.25)
         self.assertTrue(self._parse_args([
@@ -67,6 +68,9 @@ class SDCardAppletTestCase(
         self.assertTrue(self._parse_args([
             "--capture-cmd17-wire", "--clk", "B2", "card.img",
         ]).capture_cmd17_wire)
+        self.assertTrue(self._parse_args([
+            "--early-marker-trace", "--clk", "B2", "card.img",
+        ]).early_marker_trace)
 
     def test_high_z_setup_clears_voltage_alert_before_arming_signals(self):
         events = []
@@ -145,7 +149,7 @@ class SDCardAppletTestCase(
 # cases live in smaller implementation-specific modules.
 from ._test_gateware import (
     BlockBufferTestCase, COBSRecoveryTestCase, CommandEngineErrorBreakdownTestCase,
-    ReadBufferManagerTestCase,
+    EarlyMarkerCaptureTestCase, ReadBufferManagerTestCase,
 )
 from ._test_host import (
     BackendWorkerTestCase, FAT16ImageTestCase, FileBlockBackendTestCase,
