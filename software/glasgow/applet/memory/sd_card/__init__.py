@@ -37,7 +37,7 @@ from ._reply_packer import (
     HostReplyWordPacker, HOST_REPLY_WORD_LAYOUT,
     RawBlockWordPacker, RAW_BLOCK_WORD_LAYOUT,
 )
-from ._sideband_console import SidebandConsole, SidebandPartition
+from ._sideband_console import SidebandConsole, SidebandRegion
 
 
 __all__ = [
@@ -47,7 +47,7 @@ __all__ = [
     "ReplyFrame", "ReplyHeader",
     "DEFAULT_TRANSFER_SPEED", "SDCardDiagnostics", "SDCardError", "SDCardComponent",
     "SDCardInterface", "SDCardApplet",
-    "SidebandConsole", "SidebandPartition",
+    "SidebandConsole", "SidebandRegion",
     "crc7", "crc16", "build_cid", "build_csd", "build_scr", "create_fat16_image",
     "decode_csd_transfer_speed", "encode_csd_transfer_speed", "parse_transfer_speed",
 ]
@@ -1039,7 +1039,7 @@ class SDCardInterface:
                         self._sideband_console.overlaps(start, end)):
                     raise BackendError(
                         BackendStatus.Invalid,
-                        "erase range overlaps the reserved sideband console partition")
+                        "erase range overlaps the reserved sideband console tail")
                 await session.worker.erase(start, end)
                 if session.sync_writes:
                     await self._flush_session(session)
@@ -1192,7 +1192,7 @@ class SDCardApplet(GlasgowAppletV2):
         parser.add_argument("--trace-commands", action="store_true",
             help="log command-counter/last-command transitions for target debugging")
         parser.add_argument("--console-pty", metavar="PATH",
-            help="intercept a type-0xDA fourth partition as a retry-safe console and "
+            help="intercept a final-sector-located unpartitioned tail as a retry-safe console and "
                  "publish its persistent host PTY at PATH")
 
     async def setup(self, args):
@@ -1201,10 +1201,10 @@ class SDCardApplet(GlasgowAppletV2):
             if args.read_only:
                 raise SDCardError("--console-pty cannot be used with --read-only")
             try:
-                partition = SidebandPartition.from_image(args.image)
+                region = SidebandRegion.from_image(args.image)
             except (OSError, ValueError) as error:
                 raise SDCardError(f"cannot enable SD sideband console: {error}") from error
-            self.sideband_console = SidebandConsole(self.logger, partition)
+            self.sideband_console = SidebandConsole(self.logger, region)
 
         if args.power_idle_high_z and args.no_power_monitor:
             raise SDCardError("--power-idle-high-z cannot be used with --no-power-monitor")
