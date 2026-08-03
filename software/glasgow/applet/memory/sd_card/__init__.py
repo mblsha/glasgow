@@ -27,7 +27,7 @@ from ._gateware_support import (
     BLOCK_SIZE, FRAME_CRC16, IMAGE_SIZE_WIDTH, CardState,
 )
 from ._host import HostBlockEngine
-from ._preinit_trace import PreinitTrace
+from ._preinit_trace import PreinitTrace, command_framing_bounds
 from ._protocol import (
     HOST_OPERATION_FOR_EVENT, BackendStatus, FrameError, HostEvent, HostReply,
     ReplyFrame, ReplyHeader, RequestFrame, RequestHeader,
@@ -1349,7 +1349,9 @@ class SDCardApplet(GlasgowAppletV2):
         preinit_trace = None
         if args.preinit_trace is not None:
             try:
-                preinit_trace = PreinitTrace(args.preinit_trace)
+                preinit_trace = PreinitTrace(
+                    args.preinit_trace,
+                    derive_command_framing=not args.capture_cmd17_wire)
             except OSError as error:
                 raise SDCardError(
                     f"cannot open pre-init trace {str(args.preinit_trace)!r}: "
@@ -1407,25 +1409,44 @@ class SDCardApplet(GlasgowAppletV2):
                     await self.sd_card_iface.read_diagnostics())
 
         async def trace_commands():
+            previous_count = None
             previous_command = None
             while True:
-                # This register already exists independently of the packed diagnostic snapshot,
-                # so command tracing remains usable with a prebuilt bitstream. Poll it alone to
-                # keep the sampling interval below a legacy 1 Mbit/s single-block transfer; read
-                # the counter only after a transition, where it is useful context rather than a
-                # prerequisite for observing the command.
-                last_command = await self.sd_card_iface.last_command
-                if last_command != previous_command:
+                # The counter and last-command registers already exist independently of the
+                # packed diagnostic snapshot, so tracing remains usable with a prebuilt bitstream.
+                # Poll the counter alone: unlike last_command, it changes for repeated CMD0 or
+                # malformed attempts. Read the other counters only after a transition.
+                command_count = await self.sd_card_iface.command_count
+                if command_count != previous_count:
+                    last_command = await self.sd_card_iface.last_command
                     if args.capture_cmd17_wire and previous_command == 17:
                         wire_low = await self.sd_card_iface.clock_count
                         wire_high = await self.sd_card_iface.command_low_count
                         wire_response = ((wire_high << 32) | wire_low) & ((1 << 48) - 1)
                         self.logger.info(
                             "CMD17 pad-observed R1: %012x", wire_response)
-                    command_count = await self.sd_card_iface.command_count
-                    self.logger.info(
-                        "SD command trace: count~%d last=CMD%d",
-                        command_count, last_command)
+                    if args.capture_cmd17_wire:
+                        self.logger.info(
+                            "SD command trace: count~%d last=CMD%d",
+                            command_count, last_command)
+                    else:
+                        sd_clocks = await self.sd_card_iface.clock_count
+                        command_low_clocks = await self.sd_card_iface.command_low_count
+                        framing = command_framing_bounds(
+                            sd_clocks, command_low_clocks, command_count)
+                        if framing["available"]:
+                            self.logger.info(
+                                "SD command trace: count~%d last=CMD%d, %d clocks, "
+                                "%d CMD-low, frame-high=%d..%d",
+                                command_count, last_command, sd_clocks,
+                                command_low_clocks,
+                                framing["frame_high_clocks_min"],
+                                framing["frame_high_clocks_max"])
+                        else:
+                            self.logger.info(
+                                "SD command trace: count~%d last=CMD%d; framing unavailable",
+                                command_count, last_command)
+                    previous_count = command_count
                     previous_command = last_command
                 # Leave headroom for the 10 ms target-power monitor and the block-service
                 # worker; an unthrottled USB register loop can otherwise delay a SENSE edge.
