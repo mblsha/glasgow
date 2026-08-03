@@ -257,6 +257,12 @@ class SidebandConsole:
             self._next_input_sequence += 1
             self._input_frames.append(frame)
 
+    def _empty_frame(self) -> bytes:
+        return ConsoleFrame(
+            ConsoleFrameKind.Empty, self.session,
+            acknowledgement=self._last_output_sequence,
+            flags=self._flags()).encode()
+
     def read_block(self, address: int) -> bytes:
         sector = self._sector(address)
         if sector == self.region.sectors - 1:
@@ -275,12 +281,13 @@ class SidebandConsole:
             self._materialize_input()
             if self._input_frames:
                 return self._input_frames[0].encode()
-            return ConsoleFrame(
-                ConsoleFrameKind.Empty, self.session,
-                acknowledgement=self._last_output_sequence,
-                flags=self._flags()).encode()
-        raise BackendError(BackendStatus.Invalid,
-            f"console sector {sector} is not readable")
+            return self._empty_frame()
+        # A raw block device cannot provide write-only LBAs. Linux may merge a mailbox read or
+        # speculatively read ahead across output, acknowledgement, and reserved sectors. Make the
+        # complete reservation a total read mapping so these ordinary block transformations never
+        # enter the backend-error/sentinel path or leave a late console packet to be associated
+        # with the next filesystem request. Writes remain restricted below.
+        return self._empty_frame()
 
     def _accept_output(self, frame: ConsoleFrame, block: bytes):
         if frame.session != self.session or frame.sequence == 0:

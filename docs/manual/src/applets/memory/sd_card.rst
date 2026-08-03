@@ -199,6 +199,13 @@ explicitly acknowledges it. Repeated target-output writes with the same session,
 contents are accepted once, which makes Linux MMC retries harmless. A new applet process chooses
 a new random session; the target renegotiates and restarts its sequence space.
 
+Every sector in the reservation is safe to read. Reads of the target-output,
+host-input-acknowledgement, and otherwise reserved sectors return a valid ``Empty`` frame; only the
+final sector returns the locator. This is required for a raw Linux block device, where merging and
+read-ahead can cross the logical mailbox roles. Writes are still accepted only for target output
+and host-input acknowledgement. The total read mapping prevents a mailbox poll from entering the
+backend-error sentinel path immediately before an unrelated filesystem read.
+
 The target discovers the reservation by reading the final sector of the whole-card block device,
 then accesses the mailbox with aligned direct I/O outside every partition. A missing or invalid
 locator is fail-closed: Glasgow refuses ``--console-pty`` and the target daemon performs no writes.

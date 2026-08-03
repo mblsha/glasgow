@@ -1,4 +1,5 @@
 from collections import deque
+import logging
 import os
 import random
 import tempfile
@@ -11,6 +12,9 @@ from .bfm import SDHostBFM
 from ._backend import BackendError
 from ._data import READ_NAC_CLOCKS
 from ._protocol import BackendStatus
+from ._sideband_console import (
+    ConsoleFrame, ConsoleFrameKind, SidebandConsole, SidebandRegion,
+)
 from ._response import RESPONSE_GUARD_CLOCKS
 from ._test_support import InlineWorker
 from ._diagnostics import decode_fpga_diagnostics
@@ -508,6 +512,58 @@ class SDCardSimulationTestMixin:
             self.assertEqual(
                 os.pread(image.fileno(), BLOCK_SIZE, erase_address),
                 bytes([0xff]) * BLOCK_SIZE)
+
+        self._run_simulation(payload, scenario)
+
+    def test_sim_sideband_write_empty_reads_then_filesystem_read(self):
+        payload = b"".join(
+            bytes(((block * 0x39) + index) & 0xff for index in range(BLOCK_SIZE))
+            for block in range(24))
+
+        async def scenario(applet, bfm, image):
+            console = SidebandConsole(
+                logging.getLogger(__name__),
+                SidebandRegion(start_lba=16, sectors=8, image_sectors=24))
+            applet.sd_card_iface._sideband_console = console
+
+            output_address = console.region.start + console.OUTPUT_SECTOR * BLOCK_SIZE
+            for sequence in range(1, 3):
+                output = ConsoleFrame(
+                    ConsoleFrameKind.TargetOutput, console.session,
+                    sequence=sequence, payload=f"sideband-{sequence}\n".encode()).encode()
+                await bfm.send_command(24, output_address)
+                bfm.assert_r1(await bfm.receive_response(48), 24)
+                await bfm.send_data_block_1bit(output)
+                self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
+                await self._complete_sim_busy_request(
+                    applet, bfm, "sideband output completion")
+
+                await bfm.send_command(18, console.region.start)
+                bfm.assert_r1(await bfm.receive_response(48), 18)
+                for sector in range(4):
+                    await self._receive_sim_block(
+                        applet, bfm,
+                        console.read_block(
+                            console.region.start + sector * BLOCK_SIZE),
+                        timeout_cycles=8192)
+                await bfm.send_command(12)
+                bfm.assert_r1(await bfm.receive_response(48), 12)
+                await bfm.idle(64)
+
+            filesystem_block = 9
+            await bfm.send_command(18, filesystem_block * BLOCK_SIZE)
+            bfm.assert_r1(await bfm.receive_response(48), 18)
+            for block in range(filesystem_block, filesystem_block + 2):
+                await self._receive_sim_block(
+                    applet, bfm,
+                    payload[block * BLOCK_SIZE:(block + 1) * BLOCK_SIZE],
+                    timeout_cycles=8192)
+            await bfm.send_command(12)
+            bfm.assert_r1(await bfm.receive_response(48), 12)
+            self.assertEqual(applet.sd_card_iface._host_backend_errors, 0)
+            self.assertEqual(await applet.sd_card_iface.protocol_errors, 0)
+            self.assertEqual(await applet.sd_card_iface.stale_replies, 0)
+            self.assertEqual(await applet.sd_card_iface.buffer_faults, 0)
 
         self._run_simulation(payload, scenario)
 
