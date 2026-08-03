@@ -124,6 +124,20 @@ class SidebandConsoleTestCase(unittest.TestCase):
             console.region.locator,
         )
 
+    def test_every_mailbox_sector_is_readable(self):
+        console = self.make_console()
+        for sector in range(console.region.sectors - 1):
+            frame = ConsoleFrame.decode(console.read_block(
+                console.region.start + sector * BLOCK_SIZE))
+            expected = (
+                ConsoleFrameKind.Control if sector == console.CONTROL_SECTOR
+                else ConsoleFrameKind.Empty)
+            self.assertEqual(frame.kind, expected)
+            self.assertEqual(frame.session, console.session)
+
+        self.assertEqual(console._last_output_sequence, 0)
+        self.assertEqual(console._last_input_ack, 0)
+
     def test_interface_intercepts_without_touching_image_or_flush(self):
         console = self.make_console()
         backend = MemoryBackend(bytes(BLOCK_SIZE * 16))
