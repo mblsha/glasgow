@@ -5,64 +5,65 @@ from amaranth.sim import Simulator
 
 from glasgow.gateware import cobs as gateware_cobs
 
-from . import BLOCK_SIZE
+from . import BLOCK_SIZE, crc7
 from ._buffer import BlockBuffer
-from ._command import CommandEngine
-from ._early_marker import EarlyMarkerCapture
+from ._command import EARLY_MARKER_COMMAND, EARLY_MARKER_MAGIC, CommandEngine
 from ._host import HostBlockEngine, TransactionPhase
 from ._interfaces import ReadBufferState
 from ._read_buffer import ReadBufferManager
 
 
-class EarlyMarkerCaptureTestCase(unittest.TestCase):
-    def test_retains_only_timing_valid_complemented_markers(self):
+class EarlyMarkerCommandTestCase(unittest.TestCase):
+    def test_uses_existing_crc_checked_command_path_without_response(self):
         m = Module()
-        m.submodules.dut = dut = EarlyMarkerCapture(
-            break_min=12, sync_min=12, sync_max=15,
-            short_min=3, short_max=5, long_min=7, long_max=9)
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = CommandEngine(early_marker_trace=True)
 
         async def testbench(ctx):
-            async def drive(level, cycles):
-                ctx.set(dut.clk_i, level)
-                await ctx.tick().repeat(cycles)
-
-            async def send_frame(marker, *, complement=None, sync_cycles=14):
+            async def send_marker(marker, *, complement=None, valid_crc=True):
                 if complement is None:
                     complement = marker ^ 0xf
-                frame = marker | (complement << 4)
-                await drive(0, 14)  # BREAK
-                await drive(1, sync_cycles)  # SYNC
-                for bit in range(8):
-                    await drive(0, 4)
-                    await drive(1, 8 if (frame >> bit) & 1 else 4)
-                await drive(0, 14)
+                argument = (EARLY_MARKER_MAGIC << 8) | (complement << 4) | marker
+                protected = (1 << 38) | (EARLY_MARKER_COMMAND << 32) | argument
+                command_crc = crc7(protected, 40) ^ (0 if valid_crc else 1)
+                frame = (protected << 8) | (command_crc << 1) | 1
+                for bit in range(47, -1, -1):
+                    ctx.set(dut.cmd_i, (frame >> bit) & 1)
+                    await ctx.tick("sd")
+                ctx.set(dut.cmd_i, 1)
+                return frame
 
-            await drive(0, 16)
-            await send_frame(0x3)
-            self.assertEqual(ctx.get(dut.last_marker), 0x3)
+            ctx.set(dut.enabled, 1)
+            ctx.set(dut.cmd_i, 1)
+            await ctx.tick("sd")
 
-            # A long SD idle followed by ordinary short clock pulses can begin
-            # BREAK recognition, but the first high pulse cannot pass SYNC.
-            await drive(0, 20)
-            for _ in range(64):
-                await drive(1, 1)
-                await drive(0, 1)
-            self.assertEqual(ctx.get(dut.last_marker), 0x3)
+            frame = await send_marker(0x3)
+            self.assertEqual(frame, 0x7847_4d4b_c3a5)
+            self.assertEqual(ctx.get(dut.early_marker), 0x3)
+            self.assertEqual(ctx.get(dut.protocol_errors), 0)
+            self.assertEqual(ctx.get(dut.command_count), 1)
+            self.assertEqual(ctx.get(dut.last_command), EARLY_MARKER_COMMAND)
+            self.assertEqual(ctx.get(dut.control.response_active), 0)
 
-            await send_frame(0x4, complement=0xa)
-            self.assertEqual(ctx.get(dut.last_marker), 0x3)
+            await send_marker(0x4, valid_crc=False)
+            self.assertEqual(ctx.get(dut.early_marker), 0x3)
+            self.assertEqual(ctx.get(dut.protocol_errors), 1)
+            self.assertEqual(ctx.get(dut.protocol_error_sources), 0b10)
 
-            await send_frame(0x5, sync_cycles=4)
-            self.assertEqual(ctx.get(dut.last_marker), 0x3)
+            await send_marker(0xa)
+            self.assertEqual(ctx.get(dut.early_marker), 0xa)
+            self.assertEqual(ctx.get(dut.protocol_errors), 1)
+            self.assertEqual(ctx.get(dut.control.response_active), 0)
 
-            await send_frame(0x0)
-            self.assertEqual(ctx.get(dut.last_marker), 0x3)
-
-            await send_frame(0xa)
-            self.assertEqual(ctx.get(dut.last_marker), 0xa)
+            # A structurally valid ordinary CMD56 does not match the private
+            # complement and follows the existing illegal-command response.
+            await send_marker(0x5, complement=0x5)
+            self.assertEqual(ctx.get(dut.early_marker), 0xa)
+            self.assertEqual(ctx.get(dut.protocol_errors), 1)
+            self.assertEqual(ctx.get(dut.control.response_active), 1)
 
         simulator = Simulator(m)
-        simulator.add_clock(1e-6)
+        simulator.add_clock(1e-6, domain="sd")
         simulator.add_testbench(testbench)
         simulator.run()
 

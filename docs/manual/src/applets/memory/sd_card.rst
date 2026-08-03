@@ -87,45 +87,43 @@ errors. A final ``rail-fell`` delta with mask ``1`` and no buffer faults is cons
 collapsing while power disappears, but the run remains non-clean until a repeated trace establishes
 the fixture-specific rule.
 
-Early input-only marker trace
------------------------------
+Early in-band command marker
+----------------------------
 
-``--early-marker-trace`` adds the earliest practical diagnostic receiver to the card-emulator
-bitstream. It is deliberately build-time opt-in so ordinary applet gateware and behavior do not
-change. The receiver only taps the SD CLK input in Glasgow's 48 MHz domain; it adds no output or
-output-enable path and does not inspect or drive CMD or DAT. A target can therefore report a
-four-bit, nonzero progress or fault marker before its MMC host driver exists by temporarily driving
-its SD-clock GPIO. The last validated four-bit marker appears as ``early_marker`` in every
-``--preinit-trace`` diagnostics object. Zero means that no marker has been accepted since the
-gateware was configured. The latch intentionally survives SD-engine generation resets so that a
-``rail-fell`` snapshot cannot erase the evidence; reconfigure the applet between independent boot
-trials when marker freshness must be proven.
+``--early-marker-trace`` adds an opt-in hook after the card emulator's existing 48-bit command
+receiver. It adds no second consumer of the raw SD CLK pad and no new output or output-enable path.
+Ordinary builds structurally elide the hook. A target can report a four-bit progress or fault marker
+before its MMC driver exists by bit-banging one complete, CRC-valid private CMD56 on MMCCLK and
+MMCCMD. The last accepted marker appears as ``early_marker`` in each ``--preinit-trace`` diagnostics
+object. Marker values are ``1`` through ``15``.
 
-The compact wire format is intentionally not UART. It is a timing-framed pulse code, with the line
-idle low: BREAK is low for 128 PXA OS-timer ticks, SYNC is high for 128 ticks, and eight bits follow
-least-significant first. Each bit is a low gap of 32 ticks followed by a high pulse of 32 ticks for
-zero or 64 ticks for one. Bits 0--3 are a nonzero marker and bits 4--7 are ``marker XOR 0xf``. At
-the 3.6864 MHz PXA OS timer these durations are about 34.7, 8.7, and 17.4 microseconds. The receiver
-checks every interval and the complement before latching a marker. Ordinary SD clocks are far too
-short to pass these windows. The receiver retains only the latest marker rather than a byte stream:
-this is a progressive binary-search/fault channel, not an interactive console. Marker values are
-``1`` through ``15``; existing emitters for the former inverted-UART format must be replaced.
-At Glasgow's 48 MHz clock, the acceptance windows are: BREAK at least 1400 cycles; SYNC 1400--1950
-cycles; short gaps/pulses 320--560 cycles; and long pulses 700--1050 cycles. These correspond to
-at least 29.2 microseconds, 29.2--40.6 microseconds, 6.7--11.7 microseconds, and 14.6--21.9
-microseconds. The nominal OS-timer durations above sit near the center of every bounded window.
+The 32-bit CMD56 argument is ``0x474d4b00 | ((marker ^ 0xf) << 4) | marker``; ``0x474d4b`` is ASCII
+``GMK``. Transmit the ordinary SD command frame most-significant bit first: start bit ``0``,
+host-to-card transmission bit ``1``, six-bit command index ``56``, the argument, SD CRC7 over the
+40 bits from the transmission bit through the argument, and end bit ``1``. CMD idles high and CLK
+idles low. Set CMD while CLK is low, then pulse CLK high and low once for each of the 48 bits.
+As a complete integration vector, marker ``3`` has argument ``0x474d4bc3``, CRC7 ``0x52``, and
+48-bit frame ``78 47 4d 4b c3 a5`` on the wire in that byte order.
 
-On the SL-C860, PXA GPIO6/MMCCLK reaches CLK on the SD socket and Glasgow B2. The established
-target transmitter uses the 3.6864 MHz OS timer, saves GPIO6's live mux, direction, and output
-latch, stops any concurrent MMC-clock owner, switches GPIO6 to AF0 output-low, emits the bounded
-waveform above, returns low, then restores the saved GPIO state before normal MMC setup. Each level
-must be held until an OS-timer deadline rather than using an instruction-counted delay. It must
-leave CMD and DAT untouched. The emulator sees the marker's CLK edges as idle SD clocks with CMD
-high, so no command, response, data transfer, or protocol error is introduced. Instrumentation
-after PXA I/O mapping can emit unique values around a suspect early-ARM call; the last retained
-value is the last proven point.
+The ordinary command receiver validates start/transmission/end framing and CRC7 before checking the
+private argument. A bad frame or CRC remains a strict protocol error. A valid CMD56 with a different
+argument follows the emulator's existing unsupported-command path. A matching marker is a
+successful internal no-op: it updates the latch but deliberately schedules no card response, so
+the target need not supply further clocks or consume R1. The target must return CMD high and release
+it after the final falling CLK edge.
 
-Use the input-only marker receiver together with the lifecycle trace as follows::
+On the SL-C860, save the live mux, direction, and output latch for GPIO6/MMCCLK and GPIO8/MMCCMD,
+stop any concurrent MMC owner, and confirm that the preceding card transaction is complete. Drive
+only CLK and CMD for the bounded 48-clock frame, release CMD before restoring ownership, then
+restore both GPIOs exactly. Leave every DAT line untouched. Glasgow continues to use its existing
+input-only CLK path and does not drive CMD for the recognized private command. Existing pulse or
+inverted-UART marker emitters are incompatible and must not be used.
+
+The marker latch is in the resettable SD-command domain. ``rail-fell`` captures it before rearming;
+the following SD-engine generation starts at zero, making freshness explicit without requiring a
+gateware reconfiguration.
+
+Use the command marker together with the lifecycle trace as follows::
 
     glasgow run memory-sd-card -V B=3.3 \
         --clk B2 --cmd B5 --dat B1,B0,B7,B6 \
@@ -133,7 +131,7 @@ Use the input-only marker receiver together with the lifecycle trace as follows:
         --power-idle-high-z --early-marker-trace \
         --preinit-trace /tmp/zaurus-preinit.jsonl card.img
 
-If execution cannot reach the bounded GPIO6 transmitter, this feature cannot manufacture evidence:
+If execution cannot reach the bounded GPIO transmitter, this feature cannot manufacture evidence:
 the independently sensed SD-power transition remains the only asynchronous observation. A
 ``rail-fell`` record captures ``early_marker`` before the applet resets the emulator generation.
 

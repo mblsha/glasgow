@@ -9,6 +9,7 @@ from glasgow.simulation.assembly import SimulationAssembly
 from . import BLOCK_SIZE, build_cid, build_csd, build_scr, crc16
 from .bfm import SDHostBFM
 from ._backend import BackendError
+from ._command import EARLY_MARKER_COMMAND, EARLY_MARKER_MAGIC
 from ._data import READ_NAC_CLOCKS
 from ._protocol import BackendStatus
 from ._response import RESPONSE_GUARD_CLOCKS
@@ -353,6 +354,16 @@ class SDCardSimulationTestMixin:
             await self._receive_sim_block(
                 applet, bfm, payload[BLOCK_SIZE * 3:BLOCK_SIZE * 4])
 
+            marker = 0x3
+            marker_argument = (
+                (EARLY_MARKER_MAGIC << 8) |
+                ((marker ^ 0xf) << 4) |
+                marker
+            )
+            await bfm.send_command(EARLY_MARKER_COMMAND, marker_argument)
+            self.assertEqual(await applet.sd_card_iface._early_marker, marker)
+            self.assertEqual(await applet.sd_card_iface.protocol_errors, 0)
+
             # Restore the source CID that _initialize_sim_card deliberately changed after the
             # first coherent snapshot, then emulate a target rail fall. Rearming must reset both
             # sides of the async transport while retaining the same host backing session.
@@ -374,6 +385,7 @@ class SDCardSimulationTestMixin:
                 after_disable=hold_reset)
             self.assertTrue(applet.sd_card_iface._active)
             self.assertNotEqual(applet.sd_card_iface._generation, generation)
+            self.assertEqual(await applet.sd_card_iface._early_marker, 0)
 
             # MAINTE does not provide the long pre-command idle sequence required by modern
             # interpretations of the SD specification. Do not add any post-reset padding here;
@@ -396,7 +408,8 @@ class SDCardSimulationTestMixin:
                 "embedded boot sectors must not wait for host service")
 
         self._run_simulation(
-            payload, scenario, setup_arguments=("--prime-first-read",),
+            payload, scenario,
+            setup_arguments=("--prime-first-read", "--early-marker-trace"),
             embed_boot_prefix=True)
 
     def test_sim_single_and_multi_bit_writes_and_erase(self):
