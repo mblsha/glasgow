@@ -62,6 +62,7 @@ class SDCardDiagnostics:
     sd_clocks: int
     command_low_clocks: int
     commands: int
+    last_command: int
     reads: int
     writes: int
     protocol_errors: int
@@ -895,14 +896,16 @@ class SDCardInterface:
 
     def _log_diagnostics(self, diagnostics):
         self._logger.info(
-            "stopped after %d SD clocks (%d CMD-low), %d commands, %d reads, %d writes, "
+            "stopped after %d SD clocks (%d CMD-low), %d commands (last CMD%d), "
+            "%d reads, %d writes, "
             "%d protocol errors, %d FPGA-reported backend errors, %d stale replies; "
             "%d buffer faults, %d prefetch waits (%d total, %d max SD clocks), "
             "%d max host-service SD clocks; %d host backend errors, %d durable flushes, "
             "%d backend calls, %.3f ms max backend call; state card=%d data=%d banks=%#x "
             "host-phase=%d reply=%d+%d bytes",
             diagnostics.sd_clocks, diagnostics.command_low_clocks,
-            diagnostics.commands, diagnostics.reads, diagnostics.writes,
+            diagnostics.commands, diagnostics.last_command,
+            diagnostics.reads, diagnostics.writes,
             diagnostics.protocol_errors, diagnostics.fpga_backend_errors,
             diagnostics.stale_replies, diagnostics.buffer_faults,
             diagnostics.prefetch_waits, diagnostics.prefetch_wait_cycles,
@@ -917,10 +920,11 @@ class SDCardInterface:
     async def read_diagnostics(self) -> SDCardDiagnostics:
         """Read named FPGA and host-side pipeline diagnostics.
 
-        The FPGA fields are latched by one packed register transaction, so they represent one
-        instant even during an active transfer. The close-time report samples that register
-        immediately before disabling the SD clock domain, then updates host fields after the
-        final flush and worker close.
+        The packed FPGA fields are latched by one register transaction, so they represent one
+        instant even during an active transfer. ``last_command`` is sampled from its existing
+        standalone register immediately afterward and is advisory during continuous traffic.
+        The close-time report samples these registers immediately before disabling the SD clock
+        domain, then updates host fields after the final flush and worker close.
         """
         async with self._lifecycle_lock:
             async with self._operation_lock:
@@ -929,11 +933,13 @@ class SDCardInterface:
     async def _read_diagnostics_unlocked(self, session) -> SDCardDiagnostics:
         worker = None if session is None else session.worker
         fpga = decode_fpga_diagnostics(await self._diagnostics_snapshot)
+        last_command = await self.last_command
         early_marker = 0 if self._early_marker is None else await self._early_marker
         return SDCardDiagnostics(
             sd_clocks=fpga["sd_clocks"],
             command_low_clocks=fpga["command_low_clocks"],
             commands=fpga["commands"],
+            last_command=last_command,
             reads=fpga["reads"],
             writes=fpga["writes"],
             protocol_errors=fpga["protocol_errors"],

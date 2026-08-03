@@ -13,6 +13,7 @@ class PreinitTraceTestCase(unittest.TestCase):
             sd_clocks=1234,
             command_low_clocks=321,
             commands=17,
+            last_command=7,
             reads=8,
             writes=0,
             protocol_errors=65,
@@ -50,6 +51,7 @@ class PreinitTraceTestCase(unittest.TestCase):
             ])
             self.assertEqual(live_records[1]["generation"], 0x1234)
             self.assertEqual(live_records[1]["diagnostics"]["commands"], 17)
+            self.assertEqual(live_records[1]["diagnostics"]["last_command"], 7)
             self.assertEqual(live_records[1]["diagnostics"]["protocol_errors"], 65)
             self.assertEqual(
                 live_records[1]["diagnostics"]["protocol_error_sources"], 1)

@@ -86,8 +86,7 @@ def _elaborate_command_engine(
 
     if early_marker_trace:
         marker = cmd_argument[:4]
-        early_marker_command = (
-            (cmd_index == EARLY_MARKER_COMMAND) &
+        early_marker_argument = (
             (cmd_argument[8:32] == EARLY_MARKER_MAGIC) &
             (cmd_argument[4:8] == (marker ^ 0xf)) &
             (marker != 0)
@@ -211,19 +210,7 @@ def _elaborate_command_engine(
                     with m.If(cmd_index != 55):
                         m.d.sd += app_command.eq(0)
 
-                    if early_marker_trace:
-                        # This private CMD56 is accepted only after the ordinary
-                        # frame and CRC7 checks above. It deliberately schedules
-                        # no response: early target code can release CMD after the
-                        # final bit without clocking or consuming an R1 response.
-                        with m.If(early_marker_command):
-                            m.d.sd += self.early_marker.eq(marker)
-                            m.d.sd += app_command.eq(0)
-                        app_dispatch = m.Elif(app_command)
-                    else:
-                        app_dispatch = m.If(app_command)
-
-                    with app_dispatch:
+                    with m.If(app_command):
                         with m.Switch(cmd_index):
                             with m.Case(13):
                                 with m.If(card_state == CardState.Tran):
@@ -410,5 +397,15 @@ def _elaborate_command_engine(
                             with m.Case(55):
                                 load_r1(cmd_index, status_value(app=True))
                                 m.d.sd += app_command.eq(1)
+                            if early_marker_trace:
+                                with m.Case(EARLY_MARKER_COMMAND):
+                                    # Keep every other command on the proven
+                                    # dispatch structure. A matching private
+                                    # CMD56 is the only path that suppresses the
+                                    # ordinary unsupported-command R1 response.
+                                    with m.If(early_marker_argument):
+                                        m.d.sd += self.early_marker.eq(marker)
+                                    with m.Else():
+                                        load_r1(cmd_index, status_value(extra=1 << 22))
                             with m.Default():
                                 load_r1(cmd_index, status_value(extra=1 << 22))

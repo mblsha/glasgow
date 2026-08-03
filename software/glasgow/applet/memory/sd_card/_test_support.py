@@ -168,6 +168,7 @@ class TestSDCardInterface(SDCardInterface):
         self._cid = ImmediateRegister(0)
         self._csd = ImmediateRegister(0)
         self._scr = ImmediateRegister(0)
+        self.last_command = ImmediateRegister(0)
         self._diagnostics_snapshot = ImmediateRegister(0)
         self._early_marker = None
         self._boot_data = None
