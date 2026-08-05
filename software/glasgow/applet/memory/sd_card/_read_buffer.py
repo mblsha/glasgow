@@ -33,6 +33,11 @@ class ReadBufferClientSignature(wiring.Signature):
             "release": Out(1),
             "active": In(1),
             "active_bank": In(BUFFER_BANK_BITS),
+            "mutation_acquire": Out(1),
+            "mutation_release": Out(1),
+            "mutation_ready": In(1),
+            "mutation_active": In(1),
+            "mutation_bank": In(BUFFER_BANK_BITS),
             "bank_states": In(BUFFER_STATE_WIDTH),
             "ready_ahead": In(range(BUFFER_BLOCKS + 1)),
             "reply_fault": In(1),
@@ -78,7 +83,10 @@ class ReadBufferManager(wiring.Component):
         empty_available = Signal()
         reserve_address_present = Signal()
         ready_bank = Signal(BUFFER_BANK_BITS)
+        mutation_candidate = Signal(BUFFER_BANK_BITS)
+        mutation_candidate_available = Signal()
         active_count = Signal(range(BUFFER_BLOCKS + 1))
+        mutation_count = Signal(range(BUFFER_BLOCKS + 1))
         ready_prefix = Array(
             Signal(name=f"ready_prefix_{index}") for index in range(BUFFER_BLOCKS))
 
@@ -92,11 +100,17 @@ class ReadBufferManager(wiring.Component):
             empty_available.eq(0),
             reserve_address_present.eq(0),
             ready_bank.eq(0),
+            mutation_candidate.eq(0),
+            mutation_candidate_available.eq(0),
             client.ready.eq(0),
             client.next_ready.eq(0),
             client.filling.eq(0),
             client.active.eq(0),
             client.active_bank.eq(0),
+            client.mutation_ready.eq(
+                ~client.mutation_active & mutation_candidate_available),
+            client.mutation_active.eq(0),
+            client.mutation_bank.eq(0),
             client.bank_states.eq(Cat(*bank_state)),
             client.ready_ahead.eq(sum(ready_prefix)),
             client.reserve_ready.eq(
@@ -104,6 +118,8 @@ class ReadBufferManager(wiring.Component):
             host.reply_consume.eq(host.reply_ready),
             active_count.eq(sum(
                 state == ReadBufferState.Active for state in bank_state)),
+            mutation_count.eq(sum(
+                state == ReadBufferState.Mutation for state in bank_state)),
         ]
         for bank in reversed(range(BUFFER_BLOCKS)):
             with m.If(bank_state[bank] == ReadBufferState.Empty):
@@ -122,6 +138,21 @@ class ReadBufferManager(wiring.Component):
                 m.d.comb += client.filling.eq(1)
             with m.If(bank_state[bank] == ReadBufferState.Active):
                 m.d.comb += [client.active.eq(1), client.active_bank.eq(bank)]
+            with m.If(bank_state[bank] == ReadBufferState.Mutation):
+                m.d.comb += [
+                    client.mutation_active.eq(1),
+                    client.mutation_bank.eq(bank),
+                ]
+            # A completed read may be evicted for a write, but a bank whose host fill is still
+            # in flight must retain ownership until that payload drains. At most one read fill
+            # can be outstanding, so the other bank is always available before a write response
+            # completes.
+            with m.If((bank_state[bank] == ReadBufferState.Empty) |
+                      (bank_state[bank] == ReadBufferState.Ready)):
+                m.d.comb += [
+                    mutation_candidate_available.eq(1),
+                    mutation_candidate.eq(bank),
+                ]
 
         for offset in range(BUFFER_BLOCKS):
             ready_at_offset = Cat(*[
@@ -205,6 +236,21 @@ class ReadBufferManager(wiring.Component):
             with m.Else():
                 m.d.comb += reply_fault_next.eq(1)
 
+        with m.If(client.mutation_acquire & client.mutation_ready):
+            m.d.comb += [
+                next_state[mutation_candidate].eq(ReadBufferState.Mutation),
+                next_pinned[mutation_candidate].eq(0),
+            ]
+
+        with m.If(client.mutation_release):
+            with m.If(client.mutation_active):
+                m.d.comb += [
+                    next_state[client.mutation_bank].eq(ReadBufferState.Empty),
+                    next_pinned[client.mutation_bank].eq(0),
+                ]
+            with m.Else():
+                m.d.comb += reply_fault_next.eq(1)
+
         with m.If(client.discard_stale):
             for bank, state in enumerate(bank_state):
                 in_window = (bank_address[bank] == client.lookup_address) | \
@@ -264,6 +310,8 @@ class ReadBufferManager(wiring.Component):
             host.request_blocks.eq(request_blocks_next),
             client.reply_fault.eq(reply_fault_next),
             Assert(active_count <= 1),
+            Assert(mutation_count <= 1),
+            Assert((active_count == 0) | (mutation_count == 0)),
         ]
         for bank in range(BUFFER_BLOCKS):
             m.d.sd += [

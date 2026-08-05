@@ -515,6 +515,44 @@ class SDCardSimulationTestMixin:
 
         self._run_simulation(payload, scenario)
 
+    def test_sim_write_cannot_poison_prefetched_read_bank(self):
+        payload = b"".join(
+            bytes(((block * 0x37) + index) & 0xff for index in range(BLOCK_SIZE))
+            for block in range(16))
+
+        async def scenario(applet, bfm, image):
+            # Consume two sectors of CMD18 so the third remains prefetched in the bank that
+            # incoming writes historically reused without invalidating its address tag.
+            await bfm.send_command(18, 0)
+            bfm.assert_r1(await bfm.receive_response(48), 18)
+            await self._receive_sim_block(applet, bfm, payload[:BLOCK_SIZE])
+            await self._receive_sim_block(
+                applet, bfm, payload[BLOCK_SIZE:BLOCK_SIZE * 2])
+            await bfm.send_command(12)
+            bfm.assert_r1(await bfm.receive_response(48), 12)
+            await bfm.idle(32)
+
+            poisoned_pattern = bytes([0x55]) * BLOCK_SIZE
+            write_address = BLOCK_SIZE * 10
+            await bfm.send_command(24, write_address)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            await bfm.send_data_block_1bit(poisoned_pattern)
+            self.assertEqual(await bfm.receive_data_response(), [0, 0, 1, 0, 1])
+            await self._complete_sim_busy_request(
+                applet, bfm, "write after prefetched read")
+
+            # The old implementation returned 0x55 here while the host backing image still
+            # contained the correct bytes. Mutation-bank ownership must force a fresh read.
+            read_address = BLOCK_SIZE * 2
+            await bfm.send_command(17, read_address)
+            bfm.assert_r1(await bfm.receive_response(48), 17)
+            await self._receive_sim_block(
+                applet, bfm, payload[read_address:read_address + BLOCK_SIZE])
+            self.assertEqual(await applet.sd_card_iface.buffer_faults, 0)
+            self.assertEqual(await applet.sd_card_iface.protocol_errors, 0)
+
+        self._run_simulation(payload, scenario)
+
     def test_sim_sideband_write_empty_reads_then_filesystem_read(self):
         payload = b"".join(
             bytes(((block * 0x39) + index) & 0xff for index in range(BLOCK_SIZE))

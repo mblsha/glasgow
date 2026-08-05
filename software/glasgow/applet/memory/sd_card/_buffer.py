@@ -115,6 +115,10 @@ class BlockBuffer(wiring.Component):
             self.host.write_address[BUFFER_BANK_BIT:BUFFER_BANK_BIT + BUFFER_BANK_BITS], 3)
         data_read_state = self.bank_states.word_select(
             self.data.read_address[BUFFER_BANK_BIT:BUFFER_BANK_BIT + BUFFER_BANK_BITS], 3)
+        data_write_state = self.bank_states.word_select(
+            self.data.write_address[BUFFER_BANK_BIT:BUFFER_BANK_BIT + BUFFER_BANK_BITS], 3)
+        host_read_state = self.bank_states.word_select(
+            self.host.read_address[BUFFER_BANK_BIT:BUFFER_BANK_BIT + BUFFER_BANK_BITS], 3)
         m.d.comb += self.collision.eq(
             (self.host.write_en.any() & self.data.write_en.any()) |
             (self.host.read_active & self.data.read_active) |
@@ -128,7 +132,11 @@ class BlockBuffer(wiring.Component):
             (self.host.write_en.any() &
              (host_write_state != ReadBufferState.Filling) &
              (host_write_state != ReadBufferState.Draining)) |
-            (self.data.read_active & (data_read_state != ReadBufferState.Active)))
+            (self.data.read_active & (data_read_state != ReadBufferState.Active)) |
+            (self.data.write_en.any() &
+             (data_write_state != ReadBufferState.Mutation)) |
+            (self.host.read_active &
+             (host_read_state != ReadBufferState.Mutation)))
         fault_event = self.collision | self.ownership_violation
         m.d.sd += fault_active.eq(fault_event)
         with m.If(self.collision & ~fault_active):

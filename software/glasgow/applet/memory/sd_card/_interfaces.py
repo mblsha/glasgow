@@ -18,6 +18,7 @@ class ReadBufferState(enum.Enum, shape=3):
     Ready = 2
     Active = 3
     Draining = 4
+    Mutation = 5
 
 
 class CommandDataSignature(wiring.Signature):
@@ -70,6 +71,7 @@ class MutationHostSignature(wiring.Signature):
     def __init__(self):
         super().__init__({
             "write_request": Out(1),
+            "write_bank": Out(BUFFER_BANK_BITS),
             "write_request_accepted": In(1),
             "erase_request": Out(1),
             "erase_request_accepted": In(1),

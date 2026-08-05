@@ -428,6 +428,7 @@ def _elaborate_host_block_engine(
             transaction.reply.eq(HOST_OPERATION_FOR_EVENT[HostEvent.Write].reply),
             transaction.request_id.eq(next_request),
             transaction.address.eq(current_address),
+            transaction.bank.eq(mutation.write_bank),
             transaction.prefetch_only.eq(0),
             next_request.eq(next_request + 1),
             mutation.write_request_accepted.eq(1),
@@ -490,7 +491,8 @@ def _elaborate_host_block_engine(
             (transaction.phase == TransactionPhase.Emit) &
             (transaction.event == HostEvent.Write)),
         block_buffer.read_address.eq(
-            Mux(event_read_advance, event_count + 1, event_read_address)),
+            Cat(Mux(event_read_advance, event_count + 1, event_read_address)[:9],
+                transaction.bank)),
     ]
     event_fire = o_stream.valid & o_stream.ready
 

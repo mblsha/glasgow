@@ -91,6 +91,9 @@ def _elaborate_data_transfer_engine(
         read_buffers.discard_stale.eq(0),
         read_buffers.activate.eq(0),
         read_buffers.release.eq(0),
+        read_buffers.mutation_acquire.eq(0),
+        read_buffers.mutation_release.eq(0),
+        mutation.write_bank.eq(read_buffers.mutation_bank),
         self.restore_boot.eq(0),
     ]
 
@@ -235,7 +238,8 @@ def _elaborate_data_transfer_engine(
                                     m.d.sd += crc_lanes[lane].eq(0)
                                 m.next = "Read-Nac"
                         with m.Case(DataMode.WriteSingle, DataMode.WriteMulti):
-                            with m.If(~response_active):
+                            m.d.comb += read_buffers.mutation_acquire.eq(1)
+                            with m.If(~response_active & read_buffers.mutation_active):
                                 m.next = "Write-Wait-Start"
                         with m.Case(DataMode.Erase):
                             with m.If(~response_active):
@@ -383,7 +387,7 @@ def _elaborate_data_transfer_engine(
             with m.If(lanes.byte_done):
                 m.d.comb += [
                     block_buffer.write_en.eq(1 << data_byte[:3]),
-                    block_buffer.write_address.eq(data_byte),
+                    block_buffer.write_address.eq(Cat(data_byte[:9], read_buffers.mutation_bank)),
                     block_buffer.write_data.eq(Cat(*([received_octet] * 8))),
                 ]
                 m.d.sd += data_bit.eq(0)
@@ -462,3 +466,9 @@ def _elaborate_data_transfer_engine(
                     update_mode(DataMode.Idle)
                     update_state(CardState.Tran)
                     m.next = "Idle"
+
+    with m.If(read_buffers.mutation_active &
+              (stop_requested |
+               ((data_mode != DataMode.WriteSingle) &
+                (data_mode != DataMode.WriteMulti)))):
+        m.d.comb += read_buffers.mutation_release.eq(1)
