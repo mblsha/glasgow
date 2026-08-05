@@ -212,6 +212,54 @@ class ReadBufferManagerTestCase(unittest.TestCase):
         simulator.add_testbench(testbench)
         simulator.run()
 
+    def test_mutation_claim_evicts_ready_tag_and_reserves_bank(self):
+        m = Module()
+        m.domains.sd = ClockDomain()
+        m.submodules.dut = dut = ReadBufferManager()
+
+        async def testbench(ctx):
+            address = BLOCK_SIZE * 7
+            ctx.set(dut.client.reserve_address, address)
+            ctx.set(dut.client.reserve, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.client.reserve, 0)
+            bank = ctx.get(dut.host.request_bank)
+            ctx.set(dut.host.request_accepted, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.host.request_accepted, 0)
+            ctx.set(dut.host.reply_ready, 1)
+            ctx.set(dut.host.reply_address, address)
+            ctx.set(dut.host.reply_bank, bank)
+            await ctx.tick("sd")
+            ctx.set(dut.host.reply_ready, 0)
+
+            ctx.set(dut.client.lookup_address, address)
+            self.assertEqual(ctx.get(dut.client.ready), 1)
+            self.assertEqual(ctx.get(dut.client.mutation_ready), 1)
+            ctx.set(dut.client.mutation_acquire, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.client.mutation_acquire, 0)
+
+            self.assertEqual(ctx.get(dut.client.mutation_active), 1)
+            self.assertEqual(ctx.get(dut.client.mutation_bank), bank)
+            self.assertEqual(ctx.get(dut.client.ready), 0)
+            states = ctx.get(dut.client.bank_states)
+            self.assertEqual(
+                (states >> (bank * 3)) & 0x7, ReadBufferState.Mutation.value)
+
+            ctx.set(dut.client.mutation_release, 1)
+            await ctx.tick("sd")
+            ctx.set(dut.client.mutation_release, 0)
+            self.assertEqual(ctx.get(dut.client.mutation_active), 0)
+            states = ctx.get(dut.client.bank_states)
+            self.assertEqual(
+                (states >> (bank * 3)) & 0x7, ReadBufferState.Empty.value)
+
+        simulator = Simulator(m)
+        simulator.add_clock(1e-6, domain="sd")
+        simulator.add_testbench(testbench)
+        simulator.run()
+
     def test_accepted_prefetch_is_drained_after_cancellation(self):
         m = Module()
         m.domains.sd = ClockDomain()
