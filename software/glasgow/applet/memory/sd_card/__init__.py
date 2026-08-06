@@ -782,9 +782,29 @@ class SDCardInterface:
                 # remains off. On this Zaurus the SD rail does not rise until ON, so waiting for
                 # that edge to re-enable loses the beginning of MAINTE initialization.
                 await self.set_signal_pulls(device, port, enabled=False)
+                diagnostics = await self.read_diagnostics()
                 await notify_transition("rail-fell", voltage)
                 now = asyncio.get_running_loop().time()
-                if now - last_rearm >= rearm_min_interval:
+                traffic_seen = any((
+                    diagnostics.commands,
+                    diagnostics.reads,
+                    diagnostics.writes,
+                ))
+                if traffic_seen:
+                    # The Zaurus loader deliberately removes SD power before the production
+                    # kernel restores it. Keeping a freshly reset card enabled throughout that
+                    # long off-rail interval interprets the collapsing host's CMD-low level as
+                    # thousands of malformed CMD0 frames. Once a real loader transaction has
+                    # occurred, disable the engine until the next qualified rise; the kernel's
+                    # MMC initialization retries while the host adapter resumes the card.
+                    await self.suspend(
+                        reason=f"target rail fell after SD traffic at {voltage:.2f} V")
+                    last_rearm = now
+                    self._logger.info(
+                        "target rail fell to %.2f V after %d commands; "
+                        "SD engine suspended until rail restore",
+                        voltage, diagnostics.commands)
+                elif now - last_rearm >= rearm_min_interval:
                     await self.rearm(
                         reason=f"target rail fell to {voltage:.2f} V",
                         reset_hold=rearm_reset_hold)
