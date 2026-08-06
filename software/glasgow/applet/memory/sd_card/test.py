@@ -1,10 +1,12 @@
 import asyncio
+from types import SimpleNamespace
+from unittest import mock
 
 from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
 from glasgow.simulation.assembly import SimulationAssembly
 
 from . import (
-    BLOCK_SIZE, DEFAULT_TRANSFER_SPEED, SDCardApplet, SDCardError,
+    BLOCK_SIZE, DEFAULT_TRANSFER_SPEED, SDCardApplet, SDCardError, SDCardInterface,
     build_cid, build_csd, build_scr, crc7, crc16,
     decode_csd_transfer_speed, encode_csd_transfer_speed, encode_early_marker,
     parse_transfer_speed,
@@ -140,6 +142,89 @@ class SDCardAppletTestCase(
         self.assertFalse(SDCardApplet._resolve_power_idle_high_z(sensed))
         self.assertFalse(SDCardApplet._resolve_power_idle_high_z(legacy))
         self.assertFalse(SDCardApplet._resolve_power_idle_high_z(explicit_off))
+
+    def test_power_monitor_suspends_traffic_active_card_until_rail_restore(self):
+        events = []
+
+        class Interface:
+            def __init__(self):
+                self._active = True
+                self._logger = mock.Mock()
+                self._diagnostics = iter((
+                    SimpleNamespace(commands=0, reads=0, writes=0),
+                    SimpleNamespace(commands=23, reads=11, writes=1),
+                ))
+
+            @property
+            def active(self):
+                return self._active
+
+            async def read_diagnostics(self):
+                value = next(self._diagnostics)
+                events.append(("diagnostics", value.commands))
+                return value
+
+            async def set_signal_pulls(self, _device, _port, *, enabled):
+                events.append(("pulls", enabled))
+
+            async def rearm(self, **_kwargs):
+                events.append(("rearm",))
+                self._active = True
+
+            async def suspend(self, **_kwargs):
+                events.append(("suspend",))
+                self._active = False
+
+            async def resume(self, **_kwargs):
+                events.append(("resume",))
+                self._active = True
+
+            async def flush(self):
+                events.append(("flush",))
+
+        class Lifecycle:
+            def __init__(self, _logger, **callbacks):
+                self.callbacks = callbacks
+
+            async def run(self):
+                await self.callbacks["suspend"](2.9)
+                await self.callbacks["after_suspend"]()
+                await self.callbacks["resume"](3.2)
+                await self.callbacks["suspend"](2.9)
+                await self.callbacks["after_suspend"]()
+                await self.callbacks["resume"](3.2)
+
+        # Call the implementation method directly; Interface deliberately supplies only the
+        # lifecycle surface so the test does not require gateware or a USB device.
+        async def direct_scenario():
+            interface = Interface()
+            transitions = []
+
+            class Device:
+                async def measure_voltage(self, _port):
+                    return 0.0
+
+            async def record(event, **_fields):
+                transitions.append(event)
+
+            with mock.patch(
+                    "glasgow.applet.memory.sd_card.TargetPowerLifecycle", Lifecycle):
+                await SDCardInterface.monitor_power(
+                    interface, Device(), "B", manage_signal_pulls=True,
+                    resume_settle=0, rearm_min_interval=0,
+                    transition_callback=record)
+            self.assertTrue(interface.active)
+            self.assertEqual(transitions, [
+                "rail-initial", "rail-fell", "rail-rose", "rail-fell", "rail-rose"])
+
+        asyncio.run(direct_scenario())
+        self.assertEqual(events, [
+            ("pulls", False), ("rearm",), ("flush",),
+            ("pulls", False), ("diagnostics", 0), ("rearm",), ("flush",),
+            ("pulls", True),
+            ("pulls", False), ("diagnostics", 23), ("suspend",), ("flush",),
+            ("pulls", True), ("resume",),
+        ])
 
     def test_csd_capacity_through_1_gib(self):
         for size in (2048, 1 << 20, 16 << 20, 512 << 20, 1024 << 20):
