@@ -4,7 +4,7 @@ from amaranth.lib.wiring import In, Out
 
 from ._buffer import BlockBufferPortSignature
 from ._gateware_support import (
-    BLOCK_SIZE, BUFFER_BLOCKS, IMAGE_SIZE_WIDTH, CardState, DataMode,
+    BLOCK_SIZE, BUFFER_BLOCKS, IMAGE_SIZE_WIDTH, MAX_IMAGE_SIZE, CardState, DataMode,
 )
 from ._interfaces import CommandDataSignature, DataHostSignature
 from ._lanes import SDDataLaneCodec
@@ -74,13 +74,16 @@ def _elaborate_data_transfer_engine(
     host_ack_status = mutation.ack_status
     host_ack_consume = mutation.ack_consume
     read_error_pending = Signal()
+    write_in_flight = Signal()
+    ignore_write_ack = Signal()
     # Start only after a complete, CRC-valid CMD0. External CLK can be intermittent while the
     # target is off or the applet is being configured, which is not enough to frame a host event.
     boot_prime_active = Signal()
     boot_prime_started = Signal()
     m.d.comb += [
         read_buffers.reset.eq(
-            stop_requested | ((data_mode == DataMode.Idle) & ~boot_prime_active)),
+            ~write_in_flight &
+            (stop_requested | ((data_mode == DataMode.Idle) & ~boot_prime_active))),
         read_buffers.preload_boot.eq(0),
         read_buffers.preload_boot_address_0.eq(self.boot_address_0),
         read_buffers.preload_boot_address_1.eq(self.boot_address_1),
@@ -118,8 +121,7 @@ def _elaborate_data_transfer_engine(
             control.address_update.eq(value),
         ]
 
-    with m.If(mutation.write_request_accepted | stop_requested |
-              (data_mode == DataMode.Idle)):
+    with m.If(mutation.write_request_accepted):
         m.d.sd += write_request.eq(0)
     with m.If(mutation.erase_request_accepted):
         m.d.sd += erase_request.eq(0)
@@ -149,10 +151,12 @@ def _elaborate_data_transfer_engine(
     data_response = Signal(5)
     data_response_bits = Signal(range(6))
     write_accepted = Signal()
+    written_blocks = Signal(range(MAX_IMAGE_SIZE // BLOCK_SIZE + 1))
     read_advance = Signal()
     inter_block_gap = Signal(range(65))
     register_read = ((data_mode == DataMode.ReadSCR) |
-                     (data_mode == DataMode.ReadSDStatus))
+                     (data_mode == DataMode.ReadSDStatus) |
+                     (data_mode == DataMode.ReadWrittenBlocks))
     valid_read = ((data_mode == DataMode.ReadSingle) |
                   (data_mode == DataMode.ReadMulti) |
                   register_read)
@@ -228,7 +232,8 @@ def _elaborate_data_transfer_engine(
                                 for lane in range(4):
                                     m.d.sd += crc_lanes[lane].eq(0)
                                 m.next = "Read-Nac"
-                        with m.Case(DataMode.ReadSCR, DataMode.ReadSDStatus):
+                        with m.Case(DataMode.ReadSCR, DataMode.ReadSDStatus,
+                                    DataMode.ReadWrittenBlocks):
                             with m.If(~response_active):
                                 m.d.sd += [
                                     data_byte.eq(0),
@@ -279,20 +284,36 @@ def _elaborate_data_transfer_engine(
                 m.next = "Idle"
 
         with m.State("Read-Data"):
-            source_byte = Mux(
-                data_mode == DataMode.ReadSCR,
-                self.scr.word_select(data_byte[:3] ^ 0b111, 8),
-                Mux(data_mode == DataMode.ReadSDStatus, C(0, 8),
-                    block_buffer.read_data))
+            source_byte = Signal(8)
+            block_last = Signal()
+            with m.Switch(data_mode):
+                with m.Case(DataMode.ReadSCR):
+                    m.d.comb += [
+                        source_byte.eq(self.scr.word_select(data_byte[:3] ^ 0b111, 8)),
+                        block_last.eq(data_byte == 7),
+                    ]
+                with m.Case(DataMode.ReadSDStatus):
+                    # DAT_BUS_WIDTH is bits 511:510, encoded as 0b10 for four data lines.
+                    m.d.comb += [
+                        source_byte.eq(Mux((data_byte == 0) & bus_width_4, 0x80, 0)),
+                        block_last.eq(data_byte == 63),
+                    ]
+                with m.Case(DataMode.ReadWrittenBlocks):
+                    count_word = Cat(written_blocks, C(0, 32 - len(written_blocks)))
+                    m.d.comb += [
+                        source_byte.eq(count_word.word_select(data_byte[:2] ^ 3, 8)),
+                        block_last.eq(data_byte == 3),
+                    ]
+                with m.Default():
+                    m.d.comb += [
+                        source_byte.eq(block_buffer.read_data),
+                        block_last.eq(data_byte == BLOCK_SIZE - 1),
+                    ]
             symbol = lanes.read_symbol(source_byte)
             m.d.comb += [dat_o.eq(symbol), dat_oe.eq(lanes.output_enable)]
             lanes.advance_read_crc(m, symbol)
             with m.If(lanes.byte_done):
                 m.d.sd += data_bit.eq(0)
-                block_last = Mux(data_mode == DataMode.ReadSCR,
-                    data_byte == 7,
-                    Mux(data_mode == DataMode.ReadSDStatus,
-                        data_byte == 63, data_byte == BLOCK_SIZE - 1))
                 with m.If(block_last):
                     m.d.sd += data_bit.eq(15)
                     m.next = "Read-CRC"
@@ -431,7 +452,7 @@ def _elaborate_data_transfer_engine(
             with m.If(data_response_bits == 1):
                 m.d.sd += data_response_bits.eq(0)
                 with m.If(write_accepted):
-                    m.d.sd += write_request.eq(1)
+                    m.d.sd += [write_request.eq(1), write_in_flight.eq(1)]
                     update_state(CardState.Prg)
                     m.next = "Busy"
                 with m.Else():
@@ -445,30 +466,43 @@ def _elaborate_data_transfer_engine(
             m.d.comb += [dat_o.eq(0xe), dat_oe.eq(0x1)]
             with m.If(host_ack_valid):
                 m.d.comb += host_ack_consume.eq(1)
-                with m.If((host_ack_status == 0) &
-                          (data_mode == DataMode.WriteMulti)):
-                    m.d.sd += self.write_count.eq(self.write_count + 1)
-                    with m.If(current_address <= self.image_size - (2 * BLOCK_SIZE)):
-                        update_address(current_address + BLOCK_SIZE)
-                        update_state(CardState.Rcv)
-                        m.next = "Write-Wait-Start"
+                m.d.sd += [write_in_flight.eq(0), ignore_write_ack.eq(0)]
+                # CMD12 can clear data_mode while a valid block is still being committed.
+                # CMD0 starts a new card session and must discard the old count.
+                with m.If(control.card_reset | ignore_write_ack):
+                    m.next = "Idle"
+                with m.Else():
+                    with m.If((host_ack_status == 0) & write_in_flight):
+                        m.d.sd += [
+                            self.write_count.eq(self.write_count + 1),
+                            written_blocks.eq(written_blocks + 1),
+                        ]
+                    with m.If((host_ack_status == 0) &
+                              (data_mode == DataMode.WriteMulti)):
+                        with m.If(current_address <= self.image_size - (2 * BLOCK_SIZE)):
+                            update_address(current_address + BLOCK_SIZE)
+                            update_state(CardState.Rcv)
+                            m.next = "Write-Wait-Start"
+                        with m.Else():
+                            m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
+                            update_mode(DataMode.Idle)
+                            update_state(CardState.Tran)
+                            m.next = "Idle"
                     with m.Else():
-                        m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
+                        with m.If(host_ack_status != 0):
+                            m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
                         update_mode(DataMode.Idle)
                         update_state(CardState.Tran)
                         m.next = "Idle"
-                with m.Else():
-                    with m.If((host_ack_status == 0) &
-                              (data_mode == DataMode.WriteSingle)):
-                        m.d.sd += self.write_count.eq(self.write_count + 1)
-                    with m.If(host_ack_status != 0):
-                        m.d.sd += self.protocol_errors.eq(self.protocol_errors + 1)
-                    update_mode(DataMode.Idle)
-                    update_state(CardState.Tran)
-                    m.next = "Idle"
 
-    with m.If(read_buffers.mutation_active &
+    with m.If(control.write_started | control.card_reset):
+        m.d.sd += written_blocks.eq(0)
+    with m.If(control.card_reset & write_in_flight & ~host_ack_valid):
+        m.d.sd += ignore_write_ack.eq(1)
+
+    # A write request can still be streaming from the mutation bank after CMD12 or CMD0.
+    # Release the bank only after the backend has acknowledged the request.
+    with m.If(read_buffers.mutation_active & ~write_in_flight &
               (stop_requested |
-               ((data_mode != DataMode.WriteSingle) &
-                (data_mode != DataMode.WriteMulti)))):
+               ((data_mode != DataMode.WriteSingle) & (data_mode != DataMode.WriteMulti)))):
         m.d.comb += read_buffers.mutation_release.eq(1)

@@ -36,21 +36,23 @@ class CommandEngine(wiring.Component):
     # constant zero and has no host register or decoded-command logic.
     early_marker: Out(4)
 
-    def __init__(self, *, capture_cmd17_wire=False):
+    def __init__(self, *, capture_cmd17_wire=False, legacy_register_block_lengths=False):
         self._capture_cmd17_wire = capture_cmd17_wire
+        self._legacy_register_block_lengths = legacy_register_block_lengths
         super().__init__()
 
     def elaborate(self, platform):
         m = Module()
         _elaborate_command_engine(
             m, self, self.cmd_i, self.cmd_o, self.cmd_oe, self.enabled, self.control,
-            capture_cmd17_wire=self._capture_cmd17_wire)
+            capture_cmd17_wire=self._capture_cmd17_wire,
+            legacy_register_block_lengths=self._legacy_register_block_lengths)
         return m
 
 
 def _elaborate_command_engine(
         m, component, cmd_i, cmd_o, cmd_oe, enabled_sd, control, *,
-        capture_cmd17_wire=False):
+        capture_cmd17_wire=False, legacy_register_block_lengths=False):
     self = component
     card_state = control.card_state
     data_mode = control.data_mode
@@ -61,6 +63,7 @@ def _elaborate_command_engine(
     erase_start_valid = Signal()
     erase_end_valid = Signal()
     app_command = Signal()
+    short_block_length = Signal()
 
     cmd_shift = Signal(48)
     cmd_bits = Signal(range(49))
@@ -136,7 +139,7 @@ def _elaborate_command_engine(
 
     response.elaborate(m)
     m.d.comb += control.response_active.eq(response_active)
-    m.d.sd += control.card_reset.eq(0)
+    m.d.sd += [control.card_reset.eq(0), control.write_started.eq(0)]
 
     with m.If(control.state_update_valid):
         m.d.sd += card_state.eq(control.state_update)
@@ -152,6 +155,8 @@ def _elaborate_command_engine(
             *response.reset(),
             card_state.eq(CardState.Idle),
             data_mode.eq(DataMode.Idle),
+            bus_width_4.eq(0),
+            short_block_length.eq(0),
             app_command.eq(0),
         ]
     with m.Elif(~response_active):
@@ -212,6 +217,15 @@ def _elaborate_command_engine(
                                     m.d.sd += bus_width_4.eq(cmd_argument[:2] == 2)
                                 with m.Else():
                                     load_r1(cmd_index, status_value(extra=1 << 22))
+                            with m.Case(22):
+                                with m.If(card_state == CardState.Tran):
+                                    load_r1(cmd_index, status_value())
+                                    m.d.sd += [
+                                        data_mode.eq(DataMode.ReadWrittenBlocks),
+                                        card_state.eq(CardState.Data),
+                                    ]
+                                with m.Else():
+                                    load_r1(cmd_index, status_value(extra=1 << 22))
                             with m.Case(23, 42):
                                 load_r1(cmd_index, status_value())
                             with m.Case(41):
@@ -238,6 +252,7 @@ def _elaborate_command_engine(
                                     card_state.eq(CardState.Idle),
                                     data_mode.eq(DataMode.Idle),
                                     bus_width_4.eq(0),
+                                    short_block_length.eq(0),
                                     erase_start_valid.eq(0),
                                     erase_end_valid.eq(0),
                                     control.card_reset.eq(1),
@@ -283,8 +298,12 @@ def _elaborate_command_engine(
                                     m.d.sd += [
                                         stop_requested.eq(1),
                                         data_mode.eq(DataMode.Idle),
-                                        card_state.eq(CardState.Tran),
                                     ]
+                                    # If a backend ACK is still pending, DAT0 stays busy and
+                                    # the data engine returns the card to Transfer on the ACK.
+                                    with m.If((card_state != CardState.Prg) |
+                                              control.state_update_valid):
+                                        m.d.sd += card_state.eq(CardState.Tran)
                             with m.Case(13):
                                 with m.If(cmd_argument[16:32] == RCA):
                                     load_r1(cmd_index, status_value())
@@ -296,7 +315,16 @@ def _elaborate_command_engine(
                                     ]
                             with m.Case(16):
                                 with m.If(card_state == CardState.Tran):
-                                    with m.If(cmd_argument == BLOCK_SIZE):
+                                    supported_length = cmd_argument == BLOCK_SIZE
+                                    if legacy_register_block_lengths:
+                                        supported_length |= cmd_argument.matches(4, 64)
+                                    with m.If(supported_length):
+                                        if legacy_register_block_lengths:
+                                            # Register transfers have fixed lengths. Preserve
+                                            # 512-byte sector I/O by rejecting it while a legacy
+                                            # host has set a short block length.
+                                            m.d.sd += short_block_length.eq(
+                                                cmd_argument != BLOCK_SIZE)
                                         load_r1(cmd_index, status_value())
                                     with m.Else():
                                         load_r1(cmd_index, status_value(extra=1 << 29))
@@ -306,6 +334,8 @@ def _elaborate_command_engine(
                                 in_range = cmd_argument <= (self.image_size - BLOCK_SIZE)
                                 with m.If(card_state != CardState.Tran):
                                     load_r1(cmd_index, status_value(extra=1 << 22))
+                                with m.Elif(short_block_length):
+                                    load_r1(cmd_index, status_value(extra=1 << 29))
                                 with m.Elif(self.read_only & cmd_index.matches(24, 25)):
                                     load_r1(cmd_index, status_value(extra=1 << 26))
                                 with m.Elif(~aligned):
@@ -334,7 +364,10 @@ def _elaborate_command_engine(
                                     with m.If(cmd_index.matches(17, 18)):
                                         m.d.sd += card_state.eq(CardState.Data)
                                     with m.Else():
-                                        m.d.sd += card_state.eq(CardState.Rcv)
+                                        m.d.sd += [
+                                            card_state.eq(CardState.Rcv),
+                                            control.write_started.eq(1),
+                                        ]
                             with m.Case(32):
                                 with m.If((card_state == CardState.Tran) &
                                           (cmd_argument[:9] == 0) &

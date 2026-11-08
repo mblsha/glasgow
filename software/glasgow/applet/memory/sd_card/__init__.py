@@ -189,11 +189,12 @@ class SDCardComponent(wiring.Component):
     early_marker: Out(8)
 
     def __init__(self, ports, *, max_sd_clock=25_000_000, boot_data=None,
-            boot_addresses=None, capture_cmd17_wire=False):
+            boot_addresses=None, capture_cmd17_wire=False, legacy_register_block_lengths=False):
         self._ports = ports
         self._max_sd_clock = max_sd_clock
         self._boot_data = boot_data
         self._capture_cmd17_wire = capture_cmd17_wire
+        self._legacy_register_block_lengths = legacy_register_block_lengths
         self._boot_addresses = (
             boot_addresses if boot_addresses is not None
             else (0, BLOCK_SIZE))
@@ -314,7 +315,8 @@ class SDCardComponent(wiring.Component):
 
         dat_i = Cat(*(buffer.i for buffer in dat_buffers))
         m.submodules.command_engine = command_engine = CommandEngine(
-            capture_cmd17_wire=self._capture_cmd17_wire)
+            capture_cmd17_wire=self._capture_cmd17_wire,
+            legacy_register_block_lengths=self._legacy_register_block_lengths)
         m.submodules.data_engine = data_engine = DataEngine()
         m.submodules.host_engine = host_engine = HostBlockEngine()
         diagnostics_snapshot = data.View(
@@ -428,7 +430,7 @@ class SDCardInterface:
             clk: GlasgowPin, cmd: GlasgowPin, dat: tuple[GlasgowPin, ...],
             max_sd_clock: int = DEFAULT_TRANSFER_SPEED,
             static_pulls: bool = True, boot_data=None, boot_addresses=None,
-            capture_cmd17_wire=False,
+            capture_cmd17_wire=False, legacy_register_block_lengths=False,
             worker_factory=BackendWorker):
         self._logger = logger
         self._level = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
@@ -442,7 +444,8 @@ class SDCardInterface:
             SDCardComponent(
                 ports, max_sd_clock=max_sd_clock, boot_data=boot_data,
                 boot_addresses=boot_addresses,
-                capture_cmd17_wire=capture_cmd17_wire))
+                capture_cmd17_wire=capture_cmd17_wire,
+                legacy_register_block_lengths=legacy_register_block_lengths))
         self._boot_data = boot_data
         self._boot_addresses = (
             boot_addresses if boot_data is not None else None)
@@ -1205,6 +1208,8 @@ class SDCardApplet(GlasgowAppletV2):
             help="embed IMAGE MBR and first partition boot sector for deterministic startup")
         parser.add_argument("--capture-cmd17-wire", action="store_true",
             help="diagnostic build: capture the pad-observed CMD17 R1 in clock counters")
+        parser.add_argument("--legacy-register-block-lengths", action="store_true",
+            help="accept legacy CMD16 lengths 4 and 64 for SD register reads")
         parser.add_argument("--early-marker-trace", action="store_true",
             help="removed unsafe diagnostic gateware; ordinary Idle-state markers need no flag")
         power_idle_group = parser.add_mutually_exclusive_group()
@@ -1244,6 +1249,7 @@ class SDCardApplet(GlasgowAppletV2):
                 boot_data=boot_data,
                 boot_addresses=boot_addresses,
                 capture_cmd17_wire=args.capture_cmd17_wire,
+                legacy_register_block_lengths=args.legacy_register_block_lengths,
                 static_pulls=not args.power_idle_high_z)
             self._sd_port = args.clk.port
 

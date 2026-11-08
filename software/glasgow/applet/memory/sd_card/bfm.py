@@ -99,6 +99,33 @@ class SDHostBFM:
         _, _, data_sample = await self.cycle()
         self.testcase.assertEqual(data_sample[0], (1, 1))
 
+    async def receive_data_block_4bit(self, expected, *, timeout_cycles=2048):
+        for _ in range(timeout_cycles):
+            _, _, pins = await self.cycle()
+            if pins == ((1, 0),) * 4:
+                break
+        else:
+            self.testcase.fail("timed out waiting for a four-bit SD data start")
+
+        lane_bits = [[] for _ in self.dat]
+        for octet in expected:
+            for nibble in (octet >> 4, octet & 0xf):
+                _, _, pins = await self.cycle()
+                self.testcase.assertEqual(pins, tuple((1, (nibble >> lane) & 1)
+                    for lane in range(4)))
+                for lane, (_, bit) in enumerate(pins):
+                    lane_bits[lane].append(bit)
+
+        lane_crcs = [crc16(bytes(
+            sum(bit << (7 - index) for index, bit in enumerate(bits[offset:offset + 8]))
+            for offset in range(0, len(bits), 8))) for bits in lane_bits]
+        for bitno in reversed(range(16)):
+            _, _, pins = await self.cycle()
+            self.testcase.assertEqual(pins, tuple((1, (crc >> bitno) & 1)
+                for crc in lane_crcs))
+        _, _, pins = await self.cycle()
+        self.testcase.assertEqual(pins, ((1, 1),) * 4)
+
     def drive_data(self, value):
         for lane, pin in enumerate(self.dat):
             self.context.set(pin.i, (value >> lane) & 1)
