@@ -11,6 +11,7 @@ from . import BLOCK_SIZE, build_cid, build_csd, build_scr, crc16, encode_early_m
 from .bfm import SDHostBFM
 from ._backend import BackendError
 from ._data import READ_NAC_CLOCKS
+from ._gateware_support import CardState
 from ._protocol import BackendStatus
 from ._sideband_console import (
     ConsoleFrame, ConsoleFrameKind, SidebandConsole, SidebandRegion,
@@ -103,9 +104,7 @@ class SDCardSimulationTestMixin:
         await bfm.send_command(16, BLOCK_SIZE)
         bfm.assert_r1(await bfm.receive_response(48), 16)
 
-        # Sharp MAINTE reads both SD-specific register blocks while opening a
-        # drive. ACMD13 is required even though its all-zero status fields are
-        # sufficient for this simple, unpartitioned card model.
+        # Sharp MAINTE reads both SD-specific register blocks while opening a drive.
         await bfm.send_command(55, 0x1234_0000)
         bfm.assert_r1(await bfm.receive_response(48), 55)
         await bfm.send_command(51)
@@ -117,6 +116,18 @@ class SDCardSimulationTestMixin:
         await bfm.send_command(13)
         bfm.assert_r1(await bfm.receive_response(48), 13)
         await bfm.receive_data_block(bytes(64))
+
+    async def _send_sim_acmd(self, bfm, command, argument=0):
+        await bfm.send_command(55, 0x1234_0000)
+        bfm.assert_r1(await bfm.receive_response(48), 55)
+        await bfm.send_command(command, argument)
+        response = await bfm.receive_response(48)
+        bfm.assert_r1(response, command)
+        self.assertEqual((response >> 8) & R1_PERSISTENT_ERROR_MASK, 0)
+
+    async def _assert_sim_written_blocks(self, bfm, count):
+        await self._send_sim_acmd(bfm, 22)
+        await bfm.receive_data_block_4bit(count.to_bytes(4, "big"))
 
     async def _receive_sim_block(self, applet, bfm, expected, *, timeout_cycles=2048):
         async def diagnostic():
@@ -262,6 +273,146 @@ class SDCardSimulationTestMixin:
                 applet, bfm, payload[BLOCK_SIZE:BLOCK_SIZE * 2])
 
         self._run_simulation(payload, scenario)
+
+    def test_sim_sd_status_reports_negotiated_bus_width(self):
+        async def scenario(applet, bfm, image):
+            await self._send_sim_acmd(bfm, 6, 2)
+            await self._send_sim_acmd(bfm, 13)
+            await bfm.receive_data_block_4bit(b"\x80" + bytes(63))
+
+            await self._send_sim_acmd(bfm, 6, 0)
+            await self._send_sim_acmd(bfm, 13)
+            await bfm.receive_data_block(bytes(64))
+
+        self._run_simulation(bytes(4096), scenario)
+
+    def test_sim_legacy_register_block_lengths_are_opt_in(self):
+        payload = bytes([0x35]) * 4096
+
+        async def scenario(applet, bfm, image):
+            async def set_length(length, expected_error=0):
+                await bfm.send_command(16, length)
+                response = await bfm.receive_response(48)
+                bfm.assert_r1(response, 16)
+                self.assertEqual((response >> 8) & R1_PERSISTENT_ERROR_MASK, expected_error)
+
+            for length in (0, 32, 1024, 0x10040):
+                await set_length(length, 1 << 29)
+            for length, command, expected in ((64, 13, b"\x80" + bytes(63)),
+                                              (4, 22, bytes(4))):
+                await set_length(length, 0 if legacy else 1 << 29)
+                await self._send_sim_acmd(bfm, 6, 2)
+                await self._send_sim_acmd(bfm, command)
+                await bfm.receive_data_block_4bit(expected)
+                if legacy:
+                    for sector_command in (17, 18, 24, 25):
+                        await bfm.send_command(sector_command, 0)
+                        response = await bfm.receive_response(48)
+                        bfm.assert_r1(response, sector_command)
+                        self.assertEqual((response >> 8) & R1_PERSISTENT_ERROR_MASK, 1 << 29)
+
+            await set_length(512)
+            await bfm.send_command(17, 0)
+            bfm.assert_r1(await bfm.receive_response(48), 17)
+            await bfm.receive_data_block_4bit(payload[:BLOCK_SIZE])
+
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                self._run_simulation(payload, scenario, setup_arguments=(
+                    ("--legacy-register-block-lengths",) if legacy else ()))
+
+    def test_sim_acmd22_counts_successful_blocks_from_last_write(self):
+        payload = bytes(4096)
+        replacement = bytes([0x5a]) * BLOCK_SIZE
+        failing_address = 3 * BLOCK_SIZE
+
+        class FailingWriteWorker(InlineWorker):
+            async def write_block(self, address, block):
+                if address == failing_address:
+                    raise BackendError(BackendStatus.IOError, "injected write failure")
+                await super().write_block(address, block)
+
+        async def scenario(applet, bfm, image):
+            async def send_block(*, valid_crc=True):
+                await bfm.send_data_block_4bit(replacement, valid_crc=valid_crc)
+                response = [0, 0, 1, 0, 1] if valid_crc else [0, 1, 0, 1, 1]
+                self.assertEqual(await bfm.receive_data_response(), response)
+
+            await self._send_sim_acmd(bfm, 6, 2)
+            await self._assert_sim_written_blocks(bfm, 0)
+            await bfm.send_command(22)
+            response = await bfm.receive_response(48)
+            bfm.assert_r1(response, 22)
+            self.assertEqual((response >> 8) & R1_PERSISTENT_ERROR_MASK, 1 << 22)
+
+            await bfm.send_command(25, 0)
+            bfm.assert_r1(await bfm.receive_response(48), 25)
+            await send_block()
+            await self._complete_sim_busy_request(applet, bfm, "first write completion")
+            await send_block(valid_crc=False)
+            await self._assert_sim_written_blocks(bfm, 1)
+            self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, BLOCK_SIZE), bytes(BLOCK_SIZE))
+
+            await bfm.send_command(25, 0)
+            bfm.assert_r1(await bfm.receive_response(48), 25)
+            await send_block()
+            await self._complete_sim_busy_request(applet, bfm, "first write completion")
+            self._active_host_agent.stalls.append(512)
+            await send_block()
+            await bfm.send_command(12)
+            bfm.assert_r1(await bfm.receive_response(48), 12)
+            self.assertEqual((await applet.sd_card_iface.read_diagnostics()).card_state,
+                CardState.Prg.value)
+            await bfm.send_command(55, 0x1234_0000)
+            bfm.assert_r1(await bfm.receive_response(48), 55)
+            await bfm.send_command(22)
+            response = await bfm.receive_response(48)
+            bfm.assert_r1(response, 22)
+            self.assertEqual((response >> 8) & R1_PERSISTENT_ERROR_MASK, 1 << 22)
+            await self._complete_sim_busy_request(applet, bfm, "write completion after CMD12")
+            await self._assert_sim_written_blocks(bfm, 2)
+            self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, BLOCK_SIZE), replacement)
+
+            await bfm.send_command(24, len(payload))
+            response = await bfm.receive_response(48)
+            bfm.assert_r1(response, 24)
+            self.assertEqual((response >> 8) & R1_PERSISTENT_ERROR_MASK, 1 << 31)
+            await self._assert_sim_written_blocks(bfm, 2)
+
+            await bfm.send_command(24, failing_address)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            await send_block()
+            await self._complete_sim_busy_request(applet, bfm, "failed backend write")
+            await self._assert_sim_written_blocks(bfm, 0)
+            self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, failing_address), bytes(BLOCK_SIZE))
+
+            await bfm.send_command(24, 0)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            await send_block()
+            await self._complete_sim_busy_request(applet, bfm, "single write completion")
+            await self._assert_sim_written_blocks(bfm, 1)
+
+            await self._initialize_sim_card(
+                applet, bfm, image, payload, transfer_speed=25_000_000)
+            await self._send_sim_acmd(bfm, 22)
+            await bfm.receive_data_block(bytes(4))
+
+            # An ACK for a previous card session must not repopulate its cleared count.
+            await self._send_sim_acmd(bfm, 6, 2)
+            await bfm.send_command(24, 0)
+            bfm.assert_r1(await bfm.receive_response(48), 24)
+            self._active_host_agent.stalls.append(256)
+            await send_block()
+            await bfm.send_command(0)
+            await self._complete_sim_busy_request(applet, bfm, "old write completion after CMD0")
+            self.assertEqual((await applet.sd_card_iface.read_diagnostics()).card_state,
+                CardState.Idle.value)
+            await self._initialize_sim_card(
+                applet, bfm, image, payload, transfer_speed=25_000_000)
+            await self._send_sim_acmd(bfm, 22)
+            await bfm.receive_data_block(bytes(4))
+
+        self._run_simulation(payload, scenario, worker_factory=FailingWriteWorker)
 
     def test_sim_read_data_starts_after_nac_gap(self):
         payload = bytes(

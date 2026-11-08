@@ -40,6 +40,7 @@ class DataMode(enum.Enum, shape=4):
     ReadSCR     = 5
     Erase       = 6
     ReadSDStatus = 7
+    ReadWrittenBlocks = 8
 
 
 def crc7_value(crc: Value, bit: Value) -> Value:

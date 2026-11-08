@@ -36,6 +36,7 @@ class CommandDataSignature(wiring.Signature):
             "response_active": Out(1),
             "stop_requested": Out(1),
             "card_reset": Out(1),
+            "write_started": Out(1),
 
             # Data-engine state transitions captured by the command engine.
             "state_update_valid": In(1),
