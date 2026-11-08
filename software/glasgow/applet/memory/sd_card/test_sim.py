@@ -384,7 +384,8 @@ class SDCardSimulationTestMixin:
             await send_block()
             await self._complete_sim_busy_request(applet, bfm, "failed backend write")
             await self._assert_sim_written_blocks(bfm, 0)
-            self.assertEqual(os.pread(image.fileno(), BLOCK_SIZE, failing_address), bytes(BLOCK_SIZE))
+            self.assertEqual(
+                os.pread(image.fileno(), BLOCK_SIZE, failing_address), bytes(BLOCK_SIZE))
 
             await bfm.send_command(24, 0)
             bfm.assert_r1(await bfm.receive_response(48), 24)
